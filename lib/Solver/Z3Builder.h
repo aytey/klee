@@ -102,7 +102,13 @@ public:
 };
 
 class Z3Builder {
+  friend class Z3SolverImpl;
   ExprHashMap<std::pair<Z3ASTHandle, unsigned> > constructed;
+
+  // Constraints generated while translating into Z3's language, which the
+  // client has to assert alongside the query itself.  Used for the x87 fp80
+  // explicit significand integer bit -- see castToFloat().
+  std::vector<Z3ASTHandle> sideConstraints;
   Z3ArrayExprHash _arr_hash;
 
 private:
@@ -166,6 +172,15 @@ private:
 
   Z3SortHandle getBvSort(unsigned width);
   Z3SortHandle getArraySort(Z3SortHandle domainSort, Z3SortHandle rangeSort);
+  Z3SortHandle getFloatSortFromBitWidth(unsigned bitWidth);
+
+  // Float casts.  KLEE carries floats around as bitvectors, so operands are
+  // lifted to Z3's FP sort at each FP operation and lowered again afterwards.
+  Z3ASTHandle castToFloat(Z3ASTHandle e);
+  Z3ASTHandle castToBitVector(Z3ASTHandle e);
+
+  Z3ASTHandle getRoundingModeSort(llvm::APFloat::roundingMode);
+  Z3ASTHandle getx87FP80ExplicitSignificandIntegerBit(Z3ASTHandle);
   bool autoClearConstructCache;
   std::string z3LogInteractionFile;
 
@@ -188,6 +203,7 @@ public:
   }
 
   void clearConstructCache() { constructed.clear(); }
+  void clearSideConstraints() { sideConstraints.clear(); }
 };
 }
 

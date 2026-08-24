@@ -110,6 +110,16 @@ Z3SolverImpl::Z3SolverImpl()
               : NULL)),
       runStatusCode(SOLVER_RUN_STATUS_FAILURE) {
   assert(builder && "unable to create Z3Builder");
+
+  // HACK: This changes Z3's handling of the `to_ieee_bv` function so that
+  // we get a signal bit pattern interpretation for NaN. At the time of writing
+  // without this option Z3 sometimes generates models which don't satisfy the
+  // original constraints.
+  //
+  // See https://github.com/Z3Prover/z3/issues/740 .
+  // https://github.com/Z3Prover/z3/issues/507
+  Z3_global_param_set("rewriter.hi_fp_unspecified", "true");
+
   solverParameters = Z3_mk_params(builder->ctx);
   Z3_params_inc_ref(builder->ctx, solverParameters);
   timeoutParamStrSymbol = Z3_mk_string_symbol(builder->ctx, "timeout");
@@ -286,6 +296,18 @@ bool Z3SolverImpl::internalRunSolver(
       builder->ctx, theSolver,
       Z3ASTHandle(Z3_mk_not(builder->ctx, z3QueryExpr), builder->ctx));
 
+  // Assert any side constraints generated while translating. This has to come
+  // last so that the whole query has been traversed and every side constraint
+  // it needs exists. Currently this is only the x87 fp80 explicit significand
+  // integer bit -- without it a model can come back with a bit pattern that is
+  // not a valid long double.
+  for (std::vector<Z3ASTHandle>::const_iterator
+           it = builder->sideConstraints.begin(),
+           ie = builder->sideConstraints.end();
+       it != ie; ++it) {
+    Z3_solver_assert(builder->ctx, theSolver, *it);
+  }
+
   if (dumpedQueriesFile) {
     *dumpedQueriesFile << "; start Z3 query\n";
     *dumpedQueriesFile << Z3_solver_to_string(builder->ctx, theSolver);
@@ -306,6 +328,7 @@ bool Z3SolverImpl::internalRunSolver(
   // ``Query`` rather than only sharing within a single call to
   // ``builder->construct()``.
   builder->clearConstructCache();
+  builder->clearSideConstraints();
 
   if (runStatusCode == SolverImpl::SOLVER_RUN_STATUS_SUCCESS_SOLVABLE ||
       runStatusCode == SolverImpl::SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE) {
