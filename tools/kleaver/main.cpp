@@ -23,6 +23,7 @@
 #include "klee/Solver/SolverCmdLine.h"
 #include "klee/Solver/SolverImpl.h"
 #include "klee/Support/PrintVersion.h"
+#include "klee/System/Time.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/CommandLine.h"
@@ -80,6 +81,14 @@ llvm::cl::opt<std::string> DirectoryToWriteQueryLogs(
     llvm::cl::desc(
         "The folder to write query logs to (default=current directory)"),
     llvm::cl::init("."), llvm::cl::cat(klee::ExprCat));
+
+llvm::cl::opt<bool> PrintQueryTime(
+    "print-query-time",
+    llvm::cl::desc("Print how long each query took to solve, in microseconds. "
+                   "Makes kleaver usable as a solver benchmark: the same query "
+                   "log put to each --solver-backend is the only way to compare "
+                   "backends on identical work (default=false)"),
+    llvm::cl::init(false), llvm::cl::cat(klee::SolvingCat));
 
 llvm::cl::opt<bool> ClearArrayAfterQuery(
     "clear-array-decls-after-query",
@@ -220,6 +229,7 @@ static bool EvaluateInputAST(const char *Filename,
     Decl *D = *it;
     if (QueryCommand *QC = dyn_cast<QueryCommand>(D)) {
       llvm::outs() << "Query " << Index << ":\t";
+      const time::Point queryStart = time::getWallTime();
 
       assert("FIXME: Support counterexample query commands!");
       if (QC->Values.empty() && QC->Objects.empty()) {
@@ -282,6 +292,11 @@ static bool EvaluateInputAST(const char *Filename,
           }
         }
       }
+
+      if (PrintQueryTime)
+        llvm::outs() << "\ttime = "
+                     << (time::getWallTime() - queryStart).toMicroseconds()
+                     << "us";
 
       llvm::outs() << "\n";
       ++Index;
