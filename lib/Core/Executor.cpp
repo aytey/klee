@@ -4927,7 +4927,18 @@ size_t Executor::getAllocationAlignment(const llvm::Value *allocSite) const {
   llvm::Type *type = NULL;
   std::string allocationSiteName(allocSite->getName().str());
   if (const GlobalObject *GO = dyn_cast<GlobalObject>(allocSite)) {
+#if LLVM_VERSION_CODE >= LLVM_VERSION(21, 0)
+    // GlobalObject::getAlign() is protected; the public accessors live on the
+    // concrete subclasses.
+    if (const GlobalVariable *gv = dyn_cast<GlobalVariable>(GO))
+      alignment = gv->getAlign().valueOrOne().value();
+    else if (const Function *fn = dyn_cast<Function>(GO))
+      alignment = fn->getAlign().valueOrOne().value();
+    else
+      alignment = 0;
+#else
     alignment = GO->getAlignment();
+#endif
     if (const GlobalVariable *globalVar = dyn_cast<GlobalVariable>(GO)) {
       // All GlobalVariables's have pointer type
       assert(globalVar->getType()->isPointerTy() &&

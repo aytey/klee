@@ -85,7 +85,11 @@ bool RaiseAsmPass::runOnModule(Module &M) {
   std::string Err;
 
   // Use target triple from the module if possible.
+#if LLVM_VERSION_CODE >= LLVM_VERSION(21, 0)
+  std::string TargetTriple = M.getTargetTriple().str();
+#else
   std::string TargetTriple = M.getTargetTriple();
+#endif
   if (TargetTriple.empty())
     TargetTriple = llvm::sys::getDefaultTargetTriple();
   const Target *Target = TargetRegistry::lookupTarget(TargetTriple, Err);
