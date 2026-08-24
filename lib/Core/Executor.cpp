@@ -1744,26 +1744,17 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
 
     case Intrinsic::fma:
     case Intrinsic::fmuladd: {
-      // NOTE: These still concretise their operands. A fused multiply-add
-      // rounds once, so it is *not* FAdd(FMul(a, b), c) and cannot be built
-      // from the Exprs we have; expressing it needs an FMA Expr kind and
-      // support in each solver builder. toConstant() warns when it fires.
-      //
-      // Both fma and fmuladd support float, double and fp80.  Note, that fp80
-      // is not mentioned in the documentation of fmuladd, nevertheless, it is
-      // still supported.  For details see
+      // Both fma and fmuladd support float, double and fp80. Note that fp80 is
+      // not mentioned in the documentation of fmuladd, nevertheless it is
+      // still supported. For details see
       // https://github.com/klee/klee/pull/1507/files#r894993332
-
       if (isa<VectorType>(i->getOperand(0)->getType()))
         return terminateStateOnExecError(
             state, f->getName() + " with vectors is not supported");
 
-      ref<ConstantExpr> op1 =
-          toConstant(state, eval(ki, 1, state).value, "floating point");
-      ref<ConstantExpr> op2 =
-          toConstant(state, eval(ki, 2, state).value, "floating point");
-      ref<ConstantExpr> op3 =
-          toConstant(state, eval(ki, 3, state).value, "floating point");
+      ref<Expr> op1 = eval(ki, 1, state).value;
+      ref<Expr> op2 = eval(ki, 2, state).value;
+      ref<Expr> op3 = eval(ki, 3, state).value;
 
       if (!fpWidthToSemantics(op1->getWidth()) ||
           !fpWidthToSemantics(op2->getWidth()) ||
@@ -1771,14 +1762,8 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
         return terminateStateOnExecError(
             state, "Unsupported " + f->getName() + " call");
 
-      // (op1 * op2) + op3
-      APFloat Res(*fpWidthToSemantics(op1->getWidth()), op1->getAPValue());
-      Res.fusedMultiplyAdd(
-          APFloat(*fpWidthToSemantics(op2->getWidth()), op2->getAPValue()),
-          APFloat(*fpWidthToSemantics(op3->getWidth()), op3->getAPValue()),
-          APFloat::rmNearestTiesToEven);
-
-      bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+      // round(op1 * op2 + op3), rounded once -- not FAdd(FMul(op1, op2), op3).
+      bindLocal(ki, state, FMAExpr::create(op1, op2, op3, state.roundingMode));
       break;
     }
 

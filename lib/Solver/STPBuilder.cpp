@@ -1355,6 +1355,15 @@ ExprHandle STPBuilder::constructActual(ref<Expr> e, int *width_out) {
     return vc_fpAbsExpr(vc, arg);
   }
 
+  case Expr::FMA: {
+    FMAExpr *fma = cast<FMAExpr>(e);
+    ExprHandle a = castToFloat(construct(fma->a, width_out));
+    ExprHandle b = castToFloat(construct(fma->b, width_out));
+    ExprHandle c = castToFloat(construct(fma->c, width_out));
+    assert(*width_out != 1 && "uncanonicalized FMA");
+    return vc_fpFMAExpr(vc, getRoundingModeExpr(fma->roundingMode), a, b, c);
+  }
+
 // unused due to canonicalization
 #if 0
   case Expr::Ne:

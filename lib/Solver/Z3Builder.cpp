@@ -1376,6 +1376,17 @@ Z3ASTHandle Z3Builder::constructActual(ref<Expr> e, int *width_out) {
     return Z3ASTHandle(Z3_mk_fpa_abs(ctx, arg), ctx);
   }
 
+  case Expr::FMA: {
+    FMAExpr *fma = cast<FMAExpr>(e);
+    Z3ASTHandle a = castToFloat(construct(fma->a, width_out));
+    Z3ASTHandle b = castToFloat(construct(fma->b, width_out));
+    Z3ASTHandle c = castToFloat(construct(fma->c, width_out));
+    assert(*width_out != 1 && "uncanonicalized FMA");
+    return Z3ASTHandle(
+        Z3_mk_fpa_fma(ctx, getRoundingModeSort(fma->roundingMode), a, b, c),
+        ctx);
+  }
+
 // unused due to canonicalization
 #if 0
   case Expr::Ne:

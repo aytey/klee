@@ -24,6 +24,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cfenv>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -171,6 +172,7 @@ void Expr::printKind(llvm::raw_ostream &os, Kind k) {
     X(IsSubnormal);
     X(FSqrt);
     X(FAbs);
+    X(FMA);
     X(And);
     X(Or);
     X(Xor);
@@ -272,6 +274,13 @@ unsigned FSqrtExpr::computeHash() {
 
 unsigned FAbsExpr::computeHash() {
   hashValue = expr->hash() * Expr::MAGIC_HASH_CONSTANT * Expr::FAbs;
+  return hashValue;
+}
+
+unsigned FMAExpr::computeHash() {
+  hashValue = (a->hash() ^ (b->hash() * 3) ^ (c->hash() * 5)) *
+                  Expr::MAGIC_HASH_CONSTANT * Expr::FMA +
+              static_cast<unsigned>(roundingMode);
   return hashValue;
 }
 
@@ -386,6 +395,13 @@ ref<Expr> Expr::createFromKind(Kind k, std::vector<CreateArg> args) {
       assert(numArgs == 2 && args[0].isExpr() && args[1].isRoundingMode() &&
              "invalid args array for given opcode");
       return FSqrtExpr::create(args[0].expr, args[1].rm);
+
+    case FMA:
+      assert(numArgs == 4 && args[0].isExpr() && args[1].isExpr() &&
+             args[2].isExpr() && args[3].isRoundingMode() &&
+             "invalid args array for given opcode");
+      return FMAExpr::create(args[0].expr, args[1].expr, args[2].expr,
+                             args[3].rm);
 
 #define UNARY_EXPR_CASE(T)                                                     \
   case T:                                                                      \
@@ -760,6 +776,52 @@ ref<ConstantExpr> TryNativeX87FP80EvalArith(const ConstantExpr *lhs,
     llvm_unreachable("Unhandled Expr kind");
   }
   // Restore the floating point environment
+  if (fesetenv(&fpEnv)) {
+    llvm::errs() << "Failed to restore floating point environment\n";
+    abort();
+  }
+
+  llvm::APInt apint = GetAPIntFromLongDouble(nativeResult);
+  assert(apint.getBitWidth() == 80);
+  return ConstantExpr::alloc(apint);
+#else
+  klee_warning_once(0, "Trying to evaluate x87 fp80 constant non natively."
+                       "Results may be wrong");
+  return NULL;
+#endif
+}
+
+// As TryNativeX87FP80EvalArith, but for the ternary fused multiply-add. Uses
+// fmal() so that the single-rounding semantics are the hardware's rather than
+// llvm::APFloat's, which we do not trust at this width.
+ref<ConstantExpr> TryNativeX87FP80EvalFMA(const ConstantExpr *a,
+                                          const ConstantExpr *b,
+                                          const ConstantExpr *c,
+                                          llvm::APFloat::roundingMode rm) {
+  if (!(a && b && c && a->getWidth() == 80 && b->getWidth() == 80 &&
+        c->getWidth() == 80))
+    return NULL;
+#ifdef __x86_64__
+  int roundingMode = LLVMRoundingModeToCRoundingMode(rm);
+  if (roundingMode == -1) {
+    klee_warning_once(0, "Cannot eval x87 fp80 fma natively due to rounding "
+                         "mode. Results may be wrong");
+    return NULL;
+  }
+  long double aN = GetNativeX87FP80FromLLVMAPInt(a->getAPValue());
+  long double bN = GetNativeX87FP80FromLLVMAPInt(b->getAPValue());
+  long double cN = GetNativeX87FP80FromLLVMAPInt(c->getAPValue());
+
+  fenv_t fpEnv;
+  if (fegetenv(&fpEnv)) {
+    llvm::errs() << "Failed to save floating point environment\n";
+    abort();
+  }
+  if (fesetround(roundingMode)) {
+    llvm::errs() << "Failed to set new rounding mode\n";
+    abort();
+  }
+  long double nativeResult = fmal(aN, bN, cN);
   if (fesetenv(&fpEnv)) {
     llvm::errs() << "Failed to restore floating point environment\n";
     abort();
@@ -1158,6 +1220,27 @@ ref<ConstantExpr> ConstantExpr::FSqrt(llvm::APFloat::roundingMode rm) const {
     return nanEval;
   APFloat arg(this->getAPFloatValue());
   llvm::APFloat result = klee::evalSqrt(arg, rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FMA(const ref<ConstantExpr> &B,
+                                    const ref<ConstantExpr> &C,
+                                    llvm::APFloat::roundingMode rm) const {
+  // Any NaN operand makes the result a NaN; pick the canonical encoding so
+  // that folding agrees with what the solver hands back.
+  if (ref<ConstantExpr> nanEval = tryUnaryOpNaNArgs(this))
+    return nanEval;
+  if (ref<ConstantExpr> nanEval = tryUnaryOpNaNArgs(B.get()))
+    return nanEval;
+  if (ref<ConstantExpr> nanEval = tryUnaryOpNaNArgs(C.get()))
+    return nanEval;
+
+  if (ref<ConstantExpr> nativeEval =
+          TryNativeX87FP80EvalFMA(this, B.get(), C.get(), rm))
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  result.fusedMultiplyAdd(B->getAPFloatValue(), C->getAPFloatValue(), rm);
   return ConstantExpr::alloc(result);
 }
 
@@ -2018,6 +2101,18 @@ ref<Expr> FSqrtExpr::create(klee::ref<klee::Expr> const &e,
     return ce->FSqrt(rm);
   }
   return FSqrtExpr::alloc(e, rm);
+}
+
+ref<Expr> FMAExpr::create(const ref<Expr> &a, const ref<Expr> &b,
+                          const ref<Expr> &c,
+                          const llvm::APFloat::roundingMode rm) {
+  assert(a->getWidth() == b->getWidth() && a->getWidth() == c->getWidth() &&
+         "type mismatch");
+  if (ConstantExpr *ca = dyn_cast<ConstantExpr>(a))
+    if (ConstantExpr *cb = dyn_cast<ConstantExpr>(b))
+      if (ConstantExpr *cc = dyn_cast<ConstantExpr>(c))
+        return ca->FMA(cb, cc, rm);
+  return FMAExpr::alloc(a, b, c, rm);
 }
 
 ref<Expr> FAbsExpr::create(klee::ref<klee::Expr> const &e) {

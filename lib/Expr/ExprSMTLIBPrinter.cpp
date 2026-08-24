@@ -482,6 +482,7 @@ const char *ExprSMTLIBPrinter::getSMTLIBKeyword(const ref<Expr> &e) {
   case Expr::FDiv:
   case Expr::FSqrt:
   case Expr::FAbs:
+  case Expr::FMA:
   case Expr::FOEq:
   case Expr::FOLt:
   case Expr::FOLe:

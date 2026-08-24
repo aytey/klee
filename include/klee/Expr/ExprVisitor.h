@@ -76,6 +76,7 @@ namespace klee {
     virtual Action visitFDiv(const FDivExpr &);
     virtual Action visitFSqrt(const FSqrtExpr &);
     virtual Action visitFAbs(const FAbsExpr &);
+    virtual Action visitFMA(const FMAExpr &);
     virtual Action visitAdd(const AddExpr&);
     virtual Action visitSub(const SubExpr&);
     virtual Action visitMul(const MulExpr&);

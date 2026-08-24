@@ -1165,6 +1165,20 @@ BitwuzlaTermHandle BitwuzlaBuilder::constructActual(ref<Expr> e,
         bitwuzla_mk_term1(tm, BITWUZLA_KIND_FP_ABS, arg));
   }
 
+  case Expr::FMA: {
+    FMAExpr *fma = cast<FMAExpr>(e);
+    BitwuzlaTermHandle a = castToFloat(construct(fma->a, width_out));
+    BitwuzlaTermHandle b = castToFloat(construct(fma->b, width_out));
+    BitwuzlaTermHandle c = castToFloat(construct(fma->c, width_out));
+    assert(*width_out != 1 && "uncanonicalized FMA");
+    // Keep the rounding-mode handle alive: a temporary would be released
+    // before bitwuzla_mk_term() reads the array.
+    BitwuzlaTermHandle rm = getRoundingModeTerm(fma->roundingMode);
+    BitwuzlaTerm args[4] = {rm, a, b, c};
+    return BitwuzlaTermHandle(
+        bitwuzla_mk_term(tm, BITWUZLA_KIND_FP_FMA, 4, args));
+  }
+
   default:
     assert(0 && "unhandled Expr type");
     return getTrue();

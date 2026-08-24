@@ -153,6 +153,9 @@ public:
     FSqrt,
     FAbs,
 
+    // Fused multiply-add (ternary)
+    FMA,
+
     // Floating point predicates
     IsNaN,
     IsInfinite,
@@ -1270,6 +1273,52 @@ private:
   FAbsExpr(const ref<Expr> &e) : expr(e) {}
 };
 
+/// Fused multiply-add: round(a*b + c), rounded **once**. This is deliberately
+/// not FAddExpr(FMulExpr(a, b), c), which rounds twice and can differ in the
+/// last bit; llvm.fma and llvm.fmuladd both mean the single-rounding form.
+class FMAExpr : public NonConstantExpr {
+public:
+  static const Kind kind = Expr::FMA;
+  static const unsigned numKids = 3;
+  const llvm::APFloat::roundingMode roundingMode;
+  ref<Expr> a, b, c;
+
+  static ref<Expr> alloc(const ref<Expr> &a, const ref<Expr> &b,
+                         const ref<Expr> &c,
+                         const llvm::APFloat::roundingMode rm) {
+    ref<Expr> r(new FMAExpr(a, b, c, rm));
+    r->computeHash();
+    return r;
+  }
+  static ref<Expr> create(const ref<Expr> &a, const ref<Expr> &b,
+                          const ref<Expr> &c,
+                          const llvm::APFloat::roundingMode rm);
+
+  Width getWidth() const { return a->getWidth(); }
+  Kind getKind() const { return Expr::FMA; }
+
+  unsigned getNumKids() const { return numKids; }
+  ref<Expr> getKid(unsigned i) const { return i == 0 ? a : (i == 1 ? b : c); }
+
+  int compareContents(const Expr &other) const {
+    const FMAExpr &eb = static_cast<const FMAExpr &>(other);
+    if (roundingMode != eb.roundingMode)
+      return roundingMode < eb.roundingMode ? -1 : 1;
+    return 0;
+  }
+  virtual ref<Expr> rebuild(ref<Expr> kids[]) const {
+    return create(kids[0], kids[1], kids[2], roundingMode);
+  }
+  virtual unsigned computeHash();
+  static bool classof(const Expr *E) { return E->getKind() == Expr::FMA; }
+  static bool classof(const FMAExpr *) { return true; }
+
+private:
+  FMAExpr(const ref<Expr> &a, const ref<Expr> &b, const ref<Expr> &c,
+          const llvm::APFloat::roundingMode rm)
+      : roundingMode(rm), a(a), b(b), c(c) {}
+};
+
 // Terminal Exprs
 
 class ConstantExpr : public Expr {
@@ -1450,6 +1499,8 @@ public:
                          llvm::APFloat::roundingMode rm) const;
   ref<ConstantExpr> FSqrt(llvm::APFloat::roundingMode rm) const;
   ref<ConstantExpr> FAbs() const;
+  ref<ConstantExpr> FMA(const ref<ConstantExpr> &B, const ref<ConstantExpr> &C,
+                        llvm::APFloat::roundingMode rm) const;
 
   // Comparisons return a constant expression of width 1.
 
