@@ -179,6 +179,12 @@ public:
   /// @brief Exploration depth, i.e., number of times KLEE branched for this state
   std::uint32_t depth = 0;
 
+  /// @brief The rounding mode floating-point operations are evaluated under.
+  /// Set by klee_set_rounding_mode() / fesetround(); part of the state, so a
+  /// fork inherits it.
+  llvm::APFloat::roundingMode roundingMode =
+      llvm::APFloat::rmNearestTiesToEven;
+
   /// @brief Address space used by this state (e.g. Global and Heap)
   AddressSpace addressSpace;
 

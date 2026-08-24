@@ -13,6 +13,7 @@
 #include "klee/Config/Version.h"
 #include "klee/Module/KCallable.h"
 #include "klee/Module/KModule.h"
+#include "klee/Support/ErrorHandling.h"
 
 #include "klee/Support/CompilerWarning.h"
 DISABLE_WARNING_PUSH
@@ -28,6 +29,8 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/ExecutionEngine/MCJIT.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <cfenv>
 #include "llvm/Support/TargetSelect.h"
 DISABLE_WARNING_POP
 
@@ -35,6 +38,22 @@ DISABLE_WARNING_POP
 #include <csignal>
 
 using namespace llvm;
+
+namespace {
+/// Restores a previously saved C rounding mode on scope exit. A negative value
+/// means "we never managed to change it", so leave it alone.
+class ScopedRoundingMode {
+  int previous;
+
+public:
+  explicit ScopedRoundingMode(int previous) : previous(previous) {}
+  ~ScopedRoundingMode() {
+    if (previous >= 0 && fesetround(previous))
+      klee::klee_warning_once(nullptr, "Failed to restore rounding mode "
+                                       "after external call");
+  }
+};
+} // namespace
 using namespace klee;
 
 /***/
@@ -68,8 +87,8 @@ private:
 public:
   ExternalDispatcherImpl(llvm::LLVMContext &ctx);
   ~ExternalDispatcherImpl();
-  bool executeCall(KCallable *callable, llvm::Instruction *i,
-                   uint64_t *args);
+  bool executeCall(KCallable *callable, llvm::Instruction *i, uint64_t *args,
+                   int roundingMode);
   void *resolveSymbol(const std::string &name);
   int getLastErrno();
   void setLastErrno(int newErrno);
@@ -163,7 +182,17 @@ ExternalDispatcherImpl::~ExternalDispatcherImpl() {
 }
 
 bool ExternalDispatcherImpl::executeCall(KCallable *callable, Instruction *i,
-                                         uint64_t *args) {
+                                         uint64_t *args, int roundingMode) {
+  // Save KLEE's own rounding mode and switch to the one the symbolic state is
+  // running under, so that the external function rounds the same way the
+  // solver was told it does.
+  int oldRoundingMode = fegetround();
+  if (fesetround(roundingMode)) {
+    klee_warning_once(
+        i, "Failed to set rounding mode for external call; results may be wrong");
+    oldRoundingMode = -1;
+  }
+  ScopedRoundingMode restore(oldRoundingMode);
   ++stats::externalCalls;
   dispatchers_ty::iterator it = dispatchers.find(i);
   if (it != dispatchers.end()) {
@@ -369,9 +398,9 @@ ExternalDispatcher::ExternalDispatcher(llvm::LLVMContext &ctx)
 
 ExternalDispatcher::~ExternalDispatcher() { delete impl; }
 
-bool ExternalDispatcher::executeCall(KCallable *callable,
-                                     llvm::Instruction *i, uint64_t *args) {
-  return impl->executeCall(callable, i, args);
+bool ExternalDispatcher::executeCall(KCallable *callable, llvm::Instruction *i,
+                                     uint64_t *args, int roundingMode) {
+  return impl->executeCall(callable, i, args, roundingMode);
 }
 
 void *ExternalDispatcher::resolveSymbol(const std::string &name) {

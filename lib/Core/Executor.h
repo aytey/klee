@@ -375,12 +375,19 @@ private:
   /// is the instruction where this constant was encountered, or NULL
   /// if not applicable/unavailable.
   ref<klee::ConstantExpr> evalConstantExpr(const llvm::ConstantExpr *c,
+                                          llvm::APFloat::roundingMode rm,
 					   const KInstruction *ki = NULL);
 
   /// Evaluates an LLVM constant.  The optional argument ki is the
   /// instruction where this constant was encountered, or NULL if
   /// not applicable/unavailable.
+  /// Lower an LLVM fcmp predicate into KLEE's ordered comparisons and NaN
+  /// predicates.
+  ref<Expr> evaluateFCmp(unsigned int predicate, ref<Expr> left,
+                         ref<Expr> right) const;
+
   ref<klee::ConstantExpr> evalConstant(const llvm::Constant *c,
+                                      llvm::APFloat::roundingMode rm,
 				       const KInstruction *ki = NULL);
 
   /// Return a unique constant value for the given expression in the

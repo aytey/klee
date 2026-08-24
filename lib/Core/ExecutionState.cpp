@@ -98,6 +98,7 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     stack(state.stack),
     incomingBBIndex(state.incomingBBIndex),
     depth(state.depth),
+      roundingMode(state.roundingMode),
     addressSpace(state.addressSpace),
     stackAllocator(state.stackAllocator),
     heapAllocator(state.heapAllocator),
