@@ -72,18 +72,43 @@ Without them a model comes back with a bit pattern that is not a valid
 `long double` stores 10 bytes but occupies 16, and `sizeof()` — hence
 `memcpy()` and `klee_make_symbolic()` — uses the larger figure.
 
+## Array ackermannisation
+
+`--z3-array-ackermannize` (default on) replaces a contiguous run of reads from
+an array with a single fresh bitvector variable, so the solver never sees the
+array theory for it. FP code produces exactly that shape: a float or double is
+read as 4 or 8 adjacent bytes and used as one value.
+
+Measured on Imperial fp-bench synthetic benchmarks rebuilt with clang 16,
+`--solver-backend=z3`, one run at a time on an idle machine:
+
+| benchmark | off | on | speedup | equivalence |
+| --- | --- | --- | --- | --- |
+| `prefix_sum_d6` | 110.76s | 5.62s | **19.7x** | 13/13 paths, 539/539 instrs |
+| `vanishing_d4` | 60.91s | 2.43s | **25.1x** | 7/7 paths, 138/138 instrs |
+| `sum_not_assoc_d8` | >260s | 3.68s | **>70x** | off never finished |
+| `sorted_search_d6` | capped | capped | 1.0x | 81.0M vs 83.5M instrs |
+| `sum_commut_d6` | capped | capped | — | no signal at this size |
+
+Worth 20x and more where the query is solver-bound, and nothing where it is
+not — `sorted_search` is instruction-bound and gets through about 3% fewer
+instructions in the same wall clock with it on. Hence the flag.
+
 ## What is not carried across
 
-* **Array ackermannisation** (`--z3-array-ackermannize` in klee-float). A
-  performance optimisation, not a correctness requirement.
-* **`llvm.fma` / `llvm.fmuladd`** still concretise. A fused multiply-add rounds
-  once, so it is not `FAdd(FMul(a, b), c)`; expressing it needs an FMA Expr kind
-  and support in each builder.
-* **SMT-LIB printing of FP queries.** klee-float's version emits `fp.abs RNE`
-  (invalid), types comparisons as FloatingPoint rather than Bool, and hardcodes
-  every constant to `(_ to_fp 11 53)`. Rather than carry that, the printer now
-  fails with a message pointing at `--debug-z3-dump-queries`, which asks Z3 to
-  print the query and handles fp80 correctly.
+* **SMT-LIB printing of FP queries through `ExprSMTLIBPrinter`.** klee-float's
+  version emits `fp.abs RNE` (invalid), types comparisons as FloatingPoint
+  rather than Bool, and hardcodes every constant to `(_ to_fp 11 53)`. Rather
+  than carry that, the printer fails with a message pointing elsewhere. Use
+  `--debug-z3-dump-queries` (Z3 prints its own, fp80 included),
+  `--debug-dump-stp-queries`, or `--write-cvcs`, which now works on all three
+  backends.
+
+`llvm.fma` and `llvm.fmuladd` build an `Expr::FMA`, a ternary node that rounds
+once. All three solvers have the operation natively (`Z3_mk_fpa_fma`,
+`vc_fpFMAExpr`, `BITWUZLA_KIND_FP_FMA`). The discriminating property is that
+`fma(x, x, -(x*x))` is the rounding error of `x*x` and is non-zero when that
+product is inexact; under `FAdd(FMul(...))` it would be identically zero.
 
 `FNeg` had no counterpart to port — the instruction postdates klee-float. It is
 implemented here as an xor with the sign mask, which is exact (unlike `0 - x`
