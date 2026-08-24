@@ -183,18 +183,59 @@ void klee::injectStaticConstructorsAndDestructors(
 /// Point every call to \p original at \p replacement instead. Used to swap
 /// libm's classification helpers and sqrt/fabs for KLEE's own, which build an
 /// Expr rather than branching on the bit pattern.
+///
+/// This runs inside the link loop, so the replacement's *definition* may not
+/// have been pulled out of libkleeRuntimeIntrinsic yet -- linking is lazy from
+/// the entry point, and nothing references these until we create the reference
+/// here. Declaring it is enough: the next round of linking resolves the body.
 static void replaceFunctionIfPresent(llvm::Module *m, const char *original,
                                      const char *replacement) {
   llvm::Function *originalFunc = m->getFunction(original);
   if (!originalFunc)
     return;
-  llvm::Function *replacementFunc = m->getFunction(replacement);
-  assert(replacementFunc && "Replacement function not found");
-  assert(!replacementFunc->isDeclaration() && "replacement must have a body");
+  auto replacementCallee =
+      m->getOrInsertFunction(replacement, originalFunc->getFunctionType());
   klee_message("Replacing function \"%s\" with \"%s\"", original,
                replacement);
-  originalFunc->replaceAllUsesWith(replacementFunc);
+  originalFunc->replaceAllUsesWith(replacementCallee.getCallee());
   originalFunc->eraseFromParent();
+}
+
+/// Swap libm's floating-point helpers for KLEE's own. The library versions
+/// pick a float apart bit by bit, which forks on a symbolic value; ours build
+/// a predicate.
+static void replaceFloatingPointFunctions(llvm::Module *module) {
+  // These are internal glibc/uclibc names.
+  // FIXME: Guard the long double replacements on the target.
+  if (UseKleeInternalFloatClassificationFunctions) {
+    replaceFunctionIfPresent(module, "__isnanf", "klee_internal_isnanf");
+    replaceFunctionIfPresent(module, "__isnan", "klee_internal_isnan");
+    replaceFunctionIfPresent(module, "__isnanl", "klee_internal_isnanl");
+    replaceFunctionIfPresent(module, "__isinff", "klee_internal_isinff");
+    replaceFunctionIfPresent(module, "__isinf", "klee_internal_isinf");
+    replaceFunctionIfPresent(module, "__isinfl", "klee_internal_isinfl");
+    replaceFunctionIfPresent(module, "__fpclassifyf",
+                             "klee_internal_fpclassifyf");
+    replaceFunctionIfPresent(module, "__fpclassify",
+                             "klee_internal_fpclassify");
+    replaceFunctionIfPresent(module, "__fpclassifyl",
+                             "klee_internal_fpclassifyl");
+    replaceFunctionIfPresent(module, "__finitef", "klee_internal_finitef");
+    replaceFunctionIfPresent(module, "__finite", "klee_internal_finite");
+    replaceFunctionIfPresent(module, "__finitel", "klee_internal_finitel");
+  }
+  if (UseKleeInternalSqrt) {
+    replaceFunctionIfPresent(module, "sqrt", "klee_internal_sqrt");
+    replaceFunctionIfPresent(module, "sqrtf", "klee_internal_sqrtf");
+    replaceFunctionIfPresent(module, "sqrtl", "klee_internal_sqrtl");
+  }
+  if (UseKleeInternalFabs) {
+    replaceFunctionIfPresent(module, "fabs", "klee_internal_fabs");
+    replaceFunctionIfPresent(module, "fabsf", "klee_internal_fabsf");
+    replaceFunctionIfPresent(module, "fabsl", "klee_internal_fabsl");
+  }
+  replaceFunctionIfPresent(module, "fegetround", "klee_internal_fegetround");
+  replaceFunctionIfPresent(module, "fesetround", "klee_internal_fesetround");
 }
 
 void KModule::addInternalFunction(const char* functionName){
@@ -231,48 +272,15 @@ bool KModule::link(std::vector<std::unique_ptr<llvm::Module>> &modules,
 }
 
 void KModule::instrument(const Interpreter::ModuleOptions &opts) {
+  // Do this before the checks so that the references it creates are still
+  // unresolved when Executor::setModule() goes round the link loop again.
+  replaceFloatingPointFunctions(module.get());
   klee::instrument(opts.CheckDivZero, opts.CheckOvershift, module.get());
 }
 
 void KModule::optimiseAndPrepare(
     const Interpreter::ModuleOptions &opts,
     llvm::ArrayRef<const char *> preservedFunctions) {
-  // Swap in KLEE's own floating-point helpers. These are internal glibc/uclibc
-  // names; libm's versions inspect the bit pattern, which forks on a symbolic
-  // float, whereas ours build a predicate.
-  // FIXME: Guard the long double replacements on the target.
-  if (UseKleeInternalFloatClassificationFunctions) {
-    replaceFunctionIfPresent(module.get(), "__isnanf", "klee_internal_isnanf");
-    replaceFunctionIfPresent(module.get(), "__isnan", "klee_internal_isnan");
-    replaceFunctionIfPresent(module.get(), "__isnanl", "klee_internal_isnanl");
-    replaceFunctionIfPresent(module.get(), "__isinff", "klee_internal_isinff");
-    replaceFunctionIfPresent(module.get(), "__isinf", "klee_internal_isinf");
-    replaceFunctionIfPresent(module.get(), "__isinfl", "klee_internal_isinfl");
-    replaceFunctionIfPresent(module.get(), "__fpclassifyf",
-                             "klee_internal_fpclassifyf");
-    replaceFunctionIfPresent(module.get(), "__fpclassify",
-                             "klee_internal_fpclassify");
-    replaceFunctionIfPresent(module.get(), "__fpclassifyl",
-                             "klee_internal_fpclassifyl");
-    replaceFunctionIfPresent(module.get(), "__finitef", "klee_internal_finitef");
-    replaceFunctionIfPresent(module.get(), "__finite", "klee_internal_finite");
-    replaceFunctionIfPresent(module.get(), "__finitel", "klee_internal_finitel");
-  }
-  if (UseKleeInternalSqrt) {
-    replaceFunctionIfPresent(module.get(), "sqrt", "klee_internal_sqrt");
-    replaceFunctionIfPresent(module.get(), "sqrtf", "klee_internal_sqrtf");
-    replaceFunctionIfPresent(module.get(), "sqrtl", "klee_internal_sqrtl");
-  }
-  if (UseKleeInternalFabs) {
-    replaceFunctionIfPresent(module.get(), "fabs", "klee_internal_fabs");
-    replaceFunctionIfPresent(module.get(), "fabsf", "klee_internal_fabsf");
-    replaceFunctionIfPresent(module.get(), "fabsl", "klee_internal_fabsl");
-  }
-  replaceFunctionIfPresent(module.get(), "fegetround",
-                           "klee_internal_fegetround");
-  replaceFunctionIfPresent(module.get(), "fesetround",
-                           "klee_internal_fesetround");
-
   // Add internal functions which are not used to check if instructions
   // have been already visited
   if (opts.CheckDivZero)

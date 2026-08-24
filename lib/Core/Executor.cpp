@@ -758,7 +758,9 @@ void Executor::allocateGlobalObjects(ExecutionState &state) {
     Type *ty = v.getValueType();
     std::uint64_t size = 0;
     if (ty->isSized())
-      size = kmodule->targetData->getTypeStoreSize(ty);
+      // Includes padding: sizeof(long double) is 16 on x86_64 even though
+      // only 10 bytes are stored.
+      size = kmodule->targetData->getTypeAllocSize(ty);
 
     if (v.isDeclaration()) {
       // FIXME: We have no general way of handling unknown external
@@ -2786,8 +2788,17 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     // Memory instructions...
   case Instruction::Alloca: {
     AllocaInst *ai = cast<AllocaInst>(i);
-    unsigned elementSize = 
-      kmodule->targetData->getTypeStoreSize(ai->getAllocatedType());
+    // FIXME: should we provide an option to switch between getTypeAllocSize()
+    // and getTypeStoreSize()? That way we could optionally treat reading
+    // outside the memory of a type as an out of bounds access. Unfortunately
+    // it isn't always desirable to do this because of padding (e.g. `long
+    // double` has getTypeStoreSize() == 80 bits but getTypeAllocSize() == 128
+    // bits on x86_64) and it may be legitimate in some cases to access that
+    // padding (e.g. with memcpy(dest, src, sizeof(long double))).
+    //
+    // elementSize includes padding
+    unsigned elementSize =
+        kmodule->targetData->getTypeAllocSize(ai->getAllocatedType());
     ref<Expr> size = Expr::createPointer(elementSize);
     if (ai->isArrayAllocation()) {
       ref<Expr> count = eval(ki, 0, state).value;
