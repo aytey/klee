@@ -47,6 +47,12 @@ llvm::cl::opt<bool>
                                     "when possible (default=true)"),
                      llvm::cl::cat(klee::ExprCat));
 
+llvm::cl::opt<bool> PCFloatConstantsAsHexFloat(
+    "pc-float-constants-as-hex-float", llvm::cl::init(false),
+    llvm::cl::desc("Print floating point constants as C99 hexfloats rather "
+                   "than decimal (default=false)"),
+    llvm::cl::cat(klee::ExprCat));
+
 llvm::cl::opt<bool> PCAllConstWidths(
     "pc-all-const-widths", llvm::cl::init(false),
     llvm::cl::desc(
@@ -364,11 +370,15 @@ public:
       if (printWidth)
 	PC << "(w" << e->getWidth() << " ";
 
-      if (e->getWidth() <= 64) {
+      if (e->getWidth() <= 64 && !(e->isFloat())) {
         PC << e->getZExtValue();
       } else {
         std::string S;
-        e->toString(S);
+        if (e->isFloat()) {
+          e->toString(S, /*radix=*/(PCFloatConstantsAsHexFloat ? 16 : 10));
+        } else {
+          e->toString(S);
+        }
         PC << S;
       }
 

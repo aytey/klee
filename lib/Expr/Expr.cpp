@@ -9,16 +9,21 @@
 
 #include "klee/Expr/Expr.h"
 
+#include "klee/ADT/APFloatEval.h"
 #include "klee/Config/Version.h"
 #include "klee/Expr/ExprPPrinter.h"
+#include "klee/Support/ErrorHandling.h"
 #include "klee/Support/OptionCategories.h"
+#include "klee/Support/RoundingModeUtil.h"
 
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cfenv>
 #include <cstring>
 #include <sstream>
 
@@ -36,6 +41,12 @@ cl::opt<bool> ConstArrayOpt(
     "const-array-opt", cl::init(false),
     cl::desc(
         "Enable an optimization involving all-constant arrays (default=false)"),
+    cl::cat(klee::ExprCat));
+
+cl::opt<bool> SingleReprForNaN(
+    "single-repr-for-nan", cl::init(true),
+    cl::desc("When constant folding, produce a consistent bit pattern for NaN "
+             "(default=true)"),
     cl::cat(klee::ExprCat));
 }
 
@@ -140,6 +151,12 @@ void Expr::printKind(llvm::raw_ostream &os, Kind k) {
     X(Extract);
     X(ZExt);
     X(SExt);
+    X(FPExt);
+    X(FPTrunc);
+    X(FPToUI);
+    X(FPToSI);
+    X(UIToFP);
+    X(SIToFP);
     X(Add);
     X(Sub);
     X(Mul);
@@ -148,12 +165,22 @@ void Expr::printKind(llvm::raw_ostream &os, Kind k) {
     X(URem);
     X(SRem);
     X(Not);
+    X(IsNaN);
+    X(IsInfinite);
+    X(IsNormal);
+    X(IsSubnormal);
+    X(FSqrt);
+    X(FAbs);
     X(And);
     X(Or);
     X(Xor);
     X(Shl);
     X(LShr);
     X(AShr);
+    X(FAdd);
+    X(FSub);
+    X(FMul);
+    X(FDiv);
     X(Eq);
     X(Ne);
     X(Ult);
@@ -164,6 +191,11 @@ void Expr::printKind(llvm::raw_ostream &os, Kind k) {
     X(Sle);
     X(Sgt);
     X(Sge);
+    X(FOEq);
+    X(FOLt);
+    X(FOLe);
+    X(FOGt);
+    X(FOGe);
 #undef X
   default:
     assert(0 && "invalid kind");
@@ -219,6 +251,30 @@ unsigned ReadExpr::computeHash() {
   return hashValue;
 }
 
+#define FP_PRED_COMPUTE_HASH(_class_kind)                                      \
+  unsigned _class_kind##Expr::computeHash() {                                  \
+    hashValue = expr->hash() * Expr::MAGIC_HASH_CONSTANT * Expr::_class_kind;  \
+    return hashValue;                                                          \
+  }
+FP_PRED_COMPUTE_HASH(IsNaN)
+FP_PRED_COMPUTE_HASH(IsInfinite)
+FP_PRED_COMPUTE_HASH(IsNormal)
+FP_PRED_COMPUTE_HASH(IsSubnormal)
+#undef FP_PRED_COMPUTE_HASH
+
+unsigned FSqrtExpr::computeHash() {
+  // The rounding mode is part of the node's identity, so it has to be part of
+  // the hash as well.
+  hashValue = expr->hash() * Expr::MAGIC_HASH_CONSTANT * Expr::FSqrt +
+              static_cast<unsigned>(roundingMode);
+  return hashValue;
+}
+
+unsigned FAbsExpr::computeHash() {
+  hashValue = expr->hash() * Expr::MAGIC_HASH_CONSTANT * Expr::FAbs;
+  return hashValue;
+}
+
 unsigned NotExpr::computeHash() {
   hashValue = expr->hash() * Expr::MAGIC_HASH_CONSTANT * Expr::Not;
   return hashValue;
@@ -271,6 +327,19 @@ ref<Expr> Expr::createFromKind(Kind k, std::vector<CreateArg> args) {
 
       CAST_EXPR_CASE(ZExt);
       CAST_EXPR_CASE(SExt);
+      CAST_EXPR_CASE(FPExt);
+
+#define FP_CAST_EXPR_CASE(T)                                                   \
+  case T:                                                                      \
+    assert(numArgs == 3 && args[0].isExpr() && args[1].isWidth() &&            \
+           args[2].isRoundingMode() && "invalid args array for given opcode"); \
+    return T##Expr::create(args[0].expr, args[1].width, args[2].rm);
+      FP_CAST_EXPR_CASE(FPTrunc);
+      FP_CAST_EXPR_CASE(FPToUI);
+      FP_CAST_EXPR_CASE(FPToSI);
+      FP_CAST_EXPR_CASE(UIToFP);
+      FP_CAST_EXPR_CASE(SIToFP);
+#undef FP_CAST_EXPR_CASE
       
       BINARY_EXPR_CASE(Add);
       BINARY_EXPR_CASE(Sub);
@@ -296,6 +365,40 @@ ref<Expr> Expr::createFromKind(Kind k, std::vector<CreateArg> args) {
       BINARY_EXPR_CASE(Sle);
       BINARY_EXPR_CASE(Sgt);
       BINARY_EXPR_CASE(Sge);
+      BINARY_EXPR_CASE(FOEq);
+      BINARY_EXPR_CASE(FOLt);
+      BINARY_EXPR_CASE(FOLe);
+      BINARY_EXPR_CASE(FOGt);
+      BINARY_EXPR_CASE(FOGe);
+
+#define BINARY_FP_RM_EXPR_CASE(T)                                              \
+  case T:                                                                      \
+    assert(numArgs == 3 && args[0].isExpr() && args[1].isExpr() &&             \
+           args[2].isRoundingMode() && "invalid args array for given opcode"); \
+    return T##Expr::create(args[0].expr, args[1].expr, args[2].rm);
+      BINARY_FP_RM_EXPR_CASE(FAdd)
+      BINARY_FP_RM_EXPR_CASE(FSub)
+      BINARY_FP_RM_EXPR_CASE(FMul)
+      BINARY_FP_RM_EXPR_CASE(FDiv)
+#undef BINARY_FP_RM_EXPR_CASE
+
+    case FSqrt:
+      assert(numArgs == 2 && args[0].isExpr() && args[1].isRoundingMode() &&
+             "invalid args array for given opcode");
+      return FSqrtExpr::create(args[0].expr, args[1].rm);
+
+#define UNARY_EXPR_CASE(T)                                                     \
+  case T:                                                                      \
+    assert(numArgs == 1 && args[0].isExpr() &&                                 \
+           "invalid args array for given opcode");                             \
+    return T##Expr::create(args[0].expr);
+      UNARY_EXPR_CASE(Not);
+      UNARY_EXPR_CASE(FAbs);
+      UNARY_EXPR_CASE(IsNaN);
+      UNARY_EXPR_CASE(IsInfinite);
+      UNARY_EXPR_CASE(IsNormal);
+      UNARY_EXPR_CASE(IsSubnormal);
+#undef UNARY_EXPR_CASE
   }
 }
 
@@ -334,6 +437,42 @@ void Expr::dump() const {
 
 /***/
 
+ConstantExpr::ConstantExpr(const llvm::APFloat &v)
+    : value(v.bitcastToAPInt()), mIsFloat(true) {
+  assert(&(v.getSemantics()) == &(getFloatSemantics()) &&
+         "float semantics mismatch");
+}
+
+llvm::APFloat ConstantExpr::getAPFloatValue() const {
+  const llvm::fltSemantics &fs = getFloatSemantics();
+  assert(&fs != &(llvm::APFloat::Bogus()) && "Invalid float semantics");
+  return llvm::APFloat(fs, getAPValue());
+}
+
+bool ConstantExpr::isFloat() const { return mIsFloat; }
+
+const llvm::fltSemantics &ConstantExpr::getFloatSemantics() const {
+  return widthToFloatSemantics(getWidth());
+}
+
+const llvm::fltSemantics &ConstantExpr::widthToFloatSemantics(Width width) {
+  switch (width) {
+  case Expr::Int16:
+    return llvm::APFloat::IEEEhalf();
+  case Expr::Int32:
+    return llvm::APFloat::IEEEsingle();
+  case Expr::Int64:
+    return llvm::APFloat::IEEEdouble();
+  case Expr::Fl80:
+    return llvm::APFloat::x87DoubleExtended();
+  case Expr::Int128:
+    // FIXME: We could also have PPCDoubleDouble here...
+    return llvm::APFloat::IEEEquad();
+  default:
+    return llvm::APFloat::Bogus();
+  }
+}
+
 ref<Expr> ConstantExpr::fromMemory(void *address, Width width) {
   switch (width) {
   default: assert(0 && "invalid width");
@@ -365,6 +504,40 @@ void ConstantExpr::toMemory(void *address) {
 }
 
 void ConstantExpr::toString(std::string &Res, unsigned radix) const {
+  if (mIsFloat) {
+    llvm::APFloat asF = getAPFloatValue();
+    switch (radix) {
+    case 10: {
+      llvm::SmallVector<char, 16> result;
+      // Print with enough precision that the value survives a round trip
+      // without loss under round-to-nearest-even.
+      asF.toString(result, /*FormatPrecision=*/0, /*FormatMaxPadding=*/0);
+      Res = std::string(result.begin(), result.end());
+      return;
+    }
+    case 16: {
+      // Emit a C99 hex float, e.g. -0x1.000p+4.  The buffer needs about
+      //
+      //   5 + ceil(significand_bits/4) + 2 + ceil(exponent_bits*log_10(2)) + 1
+      //
+      // characters; for IEEEquad (the widest we model) that is 41.
+      char buffer[41];
+      // With hexDigits = 0 the representation is exact, so the rounding mode
+      // is irrelevant here.
+      unsigned count = asF.convertToHexString(buffer,
+                                              /*hexDigits=*/0,
+                                              /*upperCase=*/false,
+                                              llvm::APFloat::rmNearestTiesToEven);
+      assert(count < sizeof(buffer) / sizeof(char));
+      (void)count;
+      Res = buffer;
+      return;
+    }
+    default:
+      assert(0 && "Unsupported radix for floating point constant");
+    }
+  }
+
   Res = llvm::toString(value, radix, false);
 }
 
@@ -488,6 +661,512 @@ ref<ConstantExpr> ConstantExpr::Sgt(const ref<ConstantExpr> &RHS) {
 
 ref<ConstantExpr> ConstantExpr::Sge(const ref<ConstantExpr> &RHS) {
   return ConstantExpr::alloc(value.sge(RHS->value), Expr::Bool);
+}
+
+// FIXME: We should probably move all this x87 fp80 stuff into some
+// utility file.
+namespace {
+bool shouldTryNativex87Eval(const ConstantExpr *lhs, const ConstantExpr *rhs) {
+  if (lhs && rhs && lhs->getWidth() == 80 && rhs->getWidth() == 80) {
+    return true;
+  }
+  return false;
+};
+
+
+// WORKAROUND: A bug in llvm::APFloat means long doubles aren't evaluated
+// properly in some cases ( https://llvm.org/bugs/show_bug.cgi?id=31292 ).
+// Workaround this by evaulating natively if possible.
+ref<ConstantExpr> TryNativeX87FP80EvalCmp(const ConstantExpr *lhs,
+                                          const ConstantExpr *rhs,
+                                          Expr::Kind op) {
+  if (!shouldTryNativex87Eval(lhs, rhs))
+    return NULL;
+
+#ifdef __x86_64__
+  // Use APInt directly because making an APFloat might change the bit pattern.
+  long double lhsAsNative = GetNativeX87FP80FromLLVMAPInt(lhs->getAPValue());
+  long double rhsAsNative = GetNativeX87FP80FromLLVMAPInt(rhs->getAPValue());
+  bool nativeResult = false;
+  switch (op) {
+  case Expr::FOEq:
+    nativeResult = (lhsAsNative == rhsAsNative);
+    break;
+  case Expr::FOLt:
+    nativeResult = (lhsAsNative < rhsAsNative);
+    break;
+  case Expr::FOLe:
+    nativeResult = (lhsAsNative <= rhsAsNative);
+    break;
+  case Expr::FOGt:
+    nativeResult = (lhsAsNative > rhsAsNative);
+    break;
+  case Expr::FOGe:
+    nativeResult = (lhsAsNative >= rhsAsNative);
+    break;
+  default:
+    llvm_unreachable("Unhandled Expr kind");
+  }
+
+  return ConstantExpr::alloc(nativeResult, Expr::Bool);
+#else
+  klee_warning_once(0, "Trying to evaluate x87 fp80 constant non natively."
+                       "Results may be wrong");
+  return NULL;
+#endif
+}
+
+ref<ConstantExpr> TryNativeX87FP80EvalArith(const ConstantExpr *lhs,
+                                            const ConstantExpr *rhs,
+                                            Expr::Kind op, llvm::APFloat::roundingMode rm) {
+  if (!shouldTryNativex87Eval(lhs, rhs))
+    return NULL;
+#ifdef __x86_64__
+  int roundingMode = LLVMRoundingModeToCRoundingMode(rm);
+  if (roundingMode == -1) {
+    klee_warning_once(0, "Cannot eval x87 fp80 constant natively due to rounding mode"
+                         "Results may be wrong");
+    return NULL;
+  }
+
+  // Use APInt directly because making an APFloat might change the bit pattern.
+  long double lhsAsNative = GetNativeX87FP80FromLLVMAPInt(lhs->getAPValue());
+  long double rhsAsNative = GetNativeX87FP80FromLLVMAPInt(rhs->getAPValue());
+  long double nativeResult = false;
+  // Save the floating point environment.
+  fenv_t fpEnv;
+  if (fegetenv(&fpEnv)) {
+    llvm::errs() << "Failed to save floating point environment\n";
+    abort();
+  }
+  if (fesetround(roundingMode)) {
+    llvm::errs() << "Failed to set new rounding mode\n";
+    abort();
+  }
+  switch (op) {
+  case Expr::FAdd:
+    nativeResult = lhsAsNative + rhsAsNative;
+    break;
+  case Expr::FSub:
+    nativeResult = lhsAsNative - rhsAsNative;
+    break;
+  case Expr::FMul:
+    nativeResult = lhsAsNative * rhsAsNative;
+    break;
+  case Expr::FDiv:
+    nativeResult = lhsAsNative / rhsAsNative;
+    break;
+  default:
+    llvm_unreachable("Unhandled Expr kind");
+  }
+  // Restore the floating point environment
+  if (fesetenv(&fpEnv)) {
+    llvm::errs() << "Failed to restore floating point environment\n";
+    abort();
+  }
+
+  llvm::APInt apint = GetAPIntFromLongDouble(nativeResult);
+  assert(apint.getBitWidth() == 80);
+  return ConstantExpr::alloc(apint);
+#else
+  klee_warning_once(0, "Trying to evaluate x87 fp80 constant non natively."
+                       "Results may be wrong");
+  return NULL;
+#endif
+}
+
+ref<ConstantExpr> TryNativeX87FP80EvalCast(const ConstantExpr *ce,
+                                           Expr::Width outWidth, Expr::Kind op,
+                                           llvm::APFloat::roundingMode rm) {
+  if (!shouldTryNativex87Eval(ce, ce))
+    return NULL;
+#ifdef __x86_64__
+  int roundingMode = LLVMRoundingModeToCRoundingMode(rm);
+  if (roundingMode == -1) {
+    klee_warning_once(
+        0, "Cannot eval x87 fp80 constant natively due to rounding mode"
+           "Results may be wrong");
+    return NULL;
+  }
+  // Use APInt directly because making an APFloat might change the bit pattern.
+  long double argAsNative = GetNativeX87FP80FromLLVMAPInt(ce->getAPValue());
+  // Save the floating point environment.
+  fenv_t fpEnv;
+  if (fegetenv(&fpEnv)) {
+    llvm::errs() << "Failed to save floating point environment\n";
+    abort();
+  }
+  if (fesetround(roundingMode)) {
+    llvm::errs() << "Failed to set new rounding mode\n";
+    abort();
+  }
+  llvm::APInt apint;
+  switch (op) {
+  case Expr::FPTrunc: {
+    switch (outWidth) {
+    case 64: {
+      assert(sizeof(double) * 8 == 64);
+      double resultAsDouble = (double)argAsNative;
+      apint = APInt::doubleToBits(resultAsDouble);
+      assert(apint.getBitWidth() == 64);
+      break;
+    }
+    case 32: {
+      assert(sizeof(float) * 8 == 32);
+      float resultAsFloat = (float)argAsNative;
+      apint = APInt::floatToBits(resultAsFloat);
+      assert(apint.getBitWidth() == 32);
+      break;
+    }
+    default:
+      llvm_unreachable("Unhandled Expr width");
+    }
+  } break;
+  case Expr::FPToSI: {
+    uint64_t data = 0;
+    unsigned numBits = 0;
+    switch (outWidth) {
+#define CASE(WIDTH)                                                            \
+  case WIDTH: {                                                                \
+    int##WIDTH##_t toSI = (int##WIDTH##_t)argAsNative;                         \
+    memcpy(&data, &toSI, sizeof(toSI));                                        \
+    numBits = WIDTH;                                                           \
+    break;                                                                     \
+  }
+      CASE(8)
+      CASE(16)
+      CASE(32)
+      CASE(64)
+#undef CASE
+    default:
+      llvm_unreachable("Unhandled Expr cast width");
+    }
+    assert(numBits > 0);
+    apint = llvm::APInt(numBits, data, /*signed=*/true);
+    assert(apint.getBitWidth() == numBits);
+  } break;
+  case Expr::FPToUI: {
+    uint64_t data = 0;
+    unsigned numBits = 0;
+    switch (outWidth) {
+#define CASE(WIDTH)                                                            \
+  case WIDTH: {                                                                \
+    uint##WIDTH##_t toUI = (uint##WIDTH##_t)argAsNative;                       \
+    memcpy(&data, &toUI, sizeof(toUI));                                        \
+    numBits = WIDTH;                                                           \
+    break;                                                                     \
+  }
+      CASE(8)
+      CASE(16)
+      CASE(32)
+      CASE(64)
+#undef CASE
+    default:
+      llvm_unreachable("Unhandled Expr cast width");
+    }
+    assert(numBits > 0);
+    apint = llvm::APInt(numBits, data, /*signed=*/false);
+    assert(apint.getBitWidth() == numBits);
+  } break;
+  default:
+    llvm_unreachable("Unhandled Expr kind");
+  }
+  // Restore the floating point environment
+  if (fesetenv(&fpEnv)) {
+    llvm::errs() << "Failed to restore floating point environment\n";
+    abort();
+  }
+  return ConstantExpr::alloc(apint);
+#else
+  klee_warning_once(0, "Trying to evaluate x87 fp80 constant non natively."
+                       "Results may be wrong");
+  return NULL;
+#endif
+}
+
+// This is a hack to by-pass evaluation of NaN arguments by APFloat.  We need
+// to do this in-order to have the semantics of KLEE's Expr language co-incide
+// with Z3's. This is a delicate balencing act (native vs KLEE Expr vs Z3 Expr)
+// which I'm trying to get right but probably will fail in some places.
+ref<ConstantExpr> tryUnaryOpNaNArgs(const ConstantExpr *arg) {
+  if (!SingleReprForNaN)
+    return NULL;
+
+  Expr::Width width = arg->getWidth();
+  switch (width) {
+  case Expr::Int16:
+  case Expr::Int32:
+  case Expr::Int64:
+  case Expr::Int128: {
+    // For these cases llvm::APFloat behaves well so
+    // we can use it to test if the expression is a NaN
+    llvm::APFloat asF = arg->getAPFloatValue();
+    if (asF.isNaN())
+      return ConstantExpr::GetNaN(width);
+    break;
+  }
+  case Expr::Fl80: {
+    // For x87 fp80 we can't use llvm::APFloat directly
+    // if the values are "unsupported" values (see 8.2.2 Unsupported Double
+    // Extended-Precision Float-Point Encodings and Pseudo-Denormals" from the
+    // Intel(R) 64 and IA-32 Architectures Software Developer's Manual) because
+    // it incorreclty identifies these arguments as NaNs.
+    llvm::APInt api = arg->getAPValue();
+    assert(api.getBitWidth() == 80);
+    if (api[63]) {
+      // This can **only** be a IEEE754 NaN if the explicit significand integer
+      // bit is 1. It should be safe to use APFloat now to check if it's a NaN.
+      llvm::APFloat asF = arg->getAPFloatValue();
+      if (asF.isNaN())
+        return ConstantExpr::GetNaN(width);
+    }
+    break;
+  }
+  default:
+    llvm_unreachable("Unhandled width");
+  }
+  return NULL;
+}
+
+ref<ConstantExpr> tryBinaryOpNaNArgs(const ConstantExpr* lhs, const ConstantExpr *rhs) {
+  ref<ConstantExpr> lhsIsNaN = tryUnaryOpNaNArgs(lhs);
+  if (lhsIsNaN.get())
+    return lhsIsNaN;
+  ref<ConstantExpr> rhsIsNaN = tryUnaryOpNaNArgs(rhs);
+  if (rhsIsNaN.get())
+    return rhsIsNaN;
+  return NULL;
+}
+}
+
+ref<ConstantExpr> ConstantExpr::FOEq(const ref<ConstantExpr> &RHS) {
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCmp(this, RHS.get(), Expr::FOEq);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat lhsF = this->getAPFloatValue();
+  APFloat rhsF = RHS->getAPFloatValue();
+  APFloat::cmpResult cmpRes = lhsF.compare(rhsF);
+  bool result = (cmpRes == APFloat::cmpEqual);
+  return ConstantExpr::alloc(result, Expr::Bool);
+}
+
+ref<ConstantExpr> ConstantExpr::FOLt(const ref<ConstantExpr> &RHS) {
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCmp(this, RHS.get(), Expr::FOLt);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat lhsF = this->getAPFloatValue();
+  APFloat rhsF = RHS->getAPFloatValue();
+  APFloat::cmpResult cmpRes = lhsF.compare(rhsF);
+  bool result = (cmpRes == APFloat::cmpLessThan);
+  return ConstantExpr::alloc(result, Expr::Bool);
+}
+
+ref<ConstantExpr> ConstantExpr::FOLe(const ref<ConstantExpr> &RHS) {
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCmp(this, RHS.get(), Expr::FOLe);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat lhsF = this->getAPFloatValue();
+  APFloat rhsF = RHS->getAPFloatValue();
+  APFloat::cmpResult cmpRes = lhsF.compare(rhsF);
+  bool result =
+      (cmpRes == APFloat::cmpLessThan) || (cmpRes == APFloat::cmpEqual);
+  return ConstantExpr::alloc(result, Expr::Bool);
+}
+
+ref<ConstantExpr> ConstantExpr::FOGt(const ref<ConstantExpr> &RHS) {
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCmp(this, RHS.get(), Expr::FOGt);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat lhsF = this->getAPFloatValue();
+  APFloat rhsF = RHS->getAPFloatValue();
+  APFloat::cmpResult cmpRes = lhsF.compare(rhsF);
+  bool result = (cmpRes == APFloat::cmpGreaterThan);
+  return ConstantExpr::alloc(result, Expr::Bool);
+}
+
+ref<ConstantExpr> ConstantExpr::FOGe(const ref<ConstantExpr> &RHS) {
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCmp(this, RHS.get(), Expr::FOGe);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat lhsF = this->getAPFloatValue();
+  APFloat rhsF = RHS->getAPFloatValue();
+  APFloat::cmpResult cmpRes = lhsF.compare(rhsF);
+  bool result =
+      (cmpRes == APFloat::cmpGreaterThan) || (cmpRes == APFloat::cmpEqual);
+  return ConstantExpr::alloc(result, Expr::Bool);
+}
+
+ref<ConstantExpr> ConstantExpr::FAdd(const ref<ConstantExpr> &RHS,
+                                     llvm::APFloat::roundingMode rm) const {
+  ref<ConstantExpr> nanEval = tryBinaryOpNaNArgs(this, RHS.get());
+  if (nanEval.get())
+    return nanEval;
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalArith(this, RHS.get(), Expr::FAdd, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  // Should we use the status?
+  result.add(RHS->getAPFloatValue(), rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FSub(const ref<ConstantExpr> &RHS,
+                                     llvm::APFloat::roundingMode rm) const {
+  ref<ConstantExpr> nanEval = tryBinaryOpNaNArgs(this, RHS.get());
+  if (nanEval.get())
+    return nanEval;
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalArith(this, RHS.get(), Expr::FSub, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  // Should we use the status?
+  result.subtract(RHS->getAPFloatValue(), rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FMul(const ref<ConstantExpr> &RHS,
+                                     llvm::APFloat::roundingMode rm) const {
+  ref<ConstantExpr> nanEval = tryBinaryOpNaNArgs(this, RHS.get());
+  if (nanEval.get())
+    return nanEval;
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalArith(this, RHS.get(), Expr::FMul, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  // Should we use the status?
+  result.multiply(RHS->getAPFloatValue(), rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FDiv(const ref<ConstantExpr> &RHS,
+                                     llvm::APFloat::roundingMode rm) const {
+  ref<ConstantExpr> nanEval = tryBinaryOpNaNArgs(this, RHS.get());
+  if (nanEval.get())
+    return nanEval;
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalArith(this, RHS.get(), Expr::FDiv, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  // Should we use the status?
+  result.divide(RHS->getAPFloatValue(), rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FPExt(Width W) const {
+  // FIXME: Make the semantics here consistent with Z3.
+  assert(W > this->getWidth() && "Invalid FPExt");
+  APFloat result(this->getAPFloatValue());
+  const llvm::fltSemantics &newType = widthToFloatSemantics(W);
+  bool losesInfo = false;
+  // The rounding mode has no meaning when extending so we can use any
+  // rounding mode here.
+
+  // Should we use the status?
+  result.convert(newType, llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FPTrunc(Width W,
+                                        llvm::APFloat::roundingMode rm) const {
+  assert(W < this->getWidth() && "Invalid FPTrunc");
+  // FIXME: Make the semantics here consistent with Z3.
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCast(this, W, Expr::FPTrunc, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat result(this->getAPFloatValue());
+  const llvm::fltSemantics &newType = widthToFloatSemantics(W);
+  bool losesInfo = false;
+  // Should we use the status?
+  result.convert(newType, rm, &losesInfo);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FPToUI(Width W,
+                                       llvm::APFloat::roundingMode rm) const {
+  // FIXME: Make the semantics here consistent with Z3.
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCast(this, W, Expr::FPToUI, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat asF(this->getAPFloatValue());
+  // Should we use the status?
+  APSInt result(/*BitWidth=*/W, /*isUnsigned=*/true);
+  bool isExact = false;
+  // What are the semantics when ``asF`` is negative?
+  asF.convertToInteger(result, rm, &isExact);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FPToSI(Width W,
+                                       llvm::APFloat::roundingMode rm) const {
+  // FIXME: Make the semantics here consistent with Z3.
+  ref<ConstantExpr> nativeEval =
+      TryNativeX87FP80EvalCast(this, W, Expr::FPToSI, rm);
+  if (nativeEval.get())
+    return nativeEval;
+
+  APFloat asF(this->getAPFloatValue());
+  // Should we use the status?
+  APSInt result(/*BitWidth=*/W, /*isUnsigned=*/false);
+  bool isExact = false;
+  asF.convertToInteger(result, rm, &isExact);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::UIToFP(Width W,
+                                       llvm::APFloat::roundingMode rm) const {
+  const llvm::fltSemantics &newType = widthToFloatSemantics(W);
+  llvm::APFloat asF(newType);
+  // Should we use the status?
+  asF.convertFromAPInt(value, /*isSigned=*/false, rm);
+  return ConstantExpr::alloc(asF);
+}
+
+ref<ConstantExpr> ConstantExpr::SIToFP(Width W,
+                                       llvm::APFloat::roundingMode rm) const {
+  const llvm::fltSemantics &newType = widthToFloatSemantics(W);
+  llvm::APFloat asF(newType);
+  // Should we use the status?
+  asF.convertFromAPInt(value, /*isSigned=*/true, rm);
+  return ConstantExpr::alloc(asF);
+}
+
+ref<ConstantExpr> ConstantExpr::FSqrt(llvm::APFloat::roundingMode rm) const {
+  ref<ConstantExpr> nanEval = tryUnaryOpNaNArgs(this);
+  if (nanEval.get())
+    return nanEval;
+  APFloat arg(this->getAPFloatValue());
+  llvm::APFloat result = klee::evalSqrt(arg, rm);
+  return ConstantExpr::alloc(result);
+}
+
+ref<ConstantExpr> ConstantExpr::FAbs() const {
+  // FIXME: Make the semantics here consistent with Z3.
+  APFloat result(this->getAPFloatValue());
+  if (result.isNegative())
+    result.changeSign();
+  return ConstantExpr::alloc(result);
 }
 
 /***/
@@ -729,6 +1408,65 @@ ref<Expr> SExtExpr::create(const ref<Expr> &e, Width w) {
     return CE->SExt(w);
   } else {    
     return SExtExpr::alloc(e, w);
+  }
+}
+
+ref<Expr> FPExtExpr::create(const ref<Expr> &e, Width w) {
+  unsigned kBits = e->getWidth();
+  if (w == kBits) {
+    return e;
+  } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->FPExt(w);
+  } else {
+    return FPExtExpr::alloc(e, w);
+  }
+}
+
+ref<Expr> FPTruncExpr::create(const ref<Expr> &e, Width w,
+                              llvm::APFloat::roundingMode rm) {
+  unsigned kBits = e->getWidth();
+  if (w == kBits) {
+    return e;
+  } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->FPTrunc(w, rm);
+  } else {
+    return FPTruncExpr::alloc(e, w, rm);
+  }
+}
+
+ref<Expr> FPToUIExpr::create(const ref<Expr> &e, Width w,
+                             llvm::APFloat::roundingMode rm) {
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->FPToUI(w, rm);
+  } else {
+    return FPToUIExpr::alloc(e, w, rm);
+  }
+}
+
+ref<Expr> FPToSIExpr::create(const ref<Expr> &e, Width w,
+                             llvm::APFloat::roundingMode rm) {
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->FPToSI(w, rm);
+  } else {
+    return FPToSIExpr::alloc(e, w, rm);
+  }
+}
+
+ref<Expr> UIToFPExpr::create(const ref<Expr> &e, Width w,
+                             llvm::APFloat::roundingMode rm) {
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->UIToFP(w, rm);
+  } else {
+    return UIToFPExpr::alloc(e, w, rm);
+  }
+}
+
+ref<Expr> SIToFPExpr::create(const ref<Expr> &e, Width w,
+                             llvm::APFloat::roundingMode rm) {
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+    return CE->SIToFP(w, rm);
+  } else {
+    return SIToFPExpr::alloc(e, w, rm);
   }
 }
 
@@ -1209,3 +1947,146 @@ CMPCREATE(UltExpr, Ult)
 CMPCREATE(UleExpr, Ule)
 CMPCREATE(SltExpr, Slt)
 CMPCREATE(SleExpr, Sle)
+
+#define FOCMPCREATE(_e_op, _op)                                                \
+  ref<Expr> _e_op::create(const ref<Expr> &l, const ref<Expr> &r) {            \
+    assert(l->getWidth() == r->getWidth() && "type mismatch");                 \
+    if (ConstantExpr *cl = dyn_cast<ConstantExpr>(l)) {                        \
+      if (ConstantExpr *cr = dyn_cast<ConstantExpr>(r))                        \
+        return cl->_op(cr);                                                    \
+      if (cl->getAPFloatValue().isNaN())                                       \
+        return ConstantExpr::alloc(0, Expr::Bool);                             \
+    } else if (ConstantExpr *cr = dyn_cast<ConstantExpr>(r)) {                 \
+      if (cr->getAPFloatValue().isNaN())                                       \
+        return ConstantExpr::alloc(0, Expr::Bool);                             \
+    }                                                                          \
+    return _e_op::alloc(l, r);                                                 \
+  }
+
+FOCMPCREATE(FOEqExpr, FOEq)
+FOCMPCREATE(FOLtExpr, FOLt)
+FOCMPCREATE(FOLeExpr, FOLe)
+FOCMPCREATE(FOGtExpr, FOGt)
+FOCMPCREATE(FOGeExpr, FOGe)
+
+#define FARITHCREATE(_e_op, _op)                                               \
+  ref<Expr> _e_op::create(const ref<Expr> &l, const ref<Expr> &r,              \
+                          llvm::APFloat::roundingMode rm) {                    \
+    assert(l->getWidth() == r->getWidth() && "type mismatch");                 \
+    if (ConstantExpr *cl = dyn_cast<ConstantExpr>(l))                          \
+      if (ConstantExpr *cr = dyn_cast<ConstantExpr>(r))                        \
+        return cl->_op(cr, rm);                                                \
+    return _e_op::alloc(l, r, rm);                                             \
+  }
+
+FARITHCREATE(FAddExpr, FAdd)
+FARITHCREATE(FSubExpr, FSub)
+FARITHCREATE(FMulExpr, FMul)
+FARITHCREATE(FDivExpr, FDiv)
+
+ref<Expr> IsNaNExpr::create(const ref<Expr> &e) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ConstantExpr::alloc(ce->getAPFloatValue().isNaN(), Expr::Bool);
+  }
+  return IsNaNExpr::alloc(e);
+}
+
+ref<Expr> IsInfiniteExpr::create(const ref<Expr> &e) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ConstantExpr::alloc(ce->getAPFloatValue().isInfinity(), Expr::Bool);
+  }
+  return IsInfiniteExpr::alloc(e);
+}
+
+ref<Expr> IsNormalExpr::create(const ref<Expr> &e) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ConstantExpr::alloc(ce->getAPFloatValue().isNormal(), Expr::Bool);
+  }
+  return IsNormalExpr::alloc(e);
+}
+
+ref<Expr> IsSubnormalExpr::create(const ref<Expr> &e) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ConstantExpr::alloc(ce->getAPFloatValue().isDenormal(), Expr::Bool);
+  }
+  return IsSubnormalExpr::alloc(e);
+}
+
+ref<Expr> FSqrtExpr::create(klee::ref<klee::Expr> const &e,
+                            llvm::APFloat::roundingMode rm) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ce->FSqrt(rm);
+  }
+  return FSqrtExpr::alloc(e, rm);
+}
+
+ref<Expr> FAbsExpr::create(klee::ref<klee::Expr> const &e) {
+  if (ConstantExpr *ce = dyn_cast<ConstantExpr>(e)) {
+    return ce->FAbs();
+  }
+  return FAbsExpr::alloc(e);
+}
+
+ref<Expr> IsNaNExpr::either(const ref<Expr> &e0, const ref<Expr> &e1) {
+  return OrExpr::create(IsNaNExpr::create(e0), IsNaNExpr::create(e1));
+}
+
+ref<Expr> IsInfiniteExpr::either(const ref<Expr> &e0, const ref<Expr> &e1) {
+  return OrExpr::create(IsInfiniteExpr::create(e0), IsInfiniteExpr::create(e1));
+}
+
+ref<Expr> IsNormalExpr::either(const ref<Expr> &e0, const ref<Expr> &e1) {
+  return OrExpr::create(IsNormalExpr::create(e0), IsNormalExpr::create(e1));
+}
+
+ref<Expr> IsSubnormalExpr::either(const ref<Expr> &e0, const ref<Expr> &e1) {
+  return OrExpr::create(IsSubnormalExpr::create(e0),
+                        IsSubnormalExpr::create(e1));
+}
+
+ref<ConstantExpr> ConstantExpr::GetNaN(Expr::Width w) {
+  // These values have been chosen to be consistent with Z3 when
+  // rewriter.hi_fp_unspecified=false
+  llvm::APInt apint;
+  const llvm::fltSemantics *sem = nullptr;
+  switch(w) {
+    case Int16: {
+      apint = llvm::APInt(/*numBits=*/16, (uint64_t) 0x7c01, /*isSigned=*/false);
+      sem = &(llvm::APFloat::IEEEhalf());
+      break;
+    }
+    case Int32: {
+      apint = llvm::APInt(/*numBits=*/32, (uint64_t) 0x7f800001, /*isSigned=*/false);
+      sem = &(llvm::APFloat::IEEEsingle());
+      break;
+    }
+    case Int64: {
+      apint = llvm::APInt(/*numBits=*/64, (uint64_t) 0x7ff0000000000001, /*isSigned=*/false);
+      sem = &(llvm::APFloat::IEEEdouble());
+      break;
+    }
+    case Fl80: {
+      // 0x7FFF8000000000000001
+      uint64_t temp[] = { 0x8000000000000001, (uint64_t) 0x7FFF};
+      apint = llvm::APInt(/*numBits=*/80, temp);
+      sem = &(llvm::APFloat::x87DoubleExtended());
+      break;
+    }
+    case Int128: {
+      // 0x7FFF0000000000000000000000000001
+      uint64_t temp[] = { 0x0000000000000001, 0x7FFF000000000000};
+      apint = llvm::APInt(/*numBits=*/128, temp);
+      sem = &(llvm::APFloat::IEEEquad());
+      break;
+    }
+    default:
+      llvm_unreachable("Unhandled width for NaN");
+  }
+#ifndef NDEBUG
+  // Make an APFloat from the bits and check its a NaN
+  llvm::APFloat asF(*sem, apint);
+  assert(asF.isNaN() && "Failed to create a NaN");
+
+#endif
+  return ConstantExpr::alloc(apint);
+}

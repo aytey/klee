@@ -13,6 +13,7 @@ add_library(kleeSupport
   MemoryUsage.cpp
   PrintVersion.cpp
   RNG.cpp
+  RoundingModeUtil.cpp
   Time.cpp
   Timer.cpp
   TreeStream.cpp
