@@ -20,6 +20,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
@@ -35,6 +36,26 @@ DISABLE_WARNING_POP
 
 using namespace llvm;
 using namespace klee;
+
+namespace {
+/// A call inserted into a function that carries debug info must have a !dbg
+/// location or the verifier rejects the module. Optimised builds often leave
+/// the instruction being checked without one, so fall back to a line-0
+/// location in the function's own scope -- the usual idiom for code the
+/// compiler introduced rather than the user writing it.
+llvm::DebugLoc getInsertedCallDebugLoc(llvm::Instruction *at) {
+  if (llvm::DebugLoc dl = at->getDebugLoc())
+    return dl;
+  llvm::Function *f = at->getFunction();
+  if (!f)
+    return llvm::DebugLoc();
+  llvm::DISubprogram *sp = f->getSubprogram();
+  if (!sp)
+    return llvm::DebugLoc();
+  return llvm::DILocation::get(f->getContext(), /*line=*/0, /*column=*/0, sp);
+}
+} // namespace
+
 
 char DivCheckPass::ID;
 
@@ -81,6 +102,10 @@ bool DivCheckPass::runOnModule(Module &M) {
 
   for (auto &divInst : divInstruction) {
     llvm::IRBuilder<> Builder(divInst /* Inserts before divInst*/);
+    // A call inserted into a function that has debug info must carry a !dbg
+    // location, or the verifier rejects the module. Inherit the location of
+    // the instruction being checked.
+    Builder.SetCurrentDebugLocation(getInsertedCallDebugLoc(divInst));
     auto denominator =
         Builder.CreateIntCast(divInst->getOperand(1), Type::getInt64Ty(ctx),
                               false, /* sign doesn't matter */
@@ -140,6 +165,9 @@ bool OvershiftCheckPass::runOnModule(Module &M) {
 
   for (auto &shiftInst : shiftInstructions) {
     llvm::IRBuilder<> Builder(shiftInst);
+    // See DivCheckPass: an inlinable call needs a !dbg location to pass the
+    // verifier when the enclosing function has debug info.
+    Builder.SetCurrentDebugLocation(getInsertedCallDebugLoc(shiftInst));
 
     std::vector<llvm::Value *> args;
 

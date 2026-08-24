@@ -173,7 +173,10 @@ bool BitwuzlaSolverImpl::internalRunSolver(
     std::vector<std::vector<unsigned char> > *values, bool &hasSolution) {
   TimerStatIncrementer t(stats::queryTime);
   runStatusCode = SOLVER_RUN_STATUS_FAILURE;
-  ++stats::queries;
+  // solverQueries, not queries: this is the core solver, and the Z3, STP and
+  // MetaSMT backends all count here. Counting the wrong one makes any
+  // per-query comparison against this backend meaningless.
+  ++stats::solverQueries;
   if (objects)
     ++stats::queryCounterexamples;
 
