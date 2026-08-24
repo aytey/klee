@@ -123,6 +123,18 @@ affected drivers.
 
 ## Results
 
+> **The three-backend tables below are being re-run and should not be used.**
+> They were measured with `--use-forked-solver` at its default, which is *on*.
+> `CoreSolver.cpp` passes that flag only to `STPSolver` -- Z3 and Bitwuzla
+> always run in-process -- so STP forked a process per query and the other two
+> did not. That is not a like-for-like comparison, and it handicaps STP: the
+> klee-float branch measures 9.3s of STP solver time with forking against 7.3s
+> without. `scripts/fp-bench-2026/run-one.sh` passes `--use-forked-solver=false`
+> for exactly this reason and this harness should have done the same from the
+> start. The STP-versus-STP sweep is unaffected in kind, but is also being
+> re-run, because STP's incremental driver cannot accumulate state across
+> queries when each query is solved in a child process that then exits.
+
 431 drivers x 3 backends x {dfs, bfs}, 60s exploration budget, 30s solver
 timeout, 20-way parallel. All 2586 runs completed.
 
