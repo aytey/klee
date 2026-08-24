@@ -810,7 +810,9 @@ ExprHandle STPBuilder::constructActual(ref<Expr> e, int *width_out) {
     ExprHandle cond = construct(se->cond, 0);
     ExprHandle tExpr = construct(se->trueExpr, width_out);
     ExprHandle fExpr = construct(se->falseExpr, width_out);
-    return vc_iteExpr(vc, cond, tExpr, fExpr);
+    // Through iteExpr(), not vc_iteExpr(): one arm may have been lifted to
+    // STP's float sort and the other not, and STP rejects a mixed-sort ite.
+    return iteExpr(cond, tExpr, fExpr);
   }
 
   case Expr::Concat: {
