@@ -215,14 +215,11 @@ namespace {
                  cl::init(true),
                  cl::cat(ChecksCat));
 
-
-
   cl::opt<bool>
   OptExitOnError("exit-on-error",
                  cl::desc("Exit KLEE if an error in the tested application has been found (default=false)"),
                  cl::init(false),
                  cl::cat(TerminationCat));
-
 
   /*** Replaying options ***/
   
@@ -294,10 +291,21 @@ namespace {
 
 namespace klee {
 extern cl::opt<std::string> MaxTime;
+
+// add by zgf to get MainExecute Path for JFS
+extern std::string pathToExecutable;
+
+// add by zgf to get default Json config file path
+extern cl::opt<std::string> JsonConfigPath;
+
+// add by zgf to record time gap
+time_t startAnalysisTime,currentTime;
+
 class ExecutionState;
 }
 
 /***/
+
 
 class KleeHandler : public InterpreterHandler {
 private:
@@ -331,7 +339,7 @@ public:
 
   void setInterpreter(Interpreter *i);
 
-  void processTestCase(const ExecutionState  &state,
+  void processTestCase(ExecutionState  &state,
                        const char *errorMessage,
                        const char *errorSuffix);
 
@@ -477,15 +485,28 @@ KleeHandler::openTestFile(const std::string &suffix, unsigned id) {
 
 
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
-void KleeHandler::processTestCase(const ExecutionState &state,
+void KleeHandler::processTestCase(ExecutionState &state,
                                   const char *errorMessage,
                                   const char *errorSuffix) {
   if (!WriteNone) {
     std::vector< std::pair<std::string, std::vector<unsigned char> > > out;
-    bool success = m_interpreter->getSymbolicSolution(state, out);
 
-    if (!success)
-      klee_warning("unable to get symbolic solution, losing test case");
+    // if work in coreutils, open this !
+    //    bool success = m_interpreter->getSymbolicSolution(state, out);
+
+    // modify by zgf : concrete execution use 'state.assignSeed' to get solution,
+    // don't use SMT solver! However, when halt execution, the remain states
+    // in queue don't have seed map to get testcase, so use SMT solver.
+    // this code is ugly !!!
+    bool success = false;
+    if(errorMessage != nullptr) {
+      std::string errMess(errorMessage);
+      if (errMess.find("Execution halting.") != std::string::npos){
+        success = m_interpreter->getSymbolicSolution(state, out);}
+      else
+        success = m_interpreter->getConcreteSymbolicSolution(state,out);
+    }else
+      success = m_interpreter->getConcreteSymbolicSolution(state,out);
 
     const auto start_time = time::getWallTime();
 
@@ -519,6 +540,13 @@ void KleeHandler::processTestCase(const ExecutionState &state,
         delete[] b.objects[i].bytes;
       delete[] b.objects;
     }
+
+    // add by zgf to record ktest produce time gap
+    std::time(&currentTime);
+    double gapSecond = std::difftime(currentTime,startAnalysisTime);
+    auto f = openTestFile("time", id);
+    if (f)
+      *f << (int)gapSecond;
 
     if (errorMessage) {
       auto f = openTestFile(errorSuffix, id);
@@ -652,6 +680,9 @@ std::string KleeHandler::getRunTimeLibraryPath(const char *argv0) {
   SmallString<128> toolRoot(
       llvm::sys::fs::getMainExecutable(argv0, MainExecAddr)
       );
+  // add by zgf : get MainExecutable path for JFS
+  // 获得主执行路径，pathToExecutable是全局变量
+  pathToExecutable = toolRoot.str();
 
   // Strip off executable so we have a directory path
   llvm::sys::path::remove_filename(toolRoot);
@@ -736,6 +767,7 @@ preparePOSIX(std::vector<std::unique_ptr<llvm::Module>> &loadedModules,
   // Rename the POSIX wrapper to prefixed entrypoint, e.g. _user_main as uClibc
   // would expect it or main otherwise
   wrapper->setName(libCPrefix + EntryPoint);
+
 }
 
 
@@ -808,6 +840,27 @@ static const char *modelledExternals[] = {
   "__ubsan_handle_sub_overflow",
   "__ubsan_handle_mul_overflow",
   "__ubsan_handle_divrem_overflow",
+  // add by zgf to support : Floating point intrinstics
+  "klee_is_nan_float",
+  "klee_is_nan_double",
+  "klee_is_nan_long_double",
+  "klee_is_infinite_float",
+  "klee_is_infinite_double",
+  "klee_is_infinite_long_double",
+  "klee_is_normal_float",
+  "klee_is_normal_double",
+  "klee_is_normal_long_double",
+  "klee_is_subnormal_float",
+  "klee_is_subnormal_double",
+  "klee_is_subnormal_long_double",
+  "klee_get_rounding_mode",
+  "klee_set_rounding_mode_internal",
+  "klee_sqrt_float",
+  "klee_sqrt_double",
+  "klee_sqrt_long_double",
+  "klee_abs_float",
+  "klee_abs_double",
+  "klee_abs_long_double",
 };
 
 // Symbols we aren't going to warn about
@@ -965,9 +1018,9 @@ void externalsAndGlobalsCheck(const llvm::Module *m) {
         if (unsafe.count(ext)) {
           foundUnsafe.insert(*it);
         } else {
-          klee_warning("undefined reference to %s: %s",
-                       it->second ? "variable" : "function",
-                       ext.c_str());
+//          klee_warning("undefined reference to %s: %s",
+//                       it->second ? "variable" : "function",
+//                       ext.c_str());
         }
       }
     }
@@ -977,9 +1030,9 @@ void externalsAndGlobalsCheck(const llvm::Module *m) {
          it = foundUnsafe.begin(), ie = foundUnsafe.end();
        it != ie; ++it) {
     const std::string &ext = it->first;
-    klee_warning("undefined reference to %s: %s (UNSAFE)!",
-                 it->second ? "variable" : "function",
-                 ext.c_str());
+//    klee_warning("undefined reference to %s: %s (UNSAFE)!",
+//                 it->second ? "variable" : "function",
+//                 ext.c_str());
   }
 }
 
@@ -1156,6 +1209,9 @@ linkWithUclibc(StringRef libDir, std::string opt_suffix,
 #endif
 
 int main(int argc, char **argv, char **envp) {
+  // 获取当前时间点
+  auto start = std::chrono::high_resolution_clock::now();
+
   atexit(llvm_shutdown);  // Call llvm_shutdown() on exit.
 
 #if LLVM_VERSION_CODE >= LLVM_VERSION(13, 0)
@@ -1166,13 +1222,14 @@ int main(int argc, char **argv, char **envp) {
 
   llvm::InitializeNativeTarget();
 
-  parseArguments(argc, argv);
+  parseArguments(argc, argv);//在屏幕上打印klee的版本及其输入的命令行参数
 #if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
   sys::PrintStackTraceOnErrorSignal(argv[0]);
 #else
   sys::PrintStackTraceOnErrorSignal();
 #endif
 
+  //当指定-maxtime的时候，用watchdog来监听执行的时间
   if (Watchdog) {
     if (MaxTime.empty()) {
       klee_error("--watchdog used without --max-time");
@@ -1187,8 +1244,11 @@ int main(int argc, char **argv, char **envp) {
       sys::SetInterruptFunction(interrupt_handle_watchdog);
 
       const time::Span maxTime(MaxTime);
-      auto nextStep = time::getWallTime() + maxTime + (maxTime / 10);
+      auto nextStep = time::getWallTime() + maxTime + (maxTime / 100);
       int level = 0;
+
+      // add by zgf
+      //auto startTime = time::getWallTime();
 
       // Simple stupid code...
       while (1) {
@@ -1211,6 +1271,10 @@ int main(int argc, char **argv, char **envp) {
         } else {
           auto time = time::getWallTime();
 
+          // add by zgf
+          //time::Span delta = time - startTime;
+          //llvm::errs()<<"[zgf dbg] delta : "<<delta.toSeconds()<<"\n";
+
           if (time > nextStep) {
             ++level;
 
@@ -1231,7 +1295,7 @@ int main(int argc, char **argv, char **envp) {
 
             // Ideally this triggers a dump, which may take a while,
             // so try and give the process extra time to clean up.
-            auto max = std::max(time::seconds(15), maxTime / 10);
+            auto max = std::max(time::seconds(15), maxTime / 100);
             nextStep = time::getWallTime() + max;
           }
         }
@@ -1241,13 +1305,14 @@ int main(int argc, char **argv, char **envp) {
     }
   }
 
+  //当ctrl-c的时候，运行终止
   sys::SetInterruptFunction(interrupt_handle);
 
   // Load the bytecode...
   std::string errorMsg;
   LLVMContext ctx;
   std::vector<std::unique_ptr<llvm::Module>> loadedModules;
-  if (!klee::loadFile(InputFile, ctx, loadedModules, errorMsg)) {
+  if (!klee::loadFile(InputFile, ctx, loadedModules, errorMsg)) {//加载输入的bc文件
     klee_error("error loading program '%s': %s", InputFile.c_str(),
                errorMsg.c_str());
   }
@@ -1329,7 +1394,7 @@ int main(int argc, char **argv, char **envp) {
 #endif
   }
 
-  switch (Libc) {
+  switch (Libc) {//根据对libc参数的指定来链接相应的库
   case LibcType::KleeLibc: {
     // FIXME: Find a reasonable solution for this.
     SmallString<128> Path(Opts.LibraryDir);
@@ -1389,17 +1454,18 @@ int main(int argc, char **argv, char **envp) {
     pEnvp = envp;
   }
 
+  //add yx; init inputArgvis null, so input argv.siz()=0; pArgc=1; the number of the input bc file argv
   pArgc = InputArgv.size() + 1;
-  pArgv = new char *[pArgc];
+  pArgv = new char *[pArgc]; //add yx:  pArgv is double point, 1th point every index is array with size=pArgc
   for (unsigned i=0; i<InputArgv.size()+1; i++) {
-    std::string &arg = (i==0 ? InputFile : InputArgv[i-1]);
-    unsigned size = arg.size() + 1;
+    std::string &arg = (i==0 ? InputFile : InputArgv[i-1]);//第一次拿bc文件名，后面拿bc文件的输入参数
+    unsigned size = arg.size() + 1;//i-th argument string size
     char *pArg = new char[size];
 
-    std::copy(arg.begin(), arg.end(), pArg);
-    pArg[size - 1] = 0;
+    std::copy(arg.begin(), arg.end(), pArg); //将arg中赋值到parg
+    pArg[size - 1] = 0;//增加一位，然后置为0是为了分隔不同的参数
 
-    pArgv[i] = pArg;
+    pArgv[i] = pArg;//存放的是，第一个是bc文件名，后面是该文件的输入参数
   }
 
   std::vector<bool> replayPath;
@@ -1408,13 +1474,17 @@ int main(int argc, char **argv, char **envp) {
     KleeHandler::loadPathFile(ReplayPathFile, replayPath);
   }
 
+  //创建handler，interpreter，并setInterpreter
   Interpreter::InterpreterOptions IOpts;
-  IOpts.MakeConcreteSymbolic = MakeConcreteSymbolic;
+  IOpts.MakeConcreteSymbolic = MakeConcreteSymbolic;//确认是否正确对具体程序符号化
+  //句柄，将pArgc，pArgv，建立一个（pArgc,pArgv）对应的唯一句柄，包装起来。同时这条语句会打印output directory info
   KleeHandler *handler = new KleeHandler(pArgc, pArgv);
+  ////返回executor(ctx,IOpts,handler)。同时打印使用求解器信息
+  //先调用new FPExecutor 然后FPExectuor构造函数中调用了Executor, 然后Executor中调用了klee::createCoreSolver（里面选择求解器，打印信息）
   Interpreter *interpreter =
-    theInterpreter = Interpreter::create(ctx, IOpts, handler);
+    theInterpreter = Interpreter::create(ctx, IOpts, handler);//
   assert(interpreter);
-  handler->setInterpreter(interpreter);
+  handler->setInterpreter(interpreter);//打印参数，PID信息到info文件
 
   for (int i=0; i<argc; i++) {
     handler->getInfoStream() << argv[i] << (i+1<argc ? " ":"\n");
@@ -1423,20 +1493,20 @@ int main(int argc, char **argv, char **envp) {
 
   // Get the desired main function.  klee_main initializes uClibc
   // locale and other data and then calls main.
-
+  // 设置模型，选择函数等等，打印“KLEE: Replacing function "fabs" with "klee_internal_fabs"”
   auto finalModule = interpreter->setModule(loadedModules, Opts);
-  Function *mainFn = finalModule->getFunction(EntryPoint);
+  Function *mainFn = finalModule->getFunction(EntryPoint);//拿到入口函数
   if (!mainFn) {
     klee_error("Entry function '%s' not found in module.", EntryPoint.c_str());
   }
 
   externalsAndGlobalsCheck(finalModule);
 
-  if (ReplayPathFile != "") {
+  if (ReplayPathFile != "") {//ReeplayPathFile 是输入的一个参数，debug的这个例子中，这里是空""
     interpreter->setReplayPath(&replayPath);
   }
 
-
+  //输出开始时间信息，格式
   auto startTime = std::time(nullptr);
   { // output clock info and start time
     std::stringstream startInfo;
@@ -1447,6 +1517,7 @@ int main(int argc, char **argv, char **envp) {
     handler->getInfoStream().flush();
   }
 
+  //ReplayKTestDir,ReplayKTestFile也是两个输入参数，在这个debug例子中，是空。
   if (!ReplayKTestDir.empty() || !ReplayKTestFile.empty()) {
     assert(SeedOutFile.empty());
     assert(SeedOutDir.empty());
@@ -1460,7 +1531,7 @@ int main(int argc, char **argv, char **envp) {
     for (std::vector<std::string>::iterator
            it = kTestFiles.begin(), ie = kTestFiles.end();
          it != ie; ++it) {
-      KTest *out = kTest_fromFile(it->c_str());
+      KTest *out = kTest_fromFile(it->c_str());//ktest文件，存放到out中，后续对out进行操作
       if (out) {
         kTests.push_back(out);
       } else {
@@ -1476,6 +1547,7 @@ int main(int argc, char **argv, char **envp) {
       }
     }
 
+    //这里是打印
     unsigned i=0;
     for (std::vector<KTest*>::iterator
            it = kTests.begin(), ie = kTests.end();
@@ -1486,7 +1558,7 @@ int main(int argc, char **argv, char **envp) {
                    << " bytes)"
                    << " (" << ++i << "/" << kTestFiles.size() << ")\n";
       // XXX should put envp in .ktest ?
-      interpreter->runFunctionAsMain(mainFn, out->numArgs, out->args, pEnvp);
+      interpreter->runFunctionAsMain(mainFn, out->numArgs, out->args, pEnvp);//调用Excutor中的函数，每个Ktest都执行一次
       if (interrupted) break;
     }
     interpreter->setReplayKTest(0);
@@ -1535,7 +1607,11 @@ int main(int argc, char **argv, char **envp) {
                    sys::StrError(errno).c_str());
       }
     }
-    interpreter->runFunctionAsMain(mainFn, pArgc, pArgv, pEnvp);
+    // add by zgf to record ktest time gap
+    std::time(&startAnalysisTime);
+
+    //  yx;  mainFn: entryFunction;  pArgc: inputarg.size();  pArgv:double point
+    interpreter->runFunctionAsMain(mainFn, pArgc, pArgv, pEnvp);//调用executor 中的函数，执行一次
 
     while (!seeds.empty()) {
       kTest_free(seeds.back());
@@ -1583,6 +1659,8 @@ int main(int argc, char **argv, char **envp) {
     *theStatisticManager->getStatisticByName("Instructions");
   uint64_t forks =
     *theStatisticManager->getStatisticByName("Forks");
+  uint64_t drealInvalid =
+          *theStatisticManager->getStatisticByName("DrealInvalid");
 
   handler->getInfoStream()
     << "KLEE: done: explored paths = " << 1 + forks << "\n";
@@ -1624,6 +1702,12 @@ int main(int argc, char **argv, char **envp) {
   handler->getInfoStream() << stats.str();
 
   delete handler;
+
+  //add by yx
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << "Total exec time: " << milliseconds << " ms" << "\n";
 
   return 0;
 }

@@ -192,7 +192,6 @@ void Optimize(Module *M, llvm::ArrayRef<const char *> preservedFunctions) {
 #if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
     auto PreserveFunctions = [=](const GlobalValue &GV) {
       StringRef GVName = GV.getName();
-
       for (const char *fun : preservedFunctions)
         if (GVName.equals(fun))
           return true;

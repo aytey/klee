@@ -179,7 +179,6 @@ klee::linkModules(std::vector<std::unique_ptr<llvm::Module>> &modules,
   // Starting from the module containing the entry function, resolve unresolved
   // dependencies recursively
 
-
   // search for the module containing the entry function
   std::unique_ptr<llvm::Module> composite;
   for (auto &module : modules) {
@@ -223,6 +222,7 @@ klee::linkModules(std::vector<std::unique_ptr<llvm::Module>> &modules,
                  errorMsg;
       return nullptr;
     }
+
     module = nullptr;
   }
 
@@ -401,6 +401,7 @@ bool klee::loadFile(const std::string &fileName, LLVMContext &context,
       klee_error("Loading file %s failed: %s", fileName.c_str(),
                  Err.getMessage().str().c_str());
     }
+
     modules.push_back(std::move(module));
     return true;
   }

@@ -455,13 +455,12 @@ bool assertCreatedPointEvaluatesToTrue(
 
   for (auto const &constraint : query.constraints) {
     ref<Expr> ret = assign.evaluate(constraint);
-
-    assert(isa<ConstantExpr>(ret) &&
-           "assignment evaluation did not result in constant");
+//    assert(isa<ConstantExpr>(ret) &&
+//           "assignment evaluation did not result in constant");
+    // modify by zgf
     ref<ConstantExpr> evaluatedConstraint = dyn_cast<ConstantExpr>(ret);
-    if (evaluatedConstraint->isFalse()) {
+    if (!isa<ConstantExpr>(ret) || evaluatedConstraint->isFalse())
       return false;
-    }
   }
   ref<Expr> neg = Expr::createIsZero(query.expr);
   ref<Expr> q = assign.evaluate(neg);
@@ -534,13 +533,22 @@ bool IndependentSolver::computeInitialValues(const Query& query,
       // this means we have an array that is somehow related to the
       // constraint, but whose values aren't actually required to
       // satisfy the query.
+
+      // note by zgf : it means if a symbolic value is not restricted
+      // by either constraint, the fill it with 'Zero'
       std::vector<unsigned char> ret(arr->size);
       values.push_back(ret);
     } else {
       values.push_back(retMap[arr]);
     }
   }
-  assert(assertCreatedPointEvaluatesToTrue(query, objects, values, retMap) && "should satisfy the equation");
+//  assert(assertCreatedPointEvaluatesToTrue(query, objects, values, retMap)
+//          && "should satisfy the equation");
+  // modify by zgf
+  if (!assertCreatedPointEvaluatesToTrue(query, objects, values, retMap)){
+    delete factors;
+    return false;
+  }
   delete factors;
   return true;
 }

@@ -27,6 +27,8 @@
 
 #include <csetjmp>
 #include <csignal>
+// add by zgf to support float point
+#include <fenv.h>
 
 using namespace llvm;
 using namespace klee;
@@ -62,8 +64,9 @@ private:
 public:
   ExternalDispatcherImpl(llvm::LLVMContext &ctx);
   ~ExternalDispatcherImpl();
+  // modify by zgf to support float point
   bool executeCall(llvm::Function *function, llvm::Instruction *i,
-                   uint64_t *args);
+                   uint64_t *args, int roundingMode);
   void *resolveSymbol(const std::string &name);
   int getLastErrno();
   void setLastErrno(int newErrno);
@@ -157,7 +160,7 @@ ExternalDispatcherImpl::~ExternalDispatcherImpl() {
 }
 
 bool ExternalDispatcherImpl::executeCall(Function *f, Instruction *i,
-                                         uint64_t *args) {
+                                         uint64_t *args, int roundingMode) {
   dispatchers_ty::iterator it = dispatchers.find(i);
   if (it != dispatchers.end()) {
     // Code already JIT'ed for this
@@ -232,6 +235,8 @@ bool ExternalDispatcherImpl::runProtectedCall(Function *f, uint64_t *args) {
     res = false;
   } else {
     errno = lastErrno;
+    // target by zgf : syscall no respond in 'cat.bc'
+    // find reason : not set sym-args and sym-stdin stdout correctly !
     executionEngine->runFunction(f, gvArgs);
     // Explicitly acquire errno information
     lastErrno = errno;
@@ -347,8 +352,9 @@ ExternalDispatcher::ExternalDispatcher(llvm::LLVMContext &ctx)
 ExternalDispatcher::~ExternalDispatcher() { delete impl; }
 
 bool ExternalDispatcher::executeCall(llvm::Function *function,
-                                     llvm::Instruction *i, uint64_t *args) {
-  return impl->executeCall(function, i, args);
+                                     llvm::Instruction *i, uint64_t *args,
+                                     int roundingMode) {
+  return impl->executeCall(function, i, args,roundingMode);
 }
 
 void *ExternalDispatcher::resolveSymbol(const std::string &name) {

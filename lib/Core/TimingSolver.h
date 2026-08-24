@@ -15,12 +15,19 @@
 #include "klee/Solver/Solver.h"
 #include "klee/System/Time.h"
 
+//add by zgf
+#include "SeedInfo.h"
+
 #include <memory>
 #include <vector>
 
 namespace klee {
 class ConstraintSet;
 class Solver;
+
+//add by zgf
+class ExecutionState;
+class SeedInfo;
 
 /// TimingSolver - A simple class which wraps a solver and handles
 /// tracking the statistics that we care about.
@@ -44,32 +51,44 @@ public:
     return solver->getConstraintLog(query);
   }
 
-  bool evaluate(const ConstraintSet &, ref<Expr>, Solver::Validity &result,
-                SolverQueryMetaData &metaData);
+  // modify by zgf : add 'useSeed' to support concrete
+  bool evaluate(ExecutionState &, ref<Expr>, Solver::Validity &result,
+                SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool mustBeTrue(const ConstraintSet &, ref<Expr>, bool &result,
-                  SolverQueryMetaData &metaData);
+  bool mustBeTrue(ExecutionState &, ref<Expr>, bool &result,
+                  SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool mustBeFalse(const ConstraintSet &, ref<Expr>, bool &result,
-                   SolverQueryMetaData &metaData);
+  bool mustBeFalse(ExecutionState &, ref<Expr>, bool &result,
+                   SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool mayBeTrue(const ConstraintSet &, ref<Expr>, bool &result,
-                 SolverQueryMetaData &metaData);
+  bool mayBeTrue(ExecutionState &, ref<Expr>, bool &result,
+                 SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool mayBeFalse(const ConstraintSet &, ref<Expr>, bool &result,
-                  SolverQueryMetaData &metaData);
+  bool mayBeFalse(ExecutionState &, ref<Expr>, bool &result,
+                  SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool getValue(const ConstraintSet &, ref<Expr> expr,
-                ref<ConstantExpr> &result, SolverQueryMetaData &metaData);
+  bool getValue(ExecutionState &, ref<Expr> expr,ref<ConstantExpr> &result,
+                SolverQueryMetaData &metaData, bool useSeed = true);
 
-  bool getInitialValues(const ConstraintSet &,
+  bool getInitialValues(ExecutionState &,
                         const std::vector<const Array *> &objects,
                         std::vector<std::vector<unsigned char>> &result,
                         SolverQueryMetaData &metaData);
 
-  std::pair<ref<Expr>, ref<Expr>> getRange(const ConstraintSet &,
+  // add by zgf : use for compute state.assignSeed using constraintSet which
+  // not contains SFC, only use for compute 'Common' constraintSet.
+  bool getInitialValuesWithConstrintSet(
+      ConstraintSet &,
+      const std::vector<const Array *> &objects,
+      std::vector<std::vector<unsigned char>> &result,
+      SolverQueryMetaData &metaData
+      );
+
+  std::pair<ref<Expr>, ref<Expr>> getRange(ExecutionState &,
                                            ref<Expr> query,
-                                           SolverQueryMetaData &metaData);
+                                           SolverQueryMetaData &metaData,
+                                           bool useSeed = true);
+
 };
 }
 

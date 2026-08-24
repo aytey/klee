@@ -16,6 +16,8 @@ ArrayCache::~ArrayCache() {
   }
 }
 
+
+//[yx  改初始化种子]
 const Array *
 ArrayCache::CreateArray(const std::string &_name, uint64_t _size,
                         const ref<ConstantExpr> *constantValuesBegin,

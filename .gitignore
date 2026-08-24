@@ -1,32 +1,39 @@
-Release/
-Release+Asserts/
-Debug/
-Debug+Asserts/
-Output/
+# Prerequisites
+*.d
 
-# commonly used as cmake build directory
-/build
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
 
-cscope.*
-*~
+# Precompiled Headers
+*.gch
+*.pch
 
-*.log
-*.sum
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
 *.out
-*.status
+*.app
 
-# In source build files
-docs/doxygen.cfg
-include/klee/Config/CompileTimeInfo.h
-*.config
+.idea/
 
-config.h
-site.exp
+build/
+cmake-build-debug/
 
-# Site file for llvm-lit
-lit.site.cfg
-
-# Autoconf files
-autoconf/aclocal.m4
-autoconf/autom4te.cache/
-autom4te.cache/
+examples/

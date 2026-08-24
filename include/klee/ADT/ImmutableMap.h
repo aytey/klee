@@ -64,10 +64,10 @@ namespace klee {
       return elts.size(); 
     }
 
-    ImmutableMap insert(const value_type &value) const { 
+    ImmutableMap insert(const value_type &value) const {
       return elts.insert(value); 
     }
-    ImmutableMap replace(const value_type &value) const { 
+    ImmutableMap replace(const value_type &value) const {
       return elts.replace(value); 
     }
     ImmutableMap remove(const key_type &key) const { 

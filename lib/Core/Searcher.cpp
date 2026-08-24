@@ -36,9 +36,7 @@
 using namespace klee;
 using namespace llvm;
 
-
 ///
-
 ExecutionState &DFSSearcher::selectState() {
   return *states.back();
 }
@@ -55,8 +53,10 @@ void DFSSearcher::update(ExecutionState *current,
       states.pop_back();
     } else {
       auto it = std::find(states.begin(), states.end(), state);
-      assert(it != states.end() && "invalid state removed");
-      states.erase(it);
+      //assert(it != states.end() && "invalid state removed");
+      // modify by zgf : when watch dog exit, dumpstates may assert failed
+      if (it != states.end())
+        states.erase(it);
     }
   }
 }
@@ -99,8 +99,10 @@ void BFSSearcher::update(ExecutionState *current,
       states.pop_front();
     } else {
       auto it = std::find(states.begin(), states.end(), state);
-      assert(it != states.end() && "invalid state removed");
-      states.erase(it);
+      //assert(it != states.end() && "invalid state removed");
+      // modify by zgf : when watch dog exit, dumpstates may assert failed
+      if (it != states.end())
+        states.erase(it);
     }
   }
 }

@@ -1,0 +1,31 @@
+#===------------------------------------------------------------------------===#
+#
+#                                      JFS
+#
+# Copyright 2017-2018 Daniel Liew
+#
+# This file is distributed under the MIT license.
+# See LICENSE.txt for details.
+#
+#===------------------------------------------------------------------------===#
+jfs_add_component(JFSCore
+  JFSContext.cpp
+  Model.cpp
+  ModelValidator.cpp
+  Query.cpp
+  RNG.cpp
+  SimpleModel.cpp
+  SMTLIB2Parser.cpp
+  Solver.cpp
+  ToolErrorHandler.cpp
+  Z3ASTVisitor.cpp
+  Z3Node.cpp
+  Z3NodeUtil.cpp
+)
+# Needed for command line support
+#jfs_get_llvm_components(llvm_components support)
+#target_link_libraries(JFSCore PUBLIC JFSSupport "${Z3_LIBRARIES}" ${llvm_components})
+
+set(LLVM_COMPONENTS support)
+klee_get_llvm_libs(LLVM_LIBS ${LLVM_COMPONENTS})
+target_link_libraries(JFSCore PUBLIC  JFSSupport "${Z3_LIBRARIES}" ${LLVM_LIBS})

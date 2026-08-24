@@ -33,6 +33,7 @@ using namespace llvm;
 namespace klee {
 
   ref<klee::ConstantExpr> Executor::evalConstant(const Constant *c,
+                                                 llvm::APFloat::roundingMode rm,
                                                  const KInstruction *ki) {
     if (!ki) {
       KConstant* kc = kmodule->getKConstant(c);
@@ -41,12 +42,13 @@ namespace klee {
     }
 
     if (const llvm::ConstantExpr *ce = dyn_cast<llvm::ConstantExpr>(c)) {
-      return evalConstantExpr(ce, ki);
+      return evalConstantExpr(ce, rm, ki);
     } else {
       if (const ConstantInt *ci = dyn_cast<ConstantInt>(c)) {
         return ConstantExpr::alloc(ci->getValue());
       } else if (const ConstantFP *cf = dyn_cast<ConstantFP>(c)) {
-        return ConstantExpr::alloc(cf->getValueAPF().bitcastToAPInt());
+        // modify by zgf to support float point operation
+        return ConstantExpr::alloc(cf->getValueAPF());
       } else if (const GlobalValue *gv = dyn_cast<GlobalValue>(c)) {
         auto it = globalAddresses.find(gv);
         assert(it != globalAddresses.end());
@@ -67,7 +69,7 @@ namespace klee {
         // the last element the highest
         std::vector<ref<Expr> > kids;
         for (unsigned i = cds->getNumElements(); i != 0; --i) {
-          ref<Expr> kid = evalConstant(cds->getElementAsConstant(i - 1), ki);
+          ref<Expr> kid = evalConstant(cds->getElementAsConstant(i - 1), rm, ki);
           kids.push_back(kid);
         }
         assert(Context::get().isLittleEndian() &&
@@ -79,7 +81,7 @@ namespace klee {
         llvm::SmallVector<ref<Expr>, 4> kids;
         for (unsigned i = cs->getNumOperands(); i != 0; --i) {
           unsigned op = i-1;
-          ref<Expr> kid = evalConstant(cs->getOperand(op), ki);
+          ref<Expr> kid = evalConstant(cs->getOperand(op), rm, ki);
 
           uint64_t thisOffset = sl->getElementOffsetInBits(op),
             nextOffset = (op == cs->getNumOperands() - 1)
@@ -100,7 +102,7 @@ namespace klee {
         llvm::SmallVector<ref<Expr>, 4> kids;
         for (unsigned i = ca->getNumOperands(); i != 0; --i) {
           unsigned op = i-1;
-          ref<Expr> kid = evalConstant(ca->getOperand(op), ki);
+          ref<Expr> kid = evalConstant(ca->getOperand(op), rm, ki);
           kids.push_back(kid);
         }
         assert(Context::get().isLittleEndian() &&
@@ -112,7 +114,7 @@ namespace klee {
         const size_t numOperands = cv->getNumOperands();
         kids.reserve(numOperands);
         for (unsigned i = numOperands; i != 0; --i) {
-          kids.push_back(evalConstant(cv->getOperand(i - 1), ki));
+          kids.push_back(evalConstant(cv->getOperand(i - 1), rm, ki));
         }
         assert(Context::get().isLittleEndian() &&
                "FIXME:Broken for big endian");
@@ -136,15 +138,16 @@ namespace klee {
   }
 
   ref<ConstantExpr> Executor::evalConstantExpr(const llvm::ConstantExpr *ce,
+                                               llvm::APFloat::roundingMode rm,
                                                const KInstruction *ki) {
     llvm::Type *type = ce->getType();
 
     ref<ConstantExpr> op1(0), op2(0), op3(0);
     int numOperands = ce->getNumOperands();
 
-    if (numOperands > 0) op1 = evalConstant(ce->getOperand(0), ki);
-    if (numOperands > 1) op2 = evalConstant(ce->getOperand(1), ki);
-    if (numOperands > 2) op3 = evalConstant(ce->getOperand(2), ki);
+    if (numOperands > 0) op1 = evalConstant(ce->getOperand(0), rm, ki);
+    if (numOperands > 1) op2 = evalConstant(ce->getOperand(1), rm, ki);
+    if (numOperands > 2) op3 = evalConstant(ce->getOperand(2), rm, ki);
 
     /* Checking for possible errors during constant folding */
     switch (ce->getOpcode()) {
@@ -209,7 +212,7 @@ namespace klee {
       for (gep_type_iterator ii = gep_type_begin(ce), ie = gep_type_end(ce);
            ii != ie; ++ii) {
         ref<ConstantExpr> indexOp =
-            evalConstant(cast<Constant>(ii.getOperand()), ki);
+            evalConstant(cast<Constant>(ii.getOperand()), rm, ki);
         if (indexOp->isZero())
           continue;
 
@@ -257,11 +260,16 @@ namespace klee {
     case Instruction::Select:
       return op1->isTrue() ? op2 : op3;
 
-    case Instruction::FAdd:
-    case Instruction::FSub:
-    case Instruction::FMul:
-    case Instruction::FDiv:
-    case Instruction::FRem:
+    // add by zgf : Floating point
+    case Instruction::FAdd: return op1->FAdd(op2, rm);
+    case Instruction::FSub: return op1->FSub(op2, rm);
+    case Instruction::FMul: return op1->FMul(op2, rm);
+    case Instruction::FDiv: return op1->FDiv(op2, rm);
+
+    case Instruction::FRem: {
+      // FIXME:
+      llvm_unreachable("Not supported");
+    }
     case Instruction::FPTrunc:
     case Instruction::FPExt:
     case Instruction::UIToFP:

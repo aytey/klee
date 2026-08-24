@@ -27,8 +27,7 @@
 #include <iomanip>
 #include <map>
 #include <set>
-#include <sstream>
-#include <stdarg.h>
+#include <utility>
 
 using namespace llvm;
 using namespace klee;
@@ -58,7 +57,8 @@ StackFrame::StackFrame(const StackFrame &s)
     callPathNode(s.callPathNode),
     allocas(s.allocas),
     minDistToUncoveredOnReturn(s.minDistToUncoveredOnReturn),
-    varargs(s.varargs) {
+    varargs(s.varargs),
+    BBcounter(s.BBcounter){
   locals = new Cell[s.kf->numRegisters];
   for (unsigned i=0; i<s.kf->numRegisters; i++)
     locals[i] = s.locals[i];
@@ -68,10 +68,23 @@ StackFrame::~StackFrame() {
   delete[] locals; 
 }
 
+// add by zgf
+ComplexFunction::ComplexFunction(std::string func_name,
+                                 std::vector<ref<Expr>> args,
+                                 unsigned stack_size,
+                                 unsigned constraint_size)
+    : func_name(std::move(func_name)), args(std::move(args)),
+      stack_size(stack_size),constraint_size(constraint_size){}
+ComplexFunction::~ComplexFunction(){args.clear();}
+
 /***/
 
 ExecutionState::ExecutionState(KFunction *kf)
-    : pc(kf->instructions), prevPC(pc) {
+    : pc(kf->instructions),
+      prevPC(pc),
+      roundingMode(llvm::APFloat::rmNearestTiesToEven), // add by zgf
+      fp2intState(FP2INTState(static_cast<std::vector<ref<Expr>>>(NULL),0,0)) // add by zgf
+{
   pushFrame(nullptr, kf);
   setID();
 }
@@ -99,6 +112,9 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     cexPreferences(state.cexPreferences),
     arrayNames(state.arrayNames),
     openMergeStack(state.openMergeStack),
+    roundingMode(state.roundingMode), // add by zgf to support float point
+    assignSeed(state.assignSeed), // add by zgf to support 'assignSeed'
+    fp2intState(state.fp2intState),
     steppedInstructions(state.steppedInstructions),
     instsSinceCovNew(state.instsSinceCovNew),
     unwindingInformation(state.unwindingInformation
@@ -108,6 +124,27 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     forkDisabled(state.forkDisabled) {
   for (const auto &cur_mergehandler: openMergeStack)
     cur_mergehandler->addOpenState(this);
+}
+
+ExecutionState *ExecutionState::copyConcrete() {
+  depth++;
+
+  auto *copyState = new ExecutionState(*this);
+  copyState->setID();
+  copyState->coveredNew = false;
+  copyState->coveredLines.clear();
+
+  // add by zgf to support FP2INT
+  copyState->fp2intExecuteStack = this->fp2intExecuteStack;
+  copyState->fp2intCheckType = this->fp2intCheckType;
+  copyState->inst_id = this->inst_id;
+  copyState->fp2intState = this->fp2intState;
+
+  // add by zgf to support filter libmath error check
+  copyState->fpErrorStack = this->fpErrorStack;
+  copyState->forkDisabled = this->forkDisabled;
+
+  return copyState;
 }
 
 ExecutionState *ExecutionState::branch() {
@@ -355,4 +392,27 @@ void ExecutionState::addConstraint(ref<Expr> e) {
 
 void ExecutionState::addCexPreference(const ref<Expr> &cond) {
   cexPreferences = cexPreferences.insert(cond);
+}
+
+// add by zgf : initial constraints means these constraints
+// will not be simplified and replaced by constant value,
+// and these constraints are used to get initial 'state.assignSeed'
+void ExecutionState::addInitialConstraint(ref<Expr> e) {
+  ConstraintManager c(constraints);
+  c.addInitialConstraint(e);
+}
+
+bool ExecutionState::checkConstraintExists(ref<Expr> e) {
+  for (const auto &constraint : constraints)
+    if (constraint->hash() == e->hash())
+      return true;
+  return false;
+}
+
+void ExecutionState::reverseLastConstraint() {
+  constraints.reverseLastConstraint();
+}
+
+void ExecutionState::leftNConstraints(unsigned leftSize) {
+  constraints.leftNConstraints(leftSize);
 }

@@ -73,6 +73,52 @@ void klee::findReads(ref<Expr> e,
   }
 }
 
+// add by zgf
+void klee::findSFCReads(ref<Expr> e,
+           std::vector< ref<ReadExpr> > &results) {
+  // Invariant: \forall_{i \in stack} !i.isConstant() && i \in visited
+  std::vector< ref<Expr> > stack;
+  std::vector< bool > SFCStack;
+  ExprHashSet visited;
+  std::set<const UpdateNode *> updates;
+
+  if (!isa<ConstantExpr>(e)) {
+    visited.insert(e);
+    stack.push_back(e);
+    SFCStack.push_back( isa<SFCExpr>(e) ? true : false);
+  }
+
+  while (!stack.empty()) {
+    ref<Expr> top = stack.back();
+    bool sfcFlag = SFCStack.back();
+    stack.pop_back();
+    SFCStack.pop_back();
+
+    if (ReadExpr *re = dyn_cast<ReadExpr>(top)) {
+      // We memoized so can just add to list without worrying about
+      // repeats.
+      if (sfcFlag)
+        results.push_back(re);
+
+      if (!isa<ConstantExpr>(re->index) &&
+          visited.insert(re->index).second){
+        stack.push_back(re->index);
+        SFCStack.push_back( isa<SFCExpr>(re->index) ? true : false);
+      }
+    } else if (!isa<ConstantExpr>(top)) {
+      Expr *e = top.get();
+      for (unsigned i=0; i<e->getNumKids(); i++) {
+        ref<Expr> k = e->getKid(i);
+        if (!isa<ConstantExpr>(k) &&
+            visited.insert(k).second){
+          stack.push_back(k);
+          SFCStack.push_back( isa<SFCExpr>(re->index) ? true : false);
+        }
+      }
+    }
+  }
+}
+
 ///
 
 namespace klee {
@@ -118,6 +164,23 @@ ExprVisitor::Action ConstantArrayFinder::visitRead(const ReadExpr &re) {
 
   return Action::doChildren();
 }
+/*
+// add by zgf for 'SFC'
+SFCExprVisitor::Action SFCConstantArrayFinder::visitRead(const ReadExpr &re) {
+  const UpdateList &ul = re.updates;
+
+  // FIXME should we memo better than what ExprVisitor is doing for us?
+  for (const auto *un = ul.head.get(); un; un = un->next.get()) {
+    visit(un->index);
+    visit(un->value);
+  }
+
+  if (ul.root->isConstantArray()) {
+    results.insert(ul.root);
+  }
+
+  return Action::doChildren();
+}*/
 }
 
 template<typename InputIterator>

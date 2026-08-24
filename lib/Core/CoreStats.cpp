@@ -26,3 +26,6 @@ Statistic stats::solverTime("SolverTime", "Stime");
 Statistic stats::states("States", "States");
 Statistic stats::trueBranches("TrueBranches", "Bt");
 Statistic stats::uncoveredInstructions("UncoveredInstructions", "Iuncov");
+
+// add by zgf
+Statistic stats::drealInvalid("DrealInvalid", "DInvalid");

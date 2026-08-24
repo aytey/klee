@@ -21,6 +21,7 @@
 #include "klee/Solver/Solver.h"
 #include "klee/System/Time.h"
 
+#include <llvm/IR/BasicBlock.h>
 #include <map>
 #include <memory>
 #include <set>
@@ -51,6 +52,7 @@ struct StackFrame {
   /// quickly compute the context sensitive minimum distance to an
   /// uncovered instruction. This value is updated by the StatsTracker
   /// periodically.
+  /// 函数返回时到未覆盖的指令的最小距离。这不是一个好地方，但可以用来快速计算上下文敏感的到未覆盖指令的最小距离。这个值由StatsTracker定期更新。
   unsigned minDistToUncoveredOnReturn;
 
   // For vararg functions: arguments not passed via parameter are
@@ -59,6 +61,10 @@ struct StackFrame {
   // does not pass vaarg through as expected). VACopy is lowered inside
   // of intrinsic lowering.
   MemoryObject *varargs;
+
+  /// add by zgf : In order to avoid infinite loop in concrete mode,
+  /// we count the visited basic block ID, if unbound, kill this state early.
+  std::map<unsigned,unsigned> BBcounter;
 
   StackFrame(KInstIterator caller, KFunction *kf);
   StackFrame(const StackFrame &s);
@@ -143,14 +149,41 @@ struct CleanupPhaseUnwindingInformation : public UnwindingInformation {
   }
 };
 
-/// @brief ExecutionState representing a path under exploration
+/// add by zgf to describe complex function
+struct ComplexFunction{
+  std::string func_name;
+  std::vector<ref<Expr>> args;
+  unsigned stack_size;
+  unsigned constraint_size;
+
+  ComplexFunction(std::string func_name,
+                  std::vector<ref<Expr>> args,
+                  unsigned stack_size,
+                  unsigned constraint_size);
+  ~ComplexFunction();
+};
+
+/// add by zgf to describe complex function
+struct FP2INTState{
+  std::vector<ref<Expr>> args;
+  unsigned opCode;
+  unsigned errCode;
+
+  FP2INTState(std::vector<ref<Expr>> _args,
+              unsigned _opCode,
+              unsigned _errCode):
+              opCode(_opCode),errCode(_errCode),args(_args){};
+  ~FP2INTState(){args.clear();};
+};
+
+/// @brief ExecutionState representing a path under exploration 正在探测的路径
 class ExecutionState {
 #ifdef KLEE_UNITTEST
 public:
 #else
 private:
 #endif
-  // copy ctor
+  // copy ctor   构造函数
   ExecutionState(const ExecutionState &state);
 
 public:
@@ -190,6 +223,7 @@ public:
 
   /// @brief History of complete path: represents branches taken to
   /// reach/create this state (both concrete and symbolic)
+  /// 表示用于达到/创建此状态的分支(具体的和象征性的)
   TreeOStream pathOS;
 
   /// @brief History of symbolic path: represents symbolic branches
@@ -240,6 +274,27 @@ public:
   /// @brief Disables forking for this state. Set by user code
   bool forkDisabled = false;
 
+  /// add by zgf : fake state is forked to raise error detection, dont't add it
+  /// into 'removedStates' or 'addedStates'
+  bool fakeState = false;
+
+  /// add by zgf : The floating point rounding mode for the current state
+  llvm::APFloat::roundingMode roundingMode;
+
+  // add by zgf : seed computed at the beginning use for concreteMode
+  Assignment assignSeed;
+
+  // add by zgf : record the first function when enter softfloat lib,
+  // use to FP2INT fpcheck
+  unsigned fp2intExecuteStack = 0;
+  std::uint32_t fp2intCheckType = 0, inst_id = 0; // 0:not check, 1:overflow 2:underflow 3:invalid 4:divzero
+  FP2INTState fp2intState;
+
+  unsigned basicBlockEntry;
+
+  // add by zgf: to support filter lib math function check float errors
+  unsigned fpErrorStack = 0;
+
 public:
 #ifdef KLEE_UNITTEST
   // provide this function only in the context of unittests
@@ -271,6 +326,18 @@ public:
 
   std::uint32_t getID() const { return id; };
   void setID() { id = nextID++; };
+
+  /// add by zgf : save constraints for next execution, don't simplify
+  void addInitialConstraint(ref<Expr> e);
+  ExecutionState *copyConcrete();
+  bool checkConstraintExists(ref<Expr> e);
+
+  /// add by zgf : forked new state's last constraint is current state's negetive
+  void reverseLastConstraint();
+
+  /// add by zgf : remove constraints collected in 'complex function',
+  /// only left constraints which are collected before 'CF'
+  void leftNConstraints(unsigned leftSize);
 };
 
 struct ExecutionStateIDCompare {

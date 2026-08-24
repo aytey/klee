@@ -93,7 +93,7 @@ namespace klee {
                                       std::vector< std::vector<unsigned char> > 
                                         &values,
                                       bool &hasSolution) = 0;
-    
+
     /// getOperationStatusCode - get the status of the last solver operation
     virtual SolverRunStatus getOperationStatusCode() = 0;
 

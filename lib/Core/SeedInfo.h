@@ -40,9 +40,14 @@ namespace klee {
     
     /// Patch the seed so that condition is satisfied while retaining as
     /// many of the seed values as possible.
-    void patchSeed(const ExecutionState &state, 
+    void patchSeed(ExecutionState &state,
                    ref<Expr> condition,
                    TimingSolver *solver);
+
+    //add by zgf : to support concreteSeed
+    SeedInfo(Assignment assign) : assignment(assign),
+                              input(NULL),
+                              inputPosition(0) {}
   };
 }
 

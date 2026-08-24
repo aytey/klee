@@ -78,7 +78,8 @@ bool AddressSpace::resolveOne(ExecutionState &state,
                               TimingSolver *solver,
                               ref<Expr> address,
                               ObjectPair &result,
-                              bool &success) const {
+                              bool &success,
+                              bool useSeed) const {
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(address)) {
     success = resolveOne(CE, result);
     return true;
@@ -88,7 +89,8 @@ bool AddressSpace::resolveOne(ExecutionState &state,
     // try cheap search, will succeed for any inbounds pointer
 
     ref<ConstantExpr> cex;
-    if (!solver->getValue(state.constraints, address, cex, state.queryMetaData))
+    // modify by zgf : don't use seed to compute symbolic address
+    if (!solver->getValue(state, address, cex, state.queryMetaData, useSeed))
       return false;
     uint64_t example = cex->getZExtValue();
     MemoryObject hack(example);
@@ -116,9 +118,10 @@ bool AddressSpace::resolveOne(ExecutionState &state,
       const auto &mo = oi->first;
 
       bool mayBeTrue;
-      if (!solver->mayBeTrue(state.constraints,
+      // modify by zgf : don't use seed to compute symbolic address
+      if (!solver->mayBeTrue(state,
                              mo->getBoundsCheckPointer(address), mayBeTrue,
-                             state.queryMetaData))
+                             state.queryMetaData, useSeed))
         return false;
       if (mayBeTrue) {
         result.first = oi->first;
@@ -127,9 +130,10 @@ bool AddressSpace::resolveOne(ExecutionState &state,
         return true;
       } else {
         bool mustBeTrue;
-        if (!solver->mustBeTrue(state.constraints,
+        // modify by zgf : don't use seed to compute symbolic address
+        if (!solver->mustBeTrue(state,
                                 UgeExpr::create(address, mo->getBaseExpr()),
-                                mustBeTrue, state.queryMetaData))
+                                mustBeTrue, state.queryMetaData, useSeed))
           return false;
         if (mustBeTrue)
           break;
@@ -141,18 +145,19 @@ bool AddressSpace::resolveOne(ExecutionState &state,
       const auto &mo = oi->first;
 
       bool mustBeTrue;
-      if (!solver->mustBeTrue(state.constraints,
+      // modify by zgf : don't use seed to compute symbolic address
+      if (!solver->mustBeTrue(state,
                               UltExpr::create(address, mo->getBaseExpr()),
-                              mustBeTrue, state.queryMetaData))
+                              mustBeTrue, state.queryMetaData, useSeed))
         return false;
       if (mustBeTrue) {
         break;
       } else {
         bool mayBeTrue;
-
-        if (!solver->mayBeTrue(state.constraints,
+        // modify by zgf : don't use seed to compute symbolic address
+        if (!solver->mayBeTrue(state,
                                mo->getBoundsCheckPointer(address), mayBeTrue,
-                               state.queryMetaData))
+                               state.queryMetaData, useSeed))
           return false;
         if (mayBeTrue) {
           result.first = oi->first;
@@ -171,15 +176,17 @@ bool AddressSpace::resolveOne(ExecutionState &state,
 int AddressSpace::checkPointerInObject(ExecutionState &state,
                                        TimingSolver *solver, ref<Expr> p,
                                        const ObjectPair &op, ResolutionList &rl,
-                                       unsigned maxResolutions) const {
+                                       unsigned maxResolutions,
+                                       bool useSeed) const {
   // XXX in the common case we can save one query if we ask
   // mustBeTrue before mayBeTrue for the first result. easy
   // to add I just want to have a nice symbolic test case first.
   const MemoryObject *mo = op.first;
   ref<Expr> inBounds = mo->getBoundsCheckPointer(p);
   bool mayBeTrue;
-  if (!solver->mayBeTrue(state.constraints, inBounds, mayBeTrue,
-                         state.queryMetaData)) {
+  // modify by zgf : don't use seed to compute symbolic address
+  if (!solver->mayBeTrue(state, inBounds, mayBeTrue,
+                         state.queryMetaData, useSeed)) {
     return 1;
   }
 
@@ -190,8 +197,9 @@ int AddressSpace::checkPointerInObject(ExecutionState &state,
     auto size = rl.size();
     if (size == 1) {
       bool mustBeTrue;
-      if (!solver->mustBeTrue(state.constraints, inBounds, mustBeTrue,
-                              state.queryMetaData))
+      // modify by zgf : don't use seed to compute symbolic address
+      if (!solver->mustBeTrue(state, inBounds, mustBeTrue,
+                              state.queryMetaData, useSeed))
         return 1;
       if (mustBeTrue)
         return 0;
@@ -206,7 +214,8 @@ int AddressSpace::checkPointerInObject(ExecutionState &state,
 
 bool AddressSpace::resolve(ExecutionState &state, TimingSolver *solver,
                            ref<Expr> p, ResolutionList &rl,
-                           unsigned maxResolutions, time::Span timeout) const {
+                           unsigned maxResolutions, time::Span timeout,
+                           bool useSeed) const {
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(p)) {
     ObjectPair res;
     if (resolveOne(CE, res))
@@ -231,7 +240,9 @@ bool AddressSpace::resolve(ExecutionState &state, TimingSolver *solver,
     // just get this by inspection of the expr.
 
     ref<ConstantExpr> cex;
-    if (!solver->getValue(state.constraints, p, cex, state.queryMetaData))
+    // modify by zgf : don't use seed to compute symbolic address
+    if (!solver->getValue(state, p, cex,
+                          state.queryMetaData, useSeed))
       return true;
     uint64_t example = cex->getZExtValue();
     MemoryObject hack(example);
@@ -253,19 +264,19 @@ bool AddressSpace::resolve(ExecutionState &state, TimingSolver *solver,
       auto op = std::make_pair<>(mo, oi->second.get());
 
       int incomplete =
-          checkPointerInObject(state, solver, p, op, rl, maxResolutions);
+          checkPointerInObject(state, solver, p, op, rl, maxResolutions,useSeed);
       if (incomplete != 2)
         return incomplete ? true : false;
 
       bool mustBeTrue;
-      if (!solver->mustBeTrue(state.constraints,
+      // modify by zgf : don't use seed to compute symbolic address
+      if (!solver->mustBeTrue(state,
                               UgeExpr::create(p, mo->getBaseExpr()), mustBeTrue,
-                              state.queryMetaData))
+                              state.queryMetaData,useSeed))
         return true;
       if (mustBeTrue)
         break;
     }
-
     // search forwards
     for (oi = start; oi != end; ++oi) {
       const MemoryObject *mo = oi->first;
@@ -273,16 +284,17 @@ bool AddressSpace::resolve(ExecutionState &state, TimingSolver *solver,
         return true;
 
       bool mustBeTrue;
-      if (!solver->mustBeTrue(state.constraints,
+      // modify by zgf : don't use seed to compute symbolic address
+      if (!solver->mustBeTrue(state,
                               UltExpr::create(p, mo->getBaseExpr()), mustBeTrue,
-                              state.queryMetaData))
+                              state.queryMetaData,useSeed))
         return true;
       if (mustBeTrue)
         break;
       auto op = std::make_pair<>(mo, oi->second.get());
 
       int incomplete =
-          checkPointerInObject(state, solver, p, op, rl, maxResolutions);
+          checkPointerInObject(state, solver, p, op, rl, maxResolutions,useSeed);
       if (incomplete != 2)
         return incomplete ? true : false;
     }

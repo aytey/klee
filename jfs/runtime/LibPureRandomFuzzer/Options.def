@@ -1,0 +1,22 @@
+//===----------------------------------------------------------------------===//
+//
+//                                     JFS
+//
+// Copyright 2018 J. Ryan Stinnett
+//
+// This file is distributed under the MIT license.
+// See LICENSE.txt for details.
+//
+//===----------------------------------------------------------------------===//
+
+// PRF_OPTION_<TYPE>(flag, name, default value)
+
+PRF_OPTION_SIZE_T(max_len, dataLength, 0)
+PRF_OPTION_SIZE_T(runs, maxRuns, UINT64_MAX)
+PRF_OPTION_UINT(seed, seed, 0)
+PRF_OPTION_INT(timeout, timeout, 1200)
+PRF_OPTION_INT(timeout_exitcode, timeoutExitCode, 77)
+PRF_OPTION_BOOL(handle_abrt, handleSIGABRT, true)
+PRF_OPTION_INT(error_exitcode, errorExitCode, 77)
+PRF_OPTION_BOOL(print_final_stats, printFinalStats, false)
+PRF_OPTION_STRING(artifact_prefix, artifactPrefix, "")

@@ -52,7 +52,8 @@ namespace klee {
     /// memory object), and 2 otherwise.
     int checkPointerInObject(ExecutionState &state, TimingSolver *solver,
                              ref<Expr> p, const ObjectPair &op,
-                             ResolutionList &rl, unsigned maxResolutions) const;
+                             ResolutionList &rl, unsigned maxResolutions,
+                             bool useSeed = false) const;
 
   public:
     /// The MemoryObject -> ObjectState map that constitutes the
@@ -82,11 +83,14 @@ namespace klee {
     /// \param[out] result An ObjectPair this address can resolve to 
     ///               (when returning true).
     /// \return true iff an object was found at \a address.
+
+    /// modify by zgf : add 'useSeed' to get Value
     bool resolveOne(ExecutionState &state, 
                     TimingSolver *solver,
                     ref<Expr> address,
                     ObjectPair &result,
-                    bool &success) const;
+                    bool &success,
+                    bool useSeed = false) const;
 
     /// Resolve pointer `p` to a list of `ObjectPairs` it can point
     /// to. If `maxResolutions` is non-zero then no more than that many
@@ -94,12 +98,15 @@ namespace klee {
     ///
     /// \return true iff the resolution is incomplete (`maxResolutions`
     /// is non-zero and it was reached, or a query timed out).
+
+    /// modify by zgf : add 'useSeed' to set concreteMode
     bool resolve(ExecutionState &state,
                  TimingSolver *solver,
                  ref<Expr> p,
                  ResolutionList &rl, 
                  unsigned maxResolutions=0,
-                 time::Span timeout=time::Span()) const;
+                 time::Span timeout=time::Span(),
+                 bool useSeed = false) const;
 
     /***/
 

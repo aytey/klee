@@ -55,51 +55,6 @@ llvm::cl::opt<unsigned>
 
 namespace klee {
 
-class Z3SolverImpl : public SolverImpl {
-private:
-  Z3Builder *builder;
-  time::Span timeout;
-  SolverRunStatus runStatusCode;
-  std::unique_ptr<llvm::raw_fd_ostream> dumpedQueriesFile;
-  ::Z3_params solverParameters;
-  // Parameter symbols
-  ::Z3_symbol timeoutParamStrSymbol;
-
-  bool internalRunSolver(const Query &,
-                         const std::vector<const Array *> *objects,
-                         std::vector<std::vector<unsigned char> > *values,
-                         bool &hasSolution);
-  bool validateZ3Model(::Z3_solver &theSolver, ::Z3_model &theModel);
-
-public:
-  Z3SolverImpl();
-  ~Z3SolverImpl();
-
-  char *getConstraintLog(const Query &);
-  void setCoreSolverTimeout(time::Span _timeout) {
-    timeout = _timeout;
-
-    auto timeoutInMilliSeconds = static_cast<unsigned>((timeout.toMicroseconds() / 1000));
-    if (!timeoutInMilliSeconds)
-      timeoutInMilliSeconds = UINT_MAX;
-    Z3_params_set_uint(builder->ctx, solverParameters, timeoutParamStrSymbol,
-                       timeoutInMilliSeconds);
-  }
-
-  bool computeTruth(const Query &, bool &isValid);
-  bool computeValue(const Query &, ref<Expr> &result);
-  bool computeInitialValues(const Query &,
-                            const std::vector<const Array *> &objects,
-                            std::vector<std::vector<unsigned char> > &values,
-                            bool &hasSolution);
-  SolverRunStatus
-  handleSolverResponse(::Z3_solver theSolver, ::Z3_lbool satisfiable,
-                       const std::vector<const Array *> *objects,
-                       std::vector<std::vector<unsigned char> > *values,
-                       bool &hasSolution);
-  SolverRunStatus getOperationStatusCode();
-};
-
 Z3SolverImpl::Z3SolverImpl()
     : builder(new Z3Builder(
           /*autoClearConstructCache=*/false,
@@ -246,6 +201,133 @@ bool Z3SolverImpl::computeInitialValues(
   return internalRunSolver(query, &objects, &values, hasSolution);
 }
 
+// add by zgf to get multisolution from z3, return how many solution we get
+int Z3SolverImpl::computeMultiSolution(const Query& query,
+                                       const std::vector<const Array *> objects,
+                                       std::vector< Assignment > &multiAssign,
+                                       int iterNum) {
+  bool hasSolution = false; // if first time no solution, means constraints is unsat
+  std::vector<std::vector<unsigned char> > init_values;
+  std::vector<std::vector<unsigned char> > copy_values;
+
+  Z3_solver theSolver = Z3_mk_solver(builder->ctx);
+  Z3_solver_inc_ref(builder->ctx, theSolver);
+  Z3_solver_set_params(builder->ctx, theSolver, solverParameters);
+  Z3SortHandle intSort = Z3SortHandle(
+      Z3_mk_int_sort(builder->ctx), builder->ctx);
+
+  // Try ackermannize the arrays
+  std::map<const ArrayAckermannizationInfo*,Z3ASTHandle> arrayReplacements;
+  FindArrayAckermannizationVisitor faav(/*recursive=*/false);
+  ackermannizeArrays(this->builder, query, faav, arrayReplacements);
+
+  ConstantArrayFinder constant_arrays_in_query;
+  for (auto const &constraint : query.constraints) {
+    Z3_solver_assert(builder->ctx, theSolver, builder->construct(constraint));
+    constant_arrays_in_query.visit(constraint);
+  }
+
+  Z3ASTHandle z3QueryExpr =
+      Z3ASTHandle(builder->construct(query.expr), builder->ctx);
+  constant_arrays_in_query.visit(query.expr);
+
+  for (auto const &constant_array : constant_arrays_in_query.results) {
+    assert(builder->constant_array_assertions.count(constant_array) == 1 &&
+           "Constant array found in query, but not handled by Z3Builder");
+    for (auto const &arrayIndexValueExpr :
+        builder->constant_array_assertions[constant_array]) {
+      Z3_solver_assert(builder->ctx, theSolver, arrayIndexValueExpr);
+    }
+  }
+
+  // KLEE Queries are validity queries i.e.
+  // ∀ X Constraints(X) → query(X)
+  // but Z3 works in terms of satisfiability so instead we ask the
+  // negation of the equivalent i.e.
+  // ∃ X Constraints(X) ∧ ¬ query(X)
+  Z3_solver_assert(
+      builder->ctx, theSolver,
+      Z3ASTHandle(Z3_mk_not(builder->ctx, z3QueryExpr), builder->ctx));
+
+  ::Z3_lbool satisfiable = Z3_solver_check(builder->ctx, theSolver);
+  runStatusCode = handleSolverResponse(theSolver, satisfiable,
+                                       &objects, &init_values,
+                                       hasSolution,faav, arrayReplacements);
+
+  if (!hasSolution)
+    return 0; // invalid constraints, don't have solution
+
+  copy_values.assign(init_values.begin(),init_values.end());
+  Assignment initAssign(objects, init_values, true);
+  multiAssign.push_back(initAssign);
+
+
+  // constraint Not(And Not(x=10 And y=5)
+  //            And Not(x=1 And y=2)
+  for (int it = 0; it < iterNum; it++){
+    const Array *op_array = objects[0];
+    const std::vector<unsigned char> &data = copy_values[0];
+
+    Z3ASTHandle op0_read = builder->getInitialRead(op_array, 0);
+
+    Z3ASTHandle op0_IntExpr = Z3ASTHandle(
+          Z3_mk_int(builder->ctx,(int)data[0],intSort), builder->ctx);
+    Z3ASTHandle op0_bvConstantExpr = Z3ASTHandle(
+          Z3_mk_int2bv(builder->ctx,op_array->getRange(),op0_IntExpr), builder->ctx);
+    Z3ASTHandle op0_EQExpr = Z3ASTHandle(
+          Z3_mk_eq(builder->ctx,op0_read,op0_bvConstantExpr), builder->ctx);
+    Z3ASTHandle solutionConj = Z3ASTHandle(
+          Z3_mk_not(builder->ctx,op0_EQExpr), builder->ctx);
+
+    // get single solution constraint
+    for (unsigned int idx = 1;idx < objects.size();idx ++){
+      const Array *array = objects[idx];
+      const std::vector<unsigned char> &data = copy_values[idx];
+
+      for (unsigned offset = 0; offset < array->size; offset++) {
+        Z3ASTHandle initial_read = builder->getInitialRead(array, offset);
+
+        Z3ASTHandle constantIntExpr = Z3ASTHandle(
+            Z3_mk_int(builder->ctx,(int)data[offset],intSort), builder->ctx);
+        Z3ASTHandle bvConstantExpr = Z3ASTHandle(
+            Z3_mk_int2bv(builder->ctx,array->getRange(),constantIntExpr), builder->ctx);
+        Z3ASTHandle assignEQExpr = Z3ASTHandle(
+            Z3_mk_eq(builder->ctx,initial_read,bvConstantExpr), builder->ctx);
+        Z3ASTHandle assignNEQExpr = Z3ASTHandle(
+            Z3_mk_not(builder->ctx,assignEQExpr), builder->ctx);
+
+        ::Z3_ast args[2] = {solutionConj, assignNEQExpr};
+        solutionConj = Z3ASTHandle(
+            Z3_mk_or(builder->ctx, 2, args), builder->ctx);
+      }
+    }
+
+    // incremental using Z3Solver
+    Z3_solver_push(builder->ctx, theSolver);
+    Z3_solver_assert(
+        builder->ctx, theSolver,solutionConj);
+
+    // fetch solution to generate Assignment
+    std::vector<std::vector<unsigned char> > new_values;
+    satisfiable = Z3_solver_check(builder->ctx, theSolver);
+    runStatusCode = handleSolverResponse(theSolver, satisfiable,
+                                         &objects, &new_values,
+                                         hasSolution,faav, arrayReplacements);
+    if (!hasSolution)
+        break; // no solution yet
+
+    copy_values.assign(new_values.begin(),new_values.end());
+    Assignment newAssign(objects, new_values, true);
+    multiAssign.push_back(newAssign);
+  }
+
+  //Z3_solver_pop(builder->ctx, theSolver,it);
+  Z3_solver_dec_ref(builder->ctx, theSolver);
+
+  return multiAssign.size();
+}
+
+//
 bool Z3SolverImpl::internalRunSolver(
     const Query &query, const std::vector<const Array *> *objects,
     std::vector<std::vector<unsigned char> > *values, bool &hasSolution) {
@@ -257,11 +339,16 @@ bool Z3SolverImpl::internalRunSolver(
   //
   // TODO: Investigate using a custom tactic as described in
   // https://github.com/klee/klee/issues/653
-  Z3_solver theSolver = Z3_mk_solver(builder->ctx);
+  Z3_solver theSolver = Z3_mk_solver(builder->ctx);// build z3 solver [yx]
   Z3_solver_inc_ref(builder->ctx, theSolver);
   Z3_solver_set_params(builder->ctx, theSolver, solverParameters);
 
   runStatusCode = SOLVER_RUN_STATUS_FAILURE;
+
+  // Try ackermannize the arrays
+  std::map<const ArrayAckermannizationInfo*,Z3ASTHandle> arrayReplacements;
+  FindArrayAckermannizationVisitor faav(/*recursive=*/false);
+  ackermannizeArrays(this->builder, query, faav, arrayReplacements);
 
   ConstantArrayFinder constant_arrays_in_query;
   for (auto const &constraint : query.constraints) {
@@ -302,10 +389,13 @@ bool Z3SolverImpl::internalRunSolver(
     *dumpedQueriesFile << "; end Z3 query\n\n";
     dumpedQueriesFile->flush();
   }
+  //llvm::errs()<<"[zgf dbg] smt :\n"<<Z3_solver_to_string(builder->ctx, theSolver)<<"\n";
 
   ::Z3_lbool satisfiable = Z3_solver_check(builder->ctx, theSolver);
   runStatusCode = handleSolverResponse(theSolver, satisfiable, objects, values,
-                                       hasSolution);
+                                       hasSolution,faav, arrayReplacements);
+
+  builder->clearReplacements();
 
   Z3_solver_dec_ref(builder->ctx, theSolver);
   // Clear the builder's cache to prevent memory usage exploding.
@@ -333,7 +423,9 @@ bool Z3SolverImpl::internalRunSolver(
 SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
     ::Z3_solver theSolver, ::Z3_lbool satisfiable,
     const std::vector<const Array *> *objects,
-    std::vector<std::vector<unsigned char> > *values, bool &hasSolution) {
+    std::vector<std::vector<unsigned char> > *values, bool &hasSolution,
+    FindArrayAckermannizationVisitor &ffv,
+    std::map<const ArrayAckermannizationInfo *, Z3ASTHandle> &arrayReplacements) {
   switch (satisfiable) {
   case Z3_L_TRUE: {
     hasSolution = true;
@@ -353,16 +445,58 @@ SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
       const Array *array = *it;
       std::vector<unsigned char> data;
 
+      // See if there is any ackermannization info for this array
+      const std::vector<ArrayAckermannizationInfo>* aais = NULL;
+      FindArrayAckermannizationVisitor::ArrayToAckermannizationInfoMapTy::
+          const_iterator aiii = ffv.ackermannizationInfo.find(array);
+      if (aiii != ffv.ackermannizationInfo.end()) {
+        aais = &(aiii->second);
+      }
+
       data.reserve(array->size);
       for (unsigned offset = 0; offset < array->size; offset++) {
         // We can't use Z3ASTHandle here so have to do ref counting manually
         ::Z3_ast arrayElementExpr;
-        Z3ASTHandle initial_read = builder->getInitialRead(array, offset);
+        Z3ASTHandle initial_read = Z3ASTHandle();
+
+        if (aais && aais->size() > 0) {
+          // Look through the possible ackermannized regions of the array
+          // and find the region that corresponds to this byte.
+          for (std::vector<ArrayAckermannizationInfo>::const_iterator
+                       i = aais->begin(),
+                       ie = aais->end();
+               i != ie; ++i) {
+            const ArrayAckermannizationInfo* info = &(*i);
+            if (!(info->containsByte(offset))) {
+              continue;
+            }
+
+            // This is the ackermannized region for this offset.
+            Z3ASTHandle replacementVariable = arrayReplacements[info];
+            assert((offset*8) >= info->contiguousLSBitIndex);
+            unsigned bitOffsetToReadWithinVariable = (offset*8) - info->contiguousLSBitIndex;
+            assert(bitOffsetToReadWithinVariable < info->getWidth());
+            // Extract the byte
+            initial_read = Z3ASTHandle(
+                    Z3_mk_extract(
+                            builder->ctx, /*high=*/bitOffsetToReadWithinVariable + 7,
+                            /*low=*/bitOffsetToReadWithinVariable, replacementVariable),
+                    builder->ctx);
+            break;
+          }
+          if (Z3_ast(initial_read) == NULL) {
+            data.push_back((unsigned char) 0);
+            continue;
+          }
+        } else {
+          // This array wasn't ackermannized.
+          initial_read = builder->getInitialRead(array, offset);
+        }
 
         __attribute__((unused))
         bool successfulEval =
             Z3_model_eval(builder->ctx, theModel, initial_read,
-                          /*model_completion=*/Z3_TRUE, &arrayElementExpr);
+                          /*model_completion=*/Z3_L_TRUE, &arrayElementExpr);
         assert(successfulEval && "Failed to evaluate model");
         Z3_inc_ref(builder->ctx, arrayElementExpr);
         assert(Z3_get_ast_kind(builder->ctx, arrayElementExpr) ==
@@ -373,6 +507,7 @@ SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
         __attribute__((unused))
         bool successGet = Z3_get_numeral_int(builder->ctx, arrayElementExpr,
                                              &arrayElementValue);
+
         assert(successGet && "failed to get value back");
         assert(arrayElementValue >= 0 && arrayElementValue <= 255 &&
                "Integer from model is out of range");
@@ -432,7 +567,7 @@ bool Z3SolverImpl::validateZ3Model(::Z3_solver &theSolver, ::Z3_model &theModel)
     __attribute__((unused))
     bool successfulEval =
         Z3_model_eval(builder->ctx, theModel, constraint,
-                      /*model_completion=*/Z3_TRUE, &rawEvaluatedExpr);
+                      /*model_completion=*/Z3_L_TRUE, &rawEvaluatedExpr);
     assert(successfulEval && "Failed to evaluate model");
 
     // Use handle to do ref-counting.
@@ -463,6 +598,47 @@ bool Z3SolverImpl::validateZ3Model(::Z3_solver &theSolver, ::Z3_model &theModel)
 
   Z3_ast_vector_dec_ref(builder->ctx, constraints);
   return success;
+}
+
+void Z3SolverImpl::ackermannizeArrays(
+        Z3Builder *z3Builder, const Query &query,
+        FindArrayAckermannizationVisitor &faav,
+        std::map<const ArrayAckermannizationInfo *, Z3ASTHandle>&arrayReplacements) {
+  for (ConstraintSet::const_iterator it = query.constraints.begin(),
+          ie = query.constraints.end();it != ie; ++it) {
+    faav.visit(*it);
+  }
+  faav.visit(query.expr);
+  for (FindArrayAckermannizationVisitor::ArrayToAckermannizationInfoMapTy::
+      const_iterator aaii = faav.ackermannizationInfo.begin(),
+      aaie = faav.ackermannizationInfo.end();
+      aaii != aaie; ++aaii) {
+    const std::vector<ArrayAckermannizationInfo> &replacements = aaii->second;
+    for (std::vector<ArrayAckermannizationInfo>::const_iterator i = replacements.begin(),
+            ie = replacements.end(); i != ie; ++i) {
+      // Taking a pointer like this is dangerous. If the std::vector<> gets
+      // resized the data might be invalidated.
+      const ArrayAckermannizationInfo *aaInfo = &(*i); // Safe?
+      // Replace with variable
+      std::string str;
+      llvm::raw_string_ostream os(str);
+      os << aaInfo->getArray()->name << "_ack";
+      assert(aaInfo->toReplace.size() > 0);
+      Z3ASTHandle replacementVar;
+      for (ExprHashSet::const_iterator ei = aaInfo->toReplace.begin(),
+              ee = aaInfo->toReplace.end();
+              ei != ee; ++ei) {
+        ref<Expr> toReplace = *ei;
+        if (replacementVar.isNull()) {
+          replacementVar = z3Builder->getFreshBitVectorVariable(
+                  toReplace->getWidth(), os.str().c_str());
+        }
+        bool success = z3Builder->addReplacementExpr(toReplace, replacementVar);
+        assert(success && "Failed to add replacement variable");
+      }
+      arrayReplacements[aaInfo] = replacementVar;
+    }
+  }
 }
 
 SolverImpl::SolverRunStatus Z3SolverImpl::getOperationStatusCode() {

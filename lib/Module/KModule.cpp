@@ -110,6 +110,24 @@ namespace {
                              cl::desc("Allow optimization of functions that "
                                       "contain KLEE calls (default=true)"),
                              cl::init(true), cl::cat(ModuleCat));
+
+  cl::opt<bool>
+  UseKleeInternalFloatClassificationFunctions(
+    "internal-float-classify",
+    cl::desc("Use KLEE internal functions for classifying floats"),
+    cl::init(true));
+
+  cl::opt<bool>
+  UseKleeInternalSqrt(
+    "internal-sqrt",
+    cl::desc("Use KLEE internal sqrt"),
+    cl::init(false));
+
+  cl::opt<bool>
+  UseKleeInternalFabs(
+    "internal-fabs",
+    cl::desc("Use KLEE internal fabs"),
+    cl::init(false));
 }
 
 /***/
@@ -201,6 +219,20 @@ injectStaticConstructorsAndDestructors(Module *m,
   }
 }
 
+// add by zgf to support float point
+void KModule::replaceFunctionIfPresent(const char *original,
+                                     const char *replacement) {
+  llvm::Function* originalFunc = module->getFunction(original);// original 没有的话，就会找不到
+  llvm::Function* replacementFunc = module->getFunction(replacement);
+  if (!originalFunc)
+    return;
+  klee_message("Replacing function \"%s\" with \"%s\"", original, replacement);
+  assert(replacementFunc && "Replacement function not found");
+  assert(!(replacementFunc->isDeclaration()) && "replacement must have body");
+  originalFunc->replaceAllUsesWith(replacementFunc);
+  originalFunc->eraseFromParent();
+}
+
 void KModule::addInternalFunction(const char* functionName){
   Function* internalFunction = module->getFunction(functionName);
   if (!internalFunction) {
@@ -268,6 +300,40 @@ void KModule::optimiseAndPrepare(
   if (opts.Optimize)
     Optimize(module.get(), preservedFunctions);
 
+  // add by zgf to support float point
+  // Use KLEE's internal float classification functions if requested.
+  if (UseKleeInternalFloatClassificationFunctions) {
+    // Note these are internal glibc/uclibc names
+    // FIXME: Guard the long double replacements based on the target.
+    replaceFunctionIfPresent("__isnanf", "klee_internal_isnanf");
+    replaceFunctionIfPresent("__isnan", "klee_internal_isnan");
+    replaceFunctionIfPresent("__isnanl", "klee_internal_isnanl");
+    replaceFunctionIfPresent("__isinff", "klee_internal_isinff");
+    replaceFunctionIfPresent("__isinf", "klee_internal_isinf");
+    replaceFunctionIfPresent("__isinfl", "klee_internal_isinfl");
+    replaceFunctionIfPresent( "__fpclassifyf",
+                             "klee_internal_fpclassifyf");
+    replaceFunctionIfPresent("__fpclassify",
+                             "klee_internal_fpclassify");
+    replaceFunctionIfPresent("__fpclassifyl",
+                             "klee_internal_fpclassifyl");
+    replaceFunctionIfPresent("__finitef", "klee_internal_finitef");
+    replaceFunctionIfPresent("__finite", "klee_internal_finite");
+    replaceFunctionIfPresent("__finitel", "klee_internal_finitel");
+  }
+  if (UseKleeInternalSqrt) {
+    replaceFunctionIfPresent("sqrt", "klee_internal_sqrt");
+    replaceFunctionIfPresent("sqrtf", "klee_internal_sqrtf");
+    replaceFunctionIfPresent("sqrtl", "klee_internal_sqrtl");
+  }
+  if (UseKleeInternalFabs) {
+    replaceFunctionIfPresent("fabs", "klee_internal_fabs");
+    replaceFunctionIfPresent("fabsf", "klee_internal_fabsf");//如果original没有，就会跳过。
+    replaceFunctionIfPresent("fabsl", "klee_internal_fabsl");
+  }
+  replaceFunctionIfPresent("fegetround", "klee_internal_fegetround");
+  replaceFunctionIfPresent("fesetround", "klee_internal_fesetround");
+
   // Add internal functions which are not used to check if instructions
   // have been already visited
   if (opts.CheckDivZero)
@@ -299,7 +365,8 @@ void KModule::optimiseAndPrepare(
   pm3.run(*module);
 }
 
-void KModule::manifest(InterpreterHandler *ih, bool forceSourceOutput) {
+void KModule::manifest(InterpreterHandler *ih,
+                       bool forceSourceOutput) {
   if (OutputSource || forceSourceOutput) {
     std::unique_ptr<llvm::raw_fd_ostream> os(ih->openOutputFile("assembly.ll"));
     assert(os && !os->has_error() && "unable to open source output");
@@ -334,6 +401,10 @@ void KModule::manifest(InterpreterHandler *ih, bool forceSourceOutput) {
       KInstruction *ki = kf->instructions[i];
       ki->info = &infos->getInfo(*ki->inst);
     }
+
+    // add by zgf
+    if (excludeFuncSet.find(Function.getName()) != excludeFuncSet.end())
+      kf->trackCoverage = false;
 
     functionMap.insert(std::make_pair(&Function, kf.get()));
     functions.push_back(std::move(kf));

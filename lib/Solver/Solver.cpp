@@ -94,13 +94,25 @@ bool Solver::getValue(const Query& query, ref<ConstantExpr> &result) {
   return true;
 }
 
+// 调用求解器
 bool 
 Solver::getInitialValues(const Query& query,
                          const std::vector<const Array*> &objects,
                          std::vector< std::vector<unsigned char> > &values) {
   bool hasSolution;
-  bool success =
-    impl->computeInitialValues(query, objects, values, hasSolution);
+//  llvm::outs()<<">>>>>>>>>>>>>>>>>>>:\n";
+//  query.expr->print(llvm::outs());
+
+//  for(auto arr:objects){
+//    llvm::outs()<<"objects:"<<arr->getName()<<"\n";
+//  }
+//  llvm::outs()<<"values:\n";
+//  for(auto val:values){
+//    for (const auto &item : val) {
+//    }
+//  }
+  //computeInitialValues     计算values值，就是转化成bvfp形式
+  bool success = impl->computeInitialValues(query, objects, values, hasSolution);
   // FIXME: Propogate this out.
   if (!hasSolution)
     return false;

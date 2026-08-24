@@ -27,6 +27,10 @@ namespace klee {
   void findReads(ref<Expr> e, 
                  bool visitUpdates,
                  std::vector< ref<ReadExpr> > &result);
+
+  // add by zgf to find read expr in SFC argument
+  void findSFCReads(ref<Expr> e,
+               std::vector< ref<ReadExpr> > &result);
   
   /// Return a list of all unique symbolic objects referenced by the given
   /// expression.
@@ -47,6 +51,15 @@ namespace klee {
   public:
     std::set<const Array *> results;
   };
+
+  /*// add by zgf for 'SFC' visitor
+  class SFCConstantArrayFinder : public SFCExprVisitor {
+  protected:
+    SFCExprVisitor::Action visitRead(const ReadExpr &re);
+
+  public:
+    std::set<const Array *> results;
+  };*/
 }
 
 #endif /* KLEE_EXPRUTIL_H */

@@ -23,20 +23,28 @@ using namespace llvm;
 
 /***/
 
-bool TimingSolver::evaluate(const ConstraintSet &constraints, ref<Expr> expr,
+bool TimingSolver::evaluate(ExecutionState &state, ref<Expr> expr,
                             Solver::Validity &result,
-                            SolverQueryMetaData &metaData) {
-  // Fast path, to avoid timer and OS overhead.
+                            SolverQueryMetaData &metaData,
+                            bool useSeed) {
+  auto const &constraints = state.constraints;
+  // modify by zgf : use concrete value instead of symbolic
+  if (useSeed){
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
+      result = CE->isTrue() ? Solver::True : Solver::False;
+      return true;
+    }
+    expr = state.assignSeed.evaluate(expr);
+  }
+
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
     result = CE->isTrue() ? Solver::True : Solver::False;
     return true;
   }
 
   TimerStatIncrementer timer(stats::solverTime);
-
   if (simplifyExprs)
     expr = ConstraintManager::simplifyExpr(constraints, expr);
-
   bool success = solver->evaluate(Query(constraints, expr), result);
 
   metaData.queryCost += timer.delta();
@@ -44,11 +52,23 @@ bool TimingSolver::evaluate(const ConstraintSet &constraints, ref<Expr> expr,
   return success;
 }
 
-bool TimingSolver::mustBeTrue(const ConstraintSet &constraints, ref<Expr> expr,
-                              bool &result, SolverQueryMetaData &metaData) {
+bool TimingSolver::mustBeTrue(ExecutionState &state, ref<Expr> expr,
+                              bool &result, SolverQueryMetaData &metaData,
+                              bool useSeed) {
+  auto const &constraints = state.constraints;
+
+  // modify by zgf : use concrete value instead of symbolic
+  if (useSeed){
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
+      result = CE->isTrue();
+      return true;
+    }
+    expr = state.assignSeed.evaluate(expr);
+  }
+
   // Fast path, to avoid timer and OS overhead.
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
-    result = CE->isTrue() ? true : false;
+    result = CE->isTrue();
     return true;
   }
 
@@ -64,32 +84,46 @@ bool TimingSolver::mustBeTrue(const ConstraintSet &constraints, ref<Expr> expr,
   return success;
 }
 
-bool TimingSolver::mustBeFalse(const ConstraintSet &constraints, ref<Expr> expr,
-                               bool &result, SolverQueryMetaData &metaData) {
-  return mustBeTrue(constraints, Expr::createIsZero(expr), result, metaData);
+bool TimingSolver::mustBeFalse(ExecutionState &state, ref<Expr> expr,
+                               bool &result, SolverQueryMetaData &metaData,
+                               bool useSeed) {
+  return mustBeTrue(state, Expr::createIsZero(expr),
+                    result, metaData,useSeed);
 }
 
-bool TimingSolver::mayBeTrue(const ConstraintSet &constraints, ref<Expr> expr,
-                             bool &result, SolverQueryMetaData &metaData) {
+bool TimingSolver::mayBeTrue(ExecutionState &state, ref<Expr> expr,
+                             bool &result, SolverQueryMetaData &metaData,
+                             bool useSeed) {
   bool res;
-  if (!mustBeFalse(constraints, expr, res, metaData))
+  if (!mustBeFalse(state, expr, res, metaData,useSeed))
     return false;
   result = !res;
   return true;
 }
 
-bool TimingSolver::mayBeFalse(const ConstraintSet &constraints, ref<Expr> expr,
-                              bool &result, SolverQueryMetaData &metaData) {
+bool TimingSolver::mayBeFalse(ExecutionState &state, ref<Expr> expr,
+                              bool &result, SolverQueryMetaData &metaData,
+                              bool useSeed) {
   bool res;
-  if (!mustBeTrue(constraints, expr, res, metaData))
+  if (!mustBeTrue(state, expr, res, metaData,useSeed))
     return false;
   result = !res;
   return true;
 }
 
-bool TimingSolver::getValue(const ConstraintSet &constraints, ref<Expr> expr,
+bool TimingSolver::getValue(ExecutionState &state, ref<Expr> expr,
                             ref<ConstantExpr> &result,
-                            SolverQueryMetaData &metaData) {
+                            SolverQueryMetaData &metaData,
+                            bool useSeed) {
+  auto const &constraints = state.constraints;
+  if (useSeed) {
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
+      result = CE;
+      return true;
+    }
+    expr = state.assignSeed.evaluate(expr);
+  }
+
   // Fast path, to avoid timer and OS overhead.
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(expr)) {
     result = CE;
@@ -109,9 +143,36 @@ bool TimingSolver::getValue(const ConstraintSet &constraints, ref<Expr> expr,
 }
 
 bool TimingSolver::getInitialValues(
-    const ConstraintSet &constraints, const std::vector<const Array *> &objects,
+    ExecutionState &state, const std::vector<const
+            Array *> &objects,
     std::vector<std::vector<unsigned char>> &result,
     SolverQueryMetaData &metaData) {
+  auto const &constraints = state.constraints;
+
+  if (objects.empty())
+    return true;
+
+  TimerStatIncrementer timer(stats::solverTime);
+//  llvm::outs()<<">>>>>>>>>>>>>>>>>\n";
+//  for(auto con:constraints){
+//    llvm::outs()<<con<<"\n";
+//  }
+  Query query(constraints, ConstantExpr::alloc(0, Expr::Bool));
+  bool success = solver->getInitialValues(query, objects, result);
+//  bool success = solver->getInitialValues(Query(constraints, ConstantExpr::alloc(0, Expr::Bool)), objects, result);
+
+  metaData.queryCost += timer.delta();
+
+  return success;
+}
+
+// add by zgf : use for compute state.assignSeed using constraintSet which
+// not contains SFC, only use for compute 'Common' constraintSet.
+bool TimingSolver::getInitialValuesWithConstrintSet(
+    ConstraintSet &constraints, const std::vector<const Array *> &objects,
+    std::vector<std::vector<unsigned char>> &result,
+    SolverQueryMetaData &metaData) {
+
   if (objects.empty())
     return true;
 
@@ -126,8 +187,16 @@ bool TimingSolver::getInitialValues(
 }
 
 std::pair<ref<Expr>, ref<Expr>>
-TimingSolver::getRange(const ConstraintSet &constraints, ref<Expr> expr,
-                       SolverQueryMetaData &metaData) {
+TimingSolver::getRange(ExecutionState &state, ref<Expr> expr,
+                       SolverQueryMetaData &metaData, bool useSeed) {
+  auto const &constraints = state.constraints;
+
+  // modify by zgf : use concrete value instead of symbolic
+  if (useSeed){
+    expr = state.assignSeed.evaluate(expr);
+  }
+
+
   TimerStatIncrementer timer(stats::solverTime);
   auto result = solver->getRange(Query(constraints, expr));
   metaData.queryCost += timer.delta();

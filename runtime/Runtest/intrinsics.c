@@ -10,6 +10,7 @@
 /* Straight C for linking simplicity */
 
 #include <assert.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,3 +185,22 @@ void klee_set_forking(unsigned enable) {}
 
 void klee_open_merge() {}
 void klee_close_merge() {}
+
+/* Use functions in the C math library to classify floats */
+_Bool klee_is_nan_float(float f) { return isnan(f) != 0; }
+
+_Bool klee_is_nan_double(double d) { return isnan(d) != 0; }
+
+_Bool klee_is_infinite_float(float f) { return isinf(f) != 0; }
+
+_Bool klee_is_infinite_double(double d) { return isinf(d) != 0; }
+
+_Bool klee_is_normal_float(float f) { return isnormal(f) != 0; }
+
+_Bool klee_is_normal_double(double d) { return isnormal(d) != 0; }
+
+_Bool klee_is_subnormal_float(float f) { return fpclassify(f) == FP_SUBNORMAL; }
+
+_Bool klee_is_subnormal_double(double d) {
+  return fpclassify(d) == FP_SUBNORMAL;
+}

@@ -194,9 +194,10 @@ unsigned InstructionInfoTable::getMaxID() const {
 const InstructionInfo &
 InstructionInfoTable::getInfo(const llvm::Instruction &inst) const {
   auto it = infos.find(&inst);
-  if (it == infos.end())
+  if (it == infos.end()){
     llvm::report_fatal_error("invalid instruction, not present in "
                              "initial module!");
+  }
   return *it->second.get();
 }
 

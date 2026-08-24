@@ -22,22 +22,50 @@
 #include "klee/Core/BranchTypes.h"
 #include "klee/Core/Interpreter.h"
 #include "klee/Core/TerminationTypes.h"
+#include "klee/Core/JsonParser.h"
 #include "klee/Expr/ArrayCache.h"
 #include "klee/Expr/ArrayExprOptimizer.h"
 #include "klee/Module/Cell.h"
 #include "klee/Module/KInstruction.h"
 #include "klee/Module/KModule.h"
 #include "klee/System/Time.h"
+#include "PTree.h"
 
+#include "../Solver/Z3Builder.h"
+#include "../Solver/Z3Solver.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <jfs/Core/JFSContext.h>
+#include <jfs/Core/ScopedJFSContextErrorHandler.h>
+#include <jfs/Core/ToolErrorHandler.h>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// add by zgf : import JFS support
+#include "JFSBuilder.h"
+
+// add by zgf : import dreal
+#include "DRealBuilder.h"
+
+// add by zgf : import dreal
+#include "GoSATBuilder.h"
+
+// add by yx : import boolector
+//#include "BoolectorBuilder.h"
+
+//add by yx : import
+#include "BitwuzlaBuilder.h"
+#include "MathSAT5Builder.h"
+#include "MathSAT.h"
+#include "CVC5Builder.h"
+#include "CVC5RealBuilder.h"
+
+
 
 struct KTest;
 
@@ -83,11 +111,72 @@ namespace klee {
   class MergingSearcher;
   template<class T> class ref;
 
-
+  // add by zgf : get json info
+  class FunctionTypeInfo;
 
   /// \todo Add a context object to keep track of data only live
   /// during an instruction step. Should contain addedStates,
   /// removedStates, and haltExecution, among others.
+
+
+// add by zgf to support dreal_is work
+class DataInterval{
+private:
+  double upVal,downVal;
+  double initVal;
+  std::string varName;
+  std::string varType;
+public:
+  DataInterval(double _val,std::string _varName,std::string _varType)
+    : initVal(_val), upVal(_val),downVal(_val),
+      varName(_varName), varType(_varType){}
+  ~DataInterval() {}
+
+  std::string getVarName() {return varName;}
+
+  void dumpUP(){
+    unsigned char* p = (unsigned char*)(&upVal);
+    for (int i = 7; i >= 0; i--)
+      printf("%02x", p[i]);
+    printf("\n");
+  }
+
+  void dumpDOWN(){
+    unsigned char* p = (unsigned char*)(&downVal);
+    for (int i = 7; i >= 0; i--)
+      printf("%02x", p[i]);
+    printf("\n");
+  }
+
+  double getInit(){return initVal;}
+
+  double getNext() {
+    if (varType.find('i') == 0){
+      upVal = upVal + 1;
+      return upVal;
+    }else if (varType.find("float") == 0){
+      float tVal = (float)upVal;
+      tVal = std::nexttoward(tVal,tVal + 1);
+      upVal = tVal;
+      return upVal;
+    }
+    upVal = std::nexttoward(upVal,upVal + 1);
+    return upVal;
+  }
+  double getPrev() {
+    if (varType.find('i') == 0){
+      downVal = downVal - 1;
+      return downVal;
+    }else if (varType.find("float") == 0){
+      float tVal = (float)downVal;
+      tVal = std::nexttoward(tVal,tVal - 1);
+      downVal = tVal;
+      return downVal;
+    }
+    downVal = std::nexttoward(downVal, downVal - 1);
+    return downVal;
+  }
+};
 
 class Executor : public Interpreter {
   friend class OwningSearcher;
@@ -97,26 +186,40 @@ class Executor : public Interpreter {
   friend class MergeHandler;
   friend klee::Searcher *klee::constructUserSearcher(Executor &executor);
 
+protected:
+  std::unique_ptr<PTree> processTree;
+
 public:
   typedef std::pair<ExecutionState*,ExecutionState*> StatePair;
 
   /// The random number generator.
   RNG theRNG;
 
-private:
+// modify by zgf : to support float-point, these function change to public
+//private:
+
   std::unique_ptr<KModule> kmodule;
   InterpreterHandler *interpreterHandler;
   Searcher *searcher;
 
   ExternalDispatcher *externalDispatcher;
   TimingSolver *solver;
+
+//  BoolectorSolver boolectorSolver;
+//  MathSAT5Builder mathsat5Builder;
+
+  MathSATSolver mathsat5Solver;
+  BitwuzlaSolver bitwuzlaSolver;
+  CVC5Solver cvc5Solver;
+//  CVC5RealBuilder cvc5Builder;
+
+
   MemoryManager *memory;
-  std::set<ExecutionState*, ExecutionStateIDCompare> states;
+  std::set<ExecutionState*, ExecutionStateIDCompare> states;//模板参数，typename，compare
   StatsTracker *statsTracker;
   TreeStreamWriter *pathWriter, *symPathWriter;
   SpecialFunctionHandler *specialFunctionHandler;
   TimerGroup timers;
-  std::unique_ptr<PTree> processTree;
 
   /// Used to track states that have been added during the current
   /// instructions step. 
@@ -137,7 +240,7 @@ private:
   /// happens with other states (that don't satisfy the seeds) depends
   /// on as-yet-to-be-determined flags.
   std::map<ExecutionState*, std::vector<SeedInfo> > seedMap;
-  
+
   /// Map of globals to their representative memory object.
   std::map<const llvm::GlobalValue*, MemoryObject*> globalObjects;
 
@@ -162,7 +265,7 @@ private:
 
   /// When non-null a list of "seed" inputs which will be used to
   /// drive execution.
-  const std::vector<struct KTest *> *usingSeeds;  
+  const std::vector<struct KTest *> *usingSeeds;
 
   /// Disables forking, instead a random path is chosen. Enabled as
   /// needed to control memory usage. \see fork()
@@ -173,7 +276,93 @@ private:
 
   /// Signals the executor to halt execution at the next instruction
   /// step.
-  bool haltExecution;  
+  bool haltExecution;//阻止下一次执行
+
+  // add by zgf : label whether this state execute finish, and select next state
+  bool concreteHalt;
+
+  // add by zgf : SFC visitor use for evaluate SFCExpr with concrete values
+  // which are produced by SMT Solver
+  SFCExprVisitor  sfcVisitor;
+  Z3SolverImpl *z3Solver;
+
+  // add by zgf : use Z3Builder for transform KQuery to SMT-LIB
+  Z3Transformer sfcTransformer;
+
+  /// add by zgf : check assignment is truly useful for concreteMode
+  int checkAssignmentValid(Assignment &assign,
+                            const ConstraintSet &constraints);
+
+   std::vector<std::string> preFloatCFList
+       {"log","log1p","log2", "logb", "log10",
+        "exp","exp2", "expm1","floor","ceil",
+        "sin","cos","tan",
+        "asin","acos","atan",
+        "sinh","cosh","tanh",
+
+        // special handler
+        "sqrt","fabs",
+
+        // two float arguments op
+        "atan2","pow","fmin","fmax"};
+
+  std::set<std::string> complexFuncSet;
+
+  /// add by zgf : support uninterpreter function
+  std::vector<FunctionTypeInfo> funcsType;
+  std::map<std::string,FunctionTypeInfo> basicFuncsTypeTable; // record all basic functions
+
+  /// add by zgf to set multiple solver
+  JFSSolver jfsSolver;
+
+  /// add by zgf to support FP2INT
+  int FP2INTCheckHandler(ExecutionState &state,ref<Expr> result);
+  std::set<std::uint32_t> checkedInstID;
+  std::set<std::uint32_t> reportedInstID;
+
+  /// add by zgf
+  void getConcreteAssignSeedSMT(ExecutionState &state, bool &checkValid);  // only z3
+  // add by yx
+//  void getConcreteAssignSeedBoolector(ExecutionState &state, bool &checkValid); // only boolector
+
+  void getConcreteAssignSeedFuzz(ExecutionState &state, bool &checkValid, int split_t);  // only jfs
+  void getConcreteAssignSeedFuzzWithSeeds(ExecutionState &state,
+                std::map<std::string, uint64_t> &fuzzSeeds,bool &checkValid, int split_t);
+
+  void getConcreteAssignSeedDReal(ExecutionState &state, bool &checkValid); // dreal + jfs
+  void getConcreteAssignSeedDRealSearch(ExecutionState &state, bool &checkValid); // interval search
+  void getConcreteAssignSeedCVC5Real(ExecutionState &state, bool &checkValid); // interval
+  void getConcreteAssignSeedMathSAT5Real(ExecutionState &state, bool &checkValid);  //only mathsat
+  void getConcreteAssignSeedGoSAT(ExecutionState &state, bool &checkValid);  // only GoSat
+
+  void getConcreteAssignSeedSMTDReal(ExecutionState &state, bool &checkValid, std::string filename); // our best method
+
+  void getConcreteAssignSeedSMTFUZZ(ExecutionState &state, bool &checkValid); // our synergy method
+
+  void getConcreteAssignSeedBitwuzla(ExecutionState &state, bool &checkValid);  //only bitwuzla
+
+  void getConcreteAssignSeedMathSAT5(ExecutionState &state, bool &checkValid);  //only mathsat
+
+  void getConcreteAssignSeedCVC5(ExecutionState &state, bool &checkValid);  //only mathsat
+
+  /// use for dreal interval search
+  void getConcreteAssignSeedSearch(
+          ExecutionState &state,
+          std::vector<const Array*> &objects,
+          std::vector<DataInterval> &dataInterVec,
+          std::map<std::string,std::string> &varTypes,
+          bool &checkValid);
+
+  /// add by zgf : In EGT KLEE, when terminate execution,
+  /// we use 'getSymbolicSolution' to generate testcase, but in concrete mode,
+  /// the 'state.assignSeed' is generated at the beginning, so there is no need
+  /// to use SMT solver in 'getSymbolicSolution' to generete testcases, instead,
+  /// dump the 'state.assignSeed' to testcases.
+  bool getConcreteSymbolicSolution(
+      const ExecutionState &state,
+      std::vector<std::pair<std::string, std::vector<unsigned char>>> &res)
+      override;
+
 
   /// Whether implied-value concretization is enabled. Currently
   /// false, it is buggy (it needs to validate its writes).
@@ -213,8 +402,11 @@ private:
 
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
-  
-  void executeInstruction(ExecutionState &state, KInstruction *ki);
+
+  // modify by zgf : change this method to virtual for FPExcutor.cpp
+  virtual void executeInstruction(ExecutionState &state, KInstruction *ki);
+
+  void getStateSeed(ExecutionState &state,bool &checkValid, std::string filename);
 
   void run(ExecutionState &initialState);
 
@@ -243,7 +435,7 @@ private:
                             llvm::Function *function,
                             std::vector< ref<Expr> > &arguments);
 
-  ObjectState *bindObjectInState(ExecutionState &state, const MemoryObject *mo,
+  static ObjectState *bindObjectInState(ExecutionState &state, const MemoryObject *mo,
                                  bool isLocal, const Array *array = 0);
 
   /// Resolve a pointer to the memory objects it could point to the
@@ -375,19 +567,22 @@ private:
   /// Evaluates an LLVM constant expression.  The optional argument ki
   /// is the instruction where this constant was encountered, or NULL
   /// if not applicable/unavailable.
+  // modify by zgf to support float point : add 'roundingMode'
   ref<klee::ConstantExpr> evalConstantExpr(const llvm::ConstantExpr *c,
+                                           llvm::APFloat::roundingMode rm,
 					   const KInstruction *ki = NULL);
 
   /// Evaluates an LLVM constant.  The optional argument ki is the
   /// instruction where this constant was encountered, or NULL if
   /// not applicable/unavailable.
   ref<klee::ConstantExpr> evalConstant(const llvm::Constant *c,
+                                       llvm::APFloat::roundingMode rm,
 				       const KInstruction *ki = NULL);
 
   /// Return a unique constant value for the given expression in the
   /// given state, if it has one (i.e. it provably only has a single
   /// value). Otherwise return the original expression.
-  ref<Expr> toUnique(const ExecutionState &state, ref<Expr> &e);
+  ref<Expr> toUnique(ExecutionState &state, ref<Expr> &e);
 
   /// Return a constant value for the given expression, forcing it to
   /// be constant in the given state by adding a constraint if
@@ -424,10 +619,13 @@ private:
 
   /// Call error handler and terminate state in case of program errors
   /// (e.g. free()ing globals, out-of-bound accesses)
+
+  // modify by zgf : add 'isConcreteHalt' to stop error state's concrete execution
   void terminateStateOnError(ExecutionState &state, const llvm::Twine &message,
                              StateTerminationType terminationType,
                              const llvm::Twine &longMessage = "",
-                             const char *suffix = nullptr);
+                             const char *suffix = nullptr,
+                             bool isConcreteHalt = true);
 
   /// Call error handler and terminate state in case of execution errors
   /// (things that should not be possible, like illegal instruction or
@@ -535,7 +733,7 @@ public:
                             Interpreter::STP) override;
 
   bool getSymbolicSolution(
-      const ExecutionState &state,
+      ExecutionState &state,
       std::vector<std::pair<std::string, std::vector<unsigned char>>> &res)
       override;
 
@@ -551,7 +749,9 @@ public:
 
   MergingSearcher *getMergingSearcher() const { return mergingSearcher; };
   void setMergingSearcher(MergingSearcher *ms) { mergingSearcher = ms; };
-};
+
+        void getConcreteAssignSeedCVC4(ExecutionState &state, bool &checkValid);
+    };
   
 } // End klee namespace
 

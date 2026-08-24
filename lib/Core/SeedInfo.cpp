@@ -59,12 +59,13 @@ KTestObject *SeedInfo::getNextInput(const MemoryObject *mo,
   }
 }
 
-void SeedInfo::patchSeed(const ExecutionState &state, 
+void SeedInfo::patchSeed(ExecutionState &state,
                          ref<Expr> condition,
                          TimingSolver *solver) {
   ConstraintSet required(state.constraints);
   ConstraintManager cm(required);
   cm.addConstraint(condition);
+
 
   // Try and patch direct reads first, this is likely to resolve the
   // problem quickly and avoids long traversal of all seed
@@ -98,13 +99,13 @@ void SeedInfo::patchSeed(const ExecutionState &state,
                                                             Expr::Int8));
       bool res;
       bool success =
-          solver->mustBeFalse(required, isSeed, res, state.queryMetaData);
+          solver->mustBeFalse(state, isSeed, res, state.queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");
       (void) success;
       if (res) {
         ref<ConstantExpr> value;
         bool success =
-            solver->getValue(required, read, value, state.queryMetaData);
+            solver->getValue(state, read, value, state.queryMetaData);
         assert(success && "FIXME: Unhandled solver failure");            
         (void) success;
         it2->second[i] = value->getZExtValue(8);
@@ -118,7 +119,7 @@ void SeedInfo::patchSeed(const ExecutionState &state,
 
   bool res;
   bool success =
-      solver->mayBeTrue(state.constraints, assignment.evaluate(condition), res,
+      solver->mayBeTrue(state, assignment.evaluate(condition), res,
                         state.queryMetaData);
   assert(success && "FIXME: Unhandled solver failure");
   (void) success;
@@ -138,13 +139,13 @@ void SeedInfo::patchSeed(const ExecutionState &state,
                                                             Expr::Int8));
       bool res;
       bool success =
-          solver->mustBeFalse(required, isSeed, res, state.queryMetaData);
+          solver->mustBeFalse(state, isSeed, res, state.queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");
       (void) success;
       if (res) {
         ref<ConstantExpr> value;
         bool success =
-            solver->getValue(required, read, value, state.queryMetaData);
+            solver->getValue(state, read, value, state.queryMetaData);
         assert(success && "FIXME: Unhandled solver failure");            
         (void) success;
         it->second[i] = value->getZExtValue(8);
@@ -160,7 +161,7 @@ void SeedInfo::patchSeed(const ExecutionState &state,
   {
     bool res;
     bool success =
-        solver->mayBeTrue(state.constraints, assignment.evaluate(condition),
+        solver->mayBeTrue(state, assignment.evaluate(condition),
                           res, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");            
     (void) success;

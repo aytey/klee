@@ -58,7 +58,7 @@ llvm::cl::opt<double> ArrayValueSymbRatio(
                    "the mixed value-based transformations are applied."),
     llvm::cl::init(1.0), llvm::cl::value_desc("Symbolic Values / Array Size"),
     llvm::cl::cat(klee::SolvingCat));
-}; // namespace klee
+} // namespace klee
 
 ref<Expr> extendRead(const UpdateList &ul, const ref<Expr> index,
                      Expr::Width w) {

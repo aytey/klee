@@ -1,0 +1,471 @@
+//===----------------------------------------------------------------------===//
+//
+//                                     JFS
+//
+// Copyright 2018 J. Ryan Stinnett
+//
+// This file is distributed under the MIT license.
+// See LICENSE.txt for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "jfs/FuzzingCommon/SpecialConstantSeedGenerator.h"
+#include "jfs/Core/RNG.h"
+#include "jfs/Core/Z3Node.h"
+#include "jfs/Core/Z3NodeSet.h"
+#include "jfs/FuzzingCommon/BufferElement.h"
+#include "jfs/FuzzingCommon/FileSerializableModel.h"
+#include "jfs/FuzzingCommon/FuzzingAnalysisInfo.h"
+#include "jfs/FuzzingCommon/SeedManager.h"
+#include "jfs/Support/StatisticsManager.h"
+#include <climits>
+
+// add by zgf
+#include "SMTLIB/NativeBitVector.h"
+
+using namespace jfs::core;
+using namespace jfs::fuzzingCommon;
+
+namespace {
+
+enum class SpecialConstantBitVector : size_t {
+  ZERO,
+  ONE,
+  MAX_UNSIGNED_INT,
+  MAX_SIGNED_INT,
+  SIZE, // Marks the size of the enum (must be the last entry)
+};
+
+enum class SpecialConstantFloatingPoint : size_t {
+  POSITIVE_ZERO,
+  NEGATIVE_ZERO,
+  POSITIVE_INFINITY,
+  NEGATIVE_INFINITY,
+  NOT_A_NUMBER,
+  POSITIVE_ONE,
+  NEGATIVE_ONE,
+  SMALLEST_POSITIVE_SUBNORMAL,
+  LARGEST_POSITIVE_SUBNORMAL,
+  SMALLEST_POSITIVE_NORMAL,
+  LARGEST_POSITIVE_NORMAL,
+  SMALLEST_NEGATIVE_SUBNORMAL,
+  LARGEST_NEGATIVE_SUBNORMAL,
+  SMALLEST_NEGATIVE_NORMAL,
+  LARGEST_NEGATIVE_NORMAL,
+  SIZE, // Marks the size of the enum (must be the last entry)
+};
+
+uint64_t getMask(const unsigned bitWidth) {
+  assert(bitWidth <= 64);
+  return (bitWidth >= 64) ? UINT64_MAX : ((UINT64_C(1) << bitWidth) - 1);
+}
+}
+
+namespace jfs {
+namespace fuzzingCommon {
+
+#define INCREMENT_ON_COVER(variable)                                           \
+  do {                                                                         \
+    static bool has_been_covered = false;                                      \
+    if (!has_been_covered) {                                                   \
+      has_been_covered = true;                                                 \
+      ++(variable);                                                            \
+    }                                                                          \
+  } while (false)
+
+bool SpecialConstantSeedGenerator::chooseBool(JFSContext& ctx,
+                                              const BufferElement& be,
+                                              Model& model) {
+  assert(be.getSort().isBoolTy());
+  bool value = ctx.getRNG().generate(2);
+  Z3ASTHandle valueAsAST;
+  if (value) {
+    INCREMENT_ON_COVER(stats->numCoveredBoolConstants);
+    valueAsAST = Z3ASTHandle::getTrue(ctx.getZ3Ctx());
+  } else {
+    INCREMENT_ON_COVER(stats->numCoveredBoolConstants);
+    valueAsAST = Z3ASTHandle::getFalse(ctx.getZ3Ctx());
+  }
+  return model.addAssignmentFor(be.getDecl(), valueAsAST);
+}
+
+bool SpecialConstantSeedGenerator::chooseBitVector(JFSContext& ctx,
+                                                   const BufferElement& be,
+                                                   Model& model) {
+  auto sort = be.getSort();
+  unsigned width = sort.getBitVectorWidth();
+  assert(sort.isBitVectorTy());
+  assert(width > 0);
+  assert(width <= 64);
+
+  // Select from special constants for the sort and also any values for the sort
+  // found in the constraints.
+  const auto& valuesFromConstraints = sortToConstraintConstantMap[be.getSort()];
+  const size_t specialConstantsSize =
+      static_cast<size_t>(SpecialConstantBitVector::SIZE);
+  size_t limit = specialConstantsSize + valuesFromConstraints.size();
+  auto value =
+      static_cast<SpecialConstantBitVector>(ctx.getRNG().generate(limit));
+
+  // If we selected a value inside the range of the enum, create the selected
+  // special constant. Otherwise, we selected a constant from the constraints.
+  Z3ASTHandle valueAsAST;
+  switch (value) {
+  case SpecialConstantBitVector::ZERO: {
+    INCREMENT_ON_COVER(stats->numCoveredBVConstants);
+    valueAsAST = Z3ASTHandle::getBV(sort, 0);
+    break;
+  }
+  case SpecialConstantBitVector::ONE: {
+    INCREMENT_ON_COVER(stats->numCoveredBVConstants);
+    valueAsAST = Z3ASTHandle::getBV(sort, 1);
+    break;
+  }
+  case SpecialConstantBitVector::MAX_UNSIGNED_INT: {
+    INCREMENT_ON_COVER(stats->numCoveredBVConstants);
+    // Max unsigned int is of the form 0b11..11.
+    // This is equal to a mask for the full width of the bit vector.
+    valueAsAST = Z3ASTHandle::getBV(sort, getMask(width));
+    break;
+  }
+  case SpecialConstantBitVector::MAX_SIGNED_INT: {
+    INCREMENT_ON_COVER(stats->numCoveredBVConstants);
+    // Max unsigned int is of the form 0b01..11.
+    // This is equal to a mask for one less than the width of the bit vector.
+    valueAsAST = Z3ASTHandle::getBV(sort, getMask(width - 1));
+    break;
+  }
+  default:
+    auto index = static_cast<size_t>(value) - specialConstantsSize;
+    valueAsAST = valuesFromConstraints[index];
+    break;
+  }
+
+  return model.addAssignmentFor(be.getDecl(), valueAsAST);
+}
+
+bool SpecialConstantSeedGenerator::chooseFloatingPoint(JFSContext& ctx,
+                                                       const BufferElement& be,
+                                                       Model& model) {
+  auto sort = be.getSort();
+  assert(sort.isFloatingPointTy());
+  unsigned ebits = sort.getFloatingPointExponentBitWidth();
+  unsigned sbits = sort.getFloatingPointSignificandBitWidth();
+  assert((ebits == 8 && sbits == 24) || (ebits == 11 && sbits == 53));
+
+  // Select from special constants for the sort and also any values for the sort
+  // found in the constraints.
+  const auto& valuesFromConstraints = sortToConstraintConstantMap[be.getSort()];
+  const size_t specialConstantsSize =
+      static_cast<size_t>(SpecialConstantFloatingPoint::SIZE);
+  size_t limit = specialConstantsSize + valuesFromConstraints.size();
+  auto value =
+      static_cast<SpecialConstantFloatingPoint>(ctx.getRNG().generate(limit));
+
+  // If we selected a value inside the range of the enum, create the selected
+  // special constant. Otherwise, we selected a constant from the constraints.
+  Z3ASTHandle valueAsAST;
+  switch (value) {
+  case SpecialConstantFloatingPoint::POSITIVE_ZERO: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatZero(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::NEGATIVE_ZERO: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatZero(sort, /*positive=*/false);
+    break;
+  }
+  case SpecialConstantFloatingPoint::POSITIVE_INFINITY: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatInfinity(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::NEGATIVE_INFINITY: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatInfinity(sort, /*positive=*/false);
+    break;
+  }
+  case SpecialConstantFloatingPoint::NOT_A_NUMBER: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatNAN(sort);
+    break;
+  }
+  case SpecialConstantFloatingPoint::POSITIVE_ONE: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatFromInt(sort, 1);
+    break;
+  }
+  case SpecialConstantFloatingPoint::NEGATIVE_ONE: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatFromInt(sort, -1);
+    break;
+  }
+  case SpecialConstantFloatingPoint::SMALLEST_POSITIVE_SUBNORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteSmallestSubnormal(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::LARGEST_POSITIVE_SUBNORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteLargestSubnormal(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::SMALLEST_POSITIVE_NORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteSmallestNormal(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::LARGEST_POSITIVE_NORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteLargestNormal(sort, /*positive=*/true);
+    break;
+  }
+  case SpecialConstantFloatingPoint::SMALLEST_NEGATIVE_SUBNORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteLargestSubnormal(sort, /*positive=*/false);
+    break;
+  }
+  case SpecialConstantFloatingPoint::LARGEST_NEGATIVE_SUBNORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST = Z3ASTHandle::getFloatAbsoluteSmallestSubnormal(
+        sort, /*positive=*/false);
+    break;
+  }
+  case SpecialConstantFloatingPoint::SMALLEST_NEGATIVE_NORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteLargestNormal(sort, /*positive=*/false);
+    break;
+  }
+  case SpecialConstantFloatingPoint::LARGEST_NEGATIVE_NORMAL: {
+    INCREMENT_ON_COVER(stats->numCoveredFPConstants);
+    valueAsAST =
+        Z3ASTHandle::getFloatAbsoluteSmallestNormal(sort, /*positive=*/false);
+    break;
+  }
+  default:
+    auto index = static_cast<size_t>(value) - specialConstantsSize;
+    valueAsAST = valuesFromConstraints[index];
+    break;
+  }
+
+  return model.addAssignmentFor(be.getDecl(), valueAsAST);
+}
+
+void SpecialConstantSeedGenerator::postGenerationCallBack(SeedManager& sm) {
+  sortToConstraintConstantMap.clear();
+  // Add stats
+  if (sm.getContext().getStats()) {
+    sm.getContext().getStats()->append(std::move(stats));
+  }
+}
+
+void SpecialConstantSeedGenerator::preGenerationCallBack(SeedManager& sm) {
+  auto query = sm.getCurrentQuery();
+  auto& ctx = sm.getContext();
+  stats.reset(
+      new SpecialConstantSeedGeneratorStat("special_constant_seed_generator"));
+  stats->totalNumBuiltInBVConstants =
+      static_cast<uint64_t>(SpecialConstantBitVector::SIZE);
+  stats->totalNumBuiltInFPConstants =
+      static_cast<uint64_t>(SpecialConstantFloatingPoint::SIZE);
+  stats->totalNumBuiltInBoolConstants = 2;
+
+  // Do a DFS to find any constants in the constraints.
+  std::list<Z3ASTHandle> workList;
+  Z3ASTSet seenExpr;
+  for (const auto& c : query->constraints) {
+    workList.push_back(c);
+  }
+  while (workList.size() != 0) {
+    Z3ASTHandle node = workList.front();
+    workList.pop_front();
+    if (seenExpr.count(node) > 0) {
+      // Already visited
+      continue;
+    }
+    seenExpr.insert(node);
+
+    // If this is a constant, track it by sort.
+    if (node.isConstant()) {
+      auto sort = node.getSort();
+      if (!sort.isBitVectorTy() && !sort.isFloatingPointTy()) {
+        continue;
+      }
+      auto& constants = sortToConstraintConstantMap[sort];
+      constants.push_back(node);
+      // Update stats
+      auto& count = stats->foundConstantsCount.emplace(sort, 0).first->second;
+      ++count;
+      continue;
+    }
+
+    // If this is a function application, visit the arguments.
+    if (node.isApp()) {
+      Z3AppHandle app = node.asApp();
+      for (size_t index = 0; index < app.getNumKids(); index++) {
+        workList.push_front(app.getKid(index));
+      }
+      continue;
+    }
+
+    llvm_unreachable("Unexpected node type");
+  }
+
+  if (ctx.getVerbosity() > 1) {
+    ctx.getDebugStream() << "(Constants found in constraints:)\n";
+    for (const auto& sortVectorPair : sortToConstraintConstantMap) {
+      const auto& sort = sortVectorPair.first;
+      ctx.getDebugStream() << "(Stored for sort: " << sort.toStr() << ")\n";
+      for (const auto& constant : sortVectorPair.second) {
+        ctx.getDebugStream() << "  (" << constant.toStr() << ")\n";
+      }
+    }
+  }
+}
+
+bool SpecialConstantSeedGenerator::writeSeed(SeedManager& sm) {
+  auto& ctx = sm.getContext();
+  auto fai = sm.getCurrentFuzzingAnalysisInfo();
+  const BufferAssignment* ba =
+      fai->freeVariableAssignment->bufferAssignment.get();
+
+  FileSerializableModel fsm(ctx);
+
+  // For each buffer element, randomly choose an assignment from special
+  // constants for its sort as well as any constants seen in the constraints.
+  for (const auto& be : *ba) {
+    auto sort = be.getSort();
+
+    // Dispatch to the appropriate helper function for the expr sort
+    bool success;
+    switch (sort.getKind()) {
+    case Z3_BOOL_SORT: {
+      success = chooseBool(ctx, be, fsm);
+      break;
+    }
+    case Z3_BV_SORT: {
+      success = chooseBitVector(ctx, be, fsm);
+      break;
+    }
+    case Z3_FLOATING_POINT_SORT: {
+      success = chooseFloatingPoint(ctx, be, fsm);
+      break;
+    }
+    default:
+      llvm_unreachable("Unhandled sort");
+    }
+
+    if (!success) {
+      std::string underlyingString;
+      llvm::raw_string_ostream ss(underlyingString);
+      ss << "Failed to generate assignment for \"";
+      be.print(ss);
+      ss << "\"";
+      ctx.raiseError(ss.str());
+      return false;
+    }
+
+    if (ctx.getVerbosity() > 1) {
+      if (fsm.hasAssignmentFor(be.getDecl())) {
+        ctx.getDebugStream()
+            << "(Sort: " << sort.toStr()
+            << ", Assignment: " << fsm.getAssignmentFor(be.getDecl()).toStr()
+            << ")\n";
+      } else {
+        ctx.getDebugStream() << "(Sort: " << sort.toStr() << ", Unassigned)\n";
+      }
+    }
+  }
+
+  // FIXME: Consider tracking what has been generated to avoid duplicates. For
+  // complex benchmarks, it seems simpler to keep selecting seeds randomly up to
+  // whatever limit the `SeedManager` has. (This implies though that it must
+  // have _some_ limit or else we'll select forever.)
+
+  // Save seed value to disk via the model.
+  return fsm.saveTo(sm.getBufferForSeed(getName()).get(), ba, ctx);
+}
+
+bool SpecialConstantSeedGenerator::empty() const { return false; }
+
+
+// add by zgf to support dreal seed Generator
+DrealFuzzSeedGenerator::DrealFuzzSeedGenerator(llvm::StringRef name,
+                                               std::map<std::string,uint64_t> &_fuzzSeeds):
+  SeedGenerator(name), fuzzSeeds(_fuzzSeeds), seedWritten(false) {}
+
+bool DrealFuzzSeedGenerator::writeSeed(SeedManager& sm) {
+  auto &ctx = sm.getContext();
+  auto fai = sm.getCurrentFuzzingAnalysisInfo();
+  const BufferAssignment *ba = fai->freeVariableAssignment->bufferAssignment.get();
+
+  auto buf = sm.getBufferForSeed(getName());
+  assert(buf != nullptr);
+  assert(ba != nullptr);
+
+  // Check buffer size is as expected
+  if (buf->getBufferSize() != ba->getRequiredStoreBytes()) {
+    ctx.getWarningStream()
+            << "(warning Failed to save model to file due to size mismatch."
+               "expected:"
+            << ba->getRequiredStoreBytes() << " actual:" << buf->getBufferSize()
+            << " bytes)";
+    return false;
+  }
+
+  // Initialize the buffer to all zeros because later steps won't write to the
+  // padding bits. If we don't do this, those bits will be left uninitialized
+  // which could cause non-determinism when seeding the fuzzer with the
+  // serialized model.
+  memset(buf->getBufferStart(), 0, buf->getBufferSize());
+
+  unsigned currentBufferBit = 0;
+  for (const auto& be : *ba) {
+    // Save assignment to buffer.
+    const unsigned bitWidth = be.getTypeBitWidth();
+    std::string varName = be.getName();
+    uint64_t bv = 0;
+    for (const auto &seed : fuzzSeeds){
+      if (varName.find(seed.first) == 0){
+        bv = seed.second;
+        break;
+      }
+    }
+
+    jfs_nr_write_seed(
+            /*bv=*/bv,
+            /*bitWidth=*/bitWidth,
+            /*bufferData=*/reinterpret_cast<uint8_t*>(buf->getBufferStart()),
+            /*bufferSize=*/buf->getBufferSize(),
+            /*bitOffset=*/currentBufferBit);
+
+    // Notice we use `getStoreBitWidth() and not `getTypeBitWidth()`.
+    // This means that if the type has alignment that we will skip
+    // some bits.
+    currentBufferBit += be.getStoreBitWidth();
+  }
+
+  // Commit saved contents to disk.
+  if (auto error = buf->commit()) {
+    auto errCode = llvm::errorToErrorCode(std::move(error));
+    ctx.getErrorStream()
+            << "(error Failed to commit model because \"" << errCode.message()
+            << "\")\n";
+    return false;
+  }
+
+  seedWritten = true;
+  return true;
+}
+
+bool DrealFuzzSeedGenerator::empty() const { return seedWritten; }
+
+} // namespace fuzzingCommon
+} // namespace jfs

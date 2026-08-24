@@ -381,6 +381,21 @@ public:
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e))
       printConst(CE, PC, printConstWidth);
     else {
+      // add by zgf : print symbolic function expression
+      if(SFCExpr *SFCE = dyn_cast<SFCExpr>(e)){
+        PC << "SFC:"<<SFCE->symFuncName<<" "<<SFCE->retType<<" (";
+        for (unsigned long idx = 0;idx < SFCE->symArgs.size();idx++){
+          unsigned indent = PC.pos;
+          print(SFCE->symArgs[idx].get(),PC,indent);
+          if (idx != SFCE->symArgs.size() -1){
+            PC<<",";
+            printSeparator(PC, false, indent);
+          }
+        }
+        PC << ")";
+        return ;
+      }
+
       std::map<ref<Expr>, unsigned>::iterator it = bindings.find(e);
       if (it!=bindings.end()) {
         PC << 'N' << it->second;

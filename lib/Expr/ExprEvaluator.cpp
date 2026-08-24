@@ -106,3 +106,100 @@ ExprVisitor::Action ExprEvaluator::visitExprPost(const Expr& e) {
   }
   return Action::skipChildren();
 }
+
+///////////// add by zgf : to evaluate 'SFC' //////////////////
+SFCExprVisitor::Action SFCExprEvaluator::evalRead(const UpdateList &ul,
+                                            unsigned index) {
+  for (auto un = ul.head; un; un = un->next) {
+    ref<Expr> ui = visit(un->index);
+
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(ui)) {
+      if (CE->getZExtValue() == index)
+        return Action::changeTo(visit(un->value));
+    } else {
+      // update index is unknown, so may or may not be index, we
+      // cannot guarantee value. we can rewrite to read at this
+      // version though (mostly for debugging).
+
+      return Action::changeTo(ReadExpr::create(UpdateList(ul.root, un),
+                                               ConstantExpr::alloc(index,
+                                                                   ul.root->getDomain())));
+    }
+  }
+
+  if (ul.root->isConstantArray() && index < ul.root->size)
+    return Action::changeTo(ul.root->constantValues[index]);
+
+  return Action::changeTo(getInitialValue(*ul.root, index));
+}
+
+SFCExprVisitor::Action SFCExprEvaluator::visitExpr(const Expr &e) {
+  // Evaluate all constant expressions here, in case they weren't folded in
+  // construction. Don't do this for reads though, because we want them to go to
+  // the normal rewrite path.
+  unsigned N = e.getNumKids();
+  if (!N || isa<ReadExpr>(e))
+    return Action::doChildren();
+
+  for (unsigned i = 0; i != N; ++i)
+    if (!isa<ConstantExpr>(e.getKid(i)))
+      return Action::doChildren();
+
+  ref<Expr> Kids[3];
+  for (unsigned i = 0; i != N; ++i) {
+    assert(i < 3);
+    Kids[i] = e.getKid(i);
+  }
+
+  return Action::changeTo(e.rebuild(Kids));
+}
+
+SFCExprVisitor::Action SFCExprEvaluator::visitRead(const ReadExpr &re) {
+  ref<Expr> v = visit(re.index);
+
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(v)) {
+    return evalRead(re.updates, CE->getZExtValue());
+  } else {
+    return Action::doChildren();
+  }
+}
+
+// we need to check for div by zero during partial evaluation,
+// if this occurs then simply ignore the 0 divisor and use the
+// original expression.
+SFCExprVisitor::Action SFCExprEvaluator::protectedDivOperation(const BinaryExpr &e) {
+  ref<Expr> kids[2] = { visit(e.left),
+                        visit(e.right) };
+
+  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(kids[1]))
+    if (CE->isZero())
+      kids[1] = e.right;
+
+  if (kids[0]!=e.left || kids[1]!=e.right) {
+    return Action::changeTo(e.rebuild(kids));
+  } else {
+    return Action::skipChildren();
+  }
+}
+
+SFCExprVisitor::Action SFCExprEvaluator::visitUDiv(const UDivExpr &e) {
+  return protectedDivOperation(e);
+}
+SFCExprVisitor::Action SFCExprEvaluator::visitSDiv(const SDivExpr &e) {
+  return protectedDivOperation(e);
+}
+SFCExprVisitor::Action SFCExprEvaluator::visitURem(const URemExpr &e) {
+  return protectedDivOperation(e);
+}
+SFCExprVisitor::Action SFCExprEvaluator::visitSRem(const SRemExpr &e) {
+  return protectedDivOperation(e);
+}
+
+SFCExprVisitor::Action SFCExprEvaluator::visitExprPost(const Expr& e) {
+  // When evaluating an assignment we should fold NotOptimizedExpr
+  // nodes so we can fully evaluate.
+  if (e.getKind() == Expr::NotOptimized) {
+    return Action::changeTo(static_cast<const NotOptimizedExpr&>(e).src);
+  }
+  return Action::skipChildren();
+}

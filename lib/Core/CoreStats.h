@@ -43,6 +43,9 @@ namespace stats {
   /// distance to a function return.
   extern Statistic minDistToReturn;
 
+  // add by zgf
+  extern Statistic drealInvalid;
+
 }
 }
 

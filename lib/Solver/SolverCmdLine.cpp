@@ -52,7 +52,7 @@ cl::opt<bool> UseBranchCache("use-branch-cache", cl::init(true),
                              cl::cat(SolvingCat));
 
 cl::opt<bool>
-    UseIndependentSolver("use-independent-solver", cl::init(true),
+    UseIndependentSolver("use-independent-solver", cl::init(false),
                          cl::desc("Use constraint independence (default=true)"),
                          cl::cat(SolvingCat));
 

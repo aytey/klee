@@ -26,10 +26,9 @@
 #include "UserSearcher.h"
 
 #include "klee/ADT/KTest.h"
-#include "klee/ADT/RNG.h"
 #include "klee/Config/Version.h"
 #include "klee/Core/Interpreter.h"
-#include "klee/Expr/ArrayExprOptimizer.h"
+#include "klee/Core/JsonParser.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Expr.h"
 #include "klee/Expr/ExprPPrinter.h"
@@ -41,7 +40,6 @@
 #include "klee/Module/KModule.h"
 #include "klee/Solver/Common.h"
 #include "klee/Solver/SolverCmdLine.h"
-#include "klee/Solver/SolverStats.h"
 #include "klee/Statistics/TimerStatIncrementer.h"
 #include "klee/Support/Casting.h"
 #include "klee/Support/ErrorHandling.h"
@@ -71,13 +69,13 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Process.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 #if LLVM_VERSION_CODE >= LLVM_VERSION(10, 0)
 #include "llvm/Support/TypeSize.h"
 #else
 typedef unsigned TypeSize;
 #endif
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
@@ -85,13 +83,31 @@ typedef unsigned TypeSize;
 #include <cstring>
 #include <cxxabi.h>
 #include <fstream>
-#include <iomanip>
 #include <iosfwd>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <vector>
+#include <llvm/Linker/Linker.h>
+#include <llvm/Support/SourceMgr.h>
+#include <llvm/IRReader/IRReader.h>
+
+// add by zgf : the wrapper to float pointing
+#include "FPExecutor.h"
+
+// add by zgf : the wrapper to float to int
+#include "FP2IntExecutor.h"
+#include "FloatPointChecker.h"
+#include <gmp.h>
+#include <gmpxx.h>
+
+// add by yx
+#include <chrono>
+#include <future>
+#include <pthread.h>
+#include <sys/stat.h>
+
 
 using namespace llvm;
 using namespace klee;
@@ -121,10 +137,21 @@ cl::opt<std::string> MaxTime(
              "Set to 0s to disable (default=0s)"),
     cl::init("0s"),
     cl::cat(TerminationCat));
+
+// add by zgf to set max basic block meet times
+cl::opt<std::string> FPToIntTransfrom(
+    "fp2int-lib", cl::init(""),
+    cl::desc("Use FP2IntExecutor instead of FPExecutor."),
+    cl::cat(TerminationCat));
+
+// add by zgf : get MainExecute Path for JFS
+std::string pathToExecutable;
+
 } // namespace klee
 
 namespace {
 
+    int filenamecnt = 0;
 /*** Test generation options ***/
 
 cl::opt<bool> DumpStatesOnHalt(
@@ -133,9 +160,10 @@ cl::opt<bool> DumpStatesOnHalt(
     cl::desc("Dump test cases for all active states on exit (default=true)"),
     cl::cat(TestGenCat));
 
+// modify by zgf : set it true to avoid too much ktest file generated.
 cl::opt<bool> OnlyOutputStatesCoveringNew(
     "only-output-states-covering-new",
-    cl::init(false),
+    cl::init(true),
     cl::desc("Only output test cases covering new code (default=false)"),
     cl::cat(TestGenCat));
 
@@ -203,6 +231,18 @@ cl::opt<bool> SuppressExternalWarnings(
     cl::desc("Supress warnings about calling external functions."),
     cl::cat(ExtCallsCat));
 
+cl::opt<bool> DebugCons(
+        "debug-cons",
+        cl::init(false),
+        cl::desc("Debug to print constraints."),
+        cl::cat(ExtCallsCat));
+
+cl::opt<std::string> smtLibPath(
+        "smtlib-path",
+        cl::init(""),
+        cl::desc("as the file name of smtlib2."),
+        cl::cat(ExtCallsCat));
+
 cl::opt<bool> AllExternalWarnings(
     "all-external-warnings",
     cl::init(false),
@@ -213,6 +253,8 @@ cl::opt<bool> AllExternalWarnings(
 
 /*** Seeding options ***/
 
+// modify by zgf : set it false, because all testcase are generate by
+// 'state.assignSeed', if set it true, too much ktest file will be generated.
 cl::opt<bool> AlwaysOutputSeeds(
     "always-output-seeds",
     cl::init(true),
@@ -264,7 +306,6 @@ cl::opt<std::string>
                       "search (default=0s (off))"),
              cl::cat(SeedingCat));
 
-
 /*** Termination criteria options ***/
 
 cl::list<StateTerminationType> ExitOnErrorType(
@@ -301,6 +342,14 @@ cl::list<StateTerminationType> ExitOnErrorType(
 cl::opt<unsigned long long> MaxInstructions(
     "max-instructions",
     cl::desc("Stop execution after this many instructions.  Set to 0 to disable (default=0)"),
+    cl::init(0),
+    cl::cat(TerminationCat));
+
+// add by zgf
+cl::opt<unsigned long long> MaxConcreteInstructions(
+    "max-concrete-instructions",
+    cl::desc("Stop execution after this many instructions under Concrete Mode. "
+             " Set to 0 to disable (default=0)"),
     cl::init(0),
     cl::cat(TerminationCat));
 
@@ -377,6 +426,76 @@ cl::opt<std::string> TimerInterval(
     cl::init("1s"),
     cl::cat(TerminationCat));
 
+// add by zgf to set max basic block meet times
+cl::opt<unsigned> MaxLoopTime(
+    "max-loop-time", cl::init(0),
+    cl::desc("In concrete mode while/for loop, if the input are copmputed "
+             "very small, the loop may endless. So if meet basic block too many "
+             "time, kill this state."),
+    cl::cat(TerminationCat));
+
+// add by zgf to set max basic block meet times
+cl::opt<unsigned> MaxSearchTime(
+    "max-search-time", cl::init(5),
+    cl::desc("Only used in DREAL_IS method to limit interval search time."),
+    cl::cat(TerminationCat));
+
+cl::list<std::string> UserComplexFunctions(
+    "complex-function",
+    cl::desc("User specify complex functions which need to skip symbolic execution."),   //desc: -help need output context
+    cl::cat(TerminationCat));  // Specifiy the Option category for the command line argument to belong
+
+// add by zgf to decide use which solver
+enum class SolverType {
+  SMT,     // Only use Z3
+  JFS,     // Only use JFS
+  DREAL_FUZZ,   // Only use DReal with JFS
+  DREAL_IS,    // DReal with internal search, SOTA work
+  SMT_DREAL_JFS,   // Use SMT to check UNSAT, then use DReal and JFS
+  SMT_JFS,
+  GOSAT,   // GOSAT with Z3
+  BITWUZLA,
+//  BOOLECTOR,
+  MATHSAT5,
+  MATHSAT5REAL,
+  FP2INT,
+  CVC5,
+  CVC5REAL,
+};
+cl::opt<SolverType> SolverTypeDecision(
+    "solver-type",
+    cl::desc("Specify the external call policy"),
+    cl::values(
+        clEnumValN(SolverType::SMT, "smt",
+                   "Always use SMT to solve all function.(default)"),
+        clEnumValN(SolverType::JFS, "jfs",
+                   "Always use Fuzzing by JFS to solve all function."),
+        clEnumValN(SolverType::DREAL_FUZZ, "dreal-fuzz",
+                   "Always use DReal to solve all function."),
+        clEnumValN(SolverType::DREAL_IS, "dreal-is",
+                   "POPL13, DReal with internal search, SOTA work."),
+        clEnumValN(SolverType::SMT_DREAL_JFS, "smt-dreal",
+                   "APSEC22 work implementation."),
+        clEnumValN(SolverType::SMT_JFS, "smt-jfs",
+                   "Synergy work implementation."),
+        clEnumValN(SolverType::GOSAT, "gosat",
+                   "GoSat solver."),
+        clEnumValN(SolverType::BITWUZLA, "bitwuzla",
+                   "Bitwuzla solver."),
+//        clEnumValN(SolverType::BOOLECTOR, "boolector",
+//                   "Boolector solver."),
+        clEnumValN(SolverType::MATHSAT5, "mathsat5",
+                   "MathSAT5 solver."),
+        clEnumValN(SolverType::MATHSAT5REAL, "mathsat5-real",
+                   "MathSAT5Real solver."),
+        clEnumValN(SolverType::CVC5, "cvc5",
+                   "CVC5 solver."),
+        clEnumValN(SolverType::CVC5REAL, "cvc5-real",
+                   "CVC5Real solver.")
+        KLEE_LLVM_CL_VAL_END),
+    cl::init(SolverType::SMT),
+    cl::cat(TerminationCat));
+
 
 /*** Debugging options ***/
 
@@ -431,19 +550,20 @@ cl::opt<bool> DebugCheckForImpliedValues(
 
 } // namespace
 
+
 // XXX hack
 extern "C" unsigned dumpStates, dumpPTree;
 unsigned dumpStates = 0, dumpPTree = 0;
 
+//Executor 构造函数
 Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
                    InterpreterHandler *ih)
     : Interpreter(opts), interpreterHandler(ih), searcher(0),
       externalDispatcher(new ExternalDispatcher(ctx)), statsTracker(0),
       pathWriter(0), symPathWriter(0), specialFunctionHandler(0), timers{time::Span(TimerInterval)},
-      replayKTest(0), replayPath(0), usingSeeds(0),
+      replayKTest(0), replayPath(0), usingSeeds(0),concreteHalt(false),
       atMemoryLimit(false), inhibitForking(false), haltExecution(false),
       ivcEnabled(false), debugLogBuffer(debugBufferString) {
-
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -454,10 +574,13 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
 
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
   if (coreSolverTimeout) UseForkedCoreSolver = true;
-  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
+  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);//创建求解器 Using Z3 solver backend 就是在这里打印的
   if (!coreSolver) {
     klee_error("Failed to create core solver\n");
   }
+
+  // add by zgf to get multiSolution
+  z3Solver = new Z3SolverImpl();
 
   Solver *solver = constructSolverChain(
       coreSolver,
@@ -467,9 +590,23 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
   this->solver = new TimingSolver(solver, EqualitySubstitution);
+
   memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
+
+  // add by zgf : to get function info for fuzzer
+  // pre defined complex function, such as : sin/cos/tan/pow...
+  buildFloatCFType(preFloatCFList,funcsType);
+  buildFPCheckType(funcsType);
+  for (const auto &baseFunc : preFloatCFList)
+    complexFuncSet.insert("CF_" + baseFunc);
+//  complexFuncSet是一个set
+  for (auto const& fType : funcsType) // 所有函数
+    basicFuncsTypeTable.insert(std::make_pair(fType.unique_name,fType));
+
+  jfsSolver.setPathToExecutable(pathToExecutable);
+  jfsSolver.setBasicFuncsTypeTable(basicFuncsTypeTable);
 
   if (OnlyOutputStatesCoveringNew && !StatsTracker::useIStats())
     klee_error("To use --only-output-states-covering-new, you need to enable --output-istats.");
@@ -504,7 +641,6 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
          "can only register one module"); // XXX gross
 
   kmodule = std::unique_ptr<KModule>(new KModule());
-
   // Preparing the final module happens in multiple stages
 
   // Link with KLEE intrinsics library before running any optimizations
@@ -523,6 +659,21 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
     kmodule->instrument(opts);
   }
 
+  // add by zgf to support FP2INT
+  std::set<std::string> fp2intFuncName;
+  if (FPToIntTransfrom != ""){
+    ErrorOr<std::unique_ptr<MemoryBuffer>> bufferErr =
+            MemoryBuffer::getFileOrSTDIN(FPToIntTransfrom.c_str());
+    MemoryBufferRef Buffer = bufferErr.get()->getMemBufferRef();
+    SMDiagnostic Err;
+    std::unique_ptr<llvm::Module> fp2intModule(
+            parseIR(Buffer, Err, modules[0]->getContext()));
+    for (auto &F : fp2intModule->getFunctionList())
+      fp2intFuncName.insert(F.getName());
+    kmodule->excludeFuncSet = fp2intFuncName;
+    auto linkResult = Linker::linkModules(*kmodule->module, std::move(fp2intModule));
+  }
+
   // 3.) Optimise and prepare for KLEE
 
   // Create a list of functions that should be preserved if used
@@ -538,6 +689,7 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
   preservedFunctions.push_back("memcmp");
   preservedFunctions.push_back("memmove");
 
+  //打印“Replacing function "fabs" with "klee_internal_fabs"”
   kmodule->optimiseAndPrepare(opts, preservedFunctions);
   kmodule->checkModule();
 
@@ -606,7 +758,7 @@ void Executor::initializeGlobalObject(ExecutionState &state, ObjectState *os,
                              offset + i*elementSize);
   } else if (!isa<UndefValue>(c) && !isa<MetadataAsValue>(c)) {
     unsigned StoreBits = targetData->getTypeStoreSizeInBits(c->getType());
-    ref<ConstantExpr> C = evalConstant(c);
+    ref<ConstantExpr> C = evalConstant(c,state.roundingMode);
 
     // Extend the constant if necessary;
     assert(StoreBits >= C->getWidth() && "Invalid store size!");
@@ -636,11 +788,12 @@ extern void *__dso_handle __attribute__ ((__weak__));
 void Executor::initializeGlobals(ExecutionState &state) {
   // allocate and initialize globals, done in two passes since we may
   // need address of a global in order to initialize some other one.
+  //分配和初始化全局变量，分两次完成，因为我们可能需要一个全局变量的地址来初始化另一个全局变量。
 
   // allocate memory objects for all globals
   allocateGlobalObjects(state);
 
-  // initialize aliases first, may be needed for global objects
+  // initialize aliases first, may be needed for global objects   aliases 别名
   initializeGlobalAliases();
 
   // finally, do the actual initialization
@@ -651,7 +804,7 @@ void Executor::allocateGlobalObjects(ExecutionState &state) {
   Module *m = kmodule->module.get();
 
   if (m->getModuleInlineAsm() != "")
-    klee_warning("executable has module level assembly (ignoring)");
+    klee_warning("executable has module level assembly (ignoring)");// 警告
   // represent function globals using the address of the actual llvm function
   // object. given that we use malloc to allocate memory in states this also
   // ensures that we won't conflict. we don't need to allocate a memory object
@@ -789,7 +942,9 @@ void Executor::initializeGlobalAlias(const llvm::Constant *c) {
 
   if (ga) {
     // aliasee is constant expression (or global alias)
-    globalAddresses.emplace(ga, evalConstant(ga->getAliasee()));
+    globalAddresses.emplace(ga,
+         evalConstant(ga->getAliasee(),
+                      llvm::APFloat::rmNearestTiesToEven));
   }
 }
 
@@ -902,7 +1057,7 @@ void Executor::branch(ExecutionState &state,
   // If necessary redistribute seeds to match conditions, killing
   // states if necessary due to OnlyReplaySeeds (inefficient but
   // simple).
-  
+
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
   if (it != seedMap.end()) {
@@ -918,7 +1073,7 @@ void Executor::branch(ExecutionState &state,
       for (i=0; i<N; ++i) {
         ref<ConstantExpr> res;
         bool success = solver->getValue(
-            state.constraints, siit->assignment.evaluate(conditions[i]), res,
+            state, siit->assignment.evaluate(conditions[i]), res,
             state.queryMetaData);
         assert(success && "FIXME: Unhandled solver failure");
         (void) success;
@@ -990,7 +1145,7 @@ ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
   if (reached_max_fork_limit || reached_max_cp_fork_limit ||
       reached_max_solver_limit || reached_max_cp_solver_limit) {
     ref<klee::ConstantExpr> value;
-    bool success = solver->getValue(current.constraints, condition, value,
+    bool success = solver->getValue(current, condition, value,
                                     current.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     (void)success;
@@ -1007,21 +1162,31 @@ ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
   return condition;
 }
 
-Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
+Executor::StatePair Executor::fork(ExecutionState &current,
+                                   ref<Expr> condition,
                                    bool isInternal, BranchType reason) {
-  Solver::Validity res;
-  std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
-    seedMap.find(&current);
-  bool isSeeding = it != seedMap.end();
 
-  if (!isSeeding)
-    condition = maxStaticPctChecks(current, condition);
+  if (! isa<ConstantExpr>(condition)) {
+//    llvm::errs() << "[zgf dbg] fork :\n  "<< condition <<"\n";
+
+    // add by zgf to avoid infinite loop in concrete mode
+    if (MaxLoopTime != 0){
+      current.stack.back().BBcounter[current.basicBlockEntry] += 1;//{}
+      if (current.stack.back().BBcounter[current.basicBlockEntry] >= MaxLoopTime) {
+        current.forkDisabled = true;
+      }else{
+        current.forkDisabled = false;
+      }
+    }
+  }
+
+  Solver::Validity res;
+  condition = maxStaticPctChecks(current, condition);
 
   time::Span timeout = coreSolverTimeout;
-  if (isSeeding)
-    timeout *= static_cast<unsigned>(it->second.size());
   solver->setTimeout(timeout);
-  bool success = solver->evaluate(current.constraints, condition, res,
+  // modify by zgf : no need to use SMT solver in concrete execution,
+  bool success = solver->evaluate(current, condition, res,
                                   current.queryMetaData);
   solver->setTimeout(time::Span());
   if (!success) {
@@ -1030,86 +1195,32 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     return StatePair(nullptr, nullptr);
   }
 
-  if (!isSeeding) {
-    if (replayPath && !isInternal) {
-      assert(replayPosition<replayPath->size() &&
-             "ran out of branches in replay path mode");
-      bool branch = (*replayPath)[replayPosition++];
-      
-      if (res==Solver::True) {
-        assert(branch && "hit invalid branch in replay path mode");
-      } else if (res==Solver::False) {
-        assert(!branch && "hit invalid branch in replay path mode");
-      } else {
-        // add constraints
-        if(branch) {
-          res = Solver::True;
-          addConstraint(current, condition);
-        } else  {
-          res = Solver::False;
-          addConstraint(current, Expr::createIsZero(condition));
-        }
-      }
-    } else if (res==Solver::Unknown) {
-      assert(!replayKTest && "in replay mode, only one branch can be true.");
-      
-      if (!branchingPermitted(current)) {
-        TimerStatIncrementer timer(stats::forkTime);
-        if (theRNG.getBool()) {
-          addConstraint(current, condition);
-          res = Solver::True;        
-        } else {
-          addConstraint(current, Expr::createIsZero(condition));
-          res = Solver::False;
-        }
-      }
-    }
-  }
-
-  // Fix branch in only-replay-seed mode, if we don't have both true
-  // and false seeds.
-  if (isSeeding && 
-      (current.forkDisabled || OnlyReplaySeeds) && 
-      res == Solver::Unknown) {
-    bool trueSeed=false, falseSeed=false;
-    // Is seed extension still ok here?
-    for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
-           siie = it->second.end(); siit != siie; ++siit) {
-      ref<ConstantExpr> res;
-      bool success = solver->getValue(current.constraints,
-                                      siit->assignment.evaluate(condition), res,
-                                      current.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      (void) success;
-      if (res->isTrue()) {
-        trueSeed = true;
-      } else {
-        falseSeed = true;
-      }
-      if (trueSeed && falseSeed)
-        break;
-    }
-    if (!(trueSeed && falseSeed)) {
-      assert(trueSeed || falseSeed);
-      
-      res = trueSeed ? Solver::True : Solver::False;
-      addConstraint(current, trueSeed ? condition : Expr::createIsZero(condition));
-    }
-  }
-
-
-  // XXX - even if the constraint is provable one way or the other we
-  // can probably benefit by adding this constraint and allowing it to
-  // reduce the other constraints. For example, if we do a binary
-  // search on a particular value, and then see a comparison against
-  // the value it has been fixed at, we should take this as a nice
-  // hint to just use the single constraint instead of all the binary
-  // search ones. If that makes sense.
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
         current.pathOS << "1";
       }
+    }
+    // add by zgf
+    if (isa<ConstantExpr>(condition)) {
+      // if condition is const, don not care it !
+    }else if (current.forkDisabled) {
+      // it must enter FP2INTCheck softfloat function,
+      // we still care the constraints collected in these soft function
+      current.addInitialConstraint(condition);
+    }else{
+      ExecutionState *otherState = current.copyConcrete();
+
+      current.addInitialConstraint(condition);
+
+      ++stats::forks;
+      otherState->addInitialConstraint(Expr::createIsZero(condition));
+      addedStates.push_back(otherState);
+      processTree->attach(current.ptreeNode, otherState,&current, reason);
+      // we must link 'otherState' to correspond successor basic block by
+      // 'transferToBasicBLock', otherwise, 'otherState' constraints will not
+      // match to the path.
+      return StatePair(&current,otherState);
     }
 
     return StatePair(&current, nullptr);
@@ -1119,82 +1230,32 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
         current.pathOS << "0";
       }
     }
+    // add by zgf
+    if (isa<ConstantExpr>(condition)) {
+      // if condition is const, don not care it !
+    }else if (current.forkDisabled) {
+      // it must enter FP2INTCheck softfloat function,
+      // we still care the constraints collected in these soft function
+      current.addInitialConstraint(Expr::createIsZero(condition));
+    }else {
+//      llvm::errs() << "cond : " << condition << "\n";
+      ExecutionState *otherState = current.copyConcrete();
+      current.addInitialConstraint(Expr::createIsZero(condition));
+
+      ++stats::forks;
+      otherState->addInitialConstraint(condition);
+      addedStates.push_back(otherState);
+      processTree->attach(current.ptreeNode, otherState, &current, reason);
+      // we must link 'otherState' to correspond successor basic block by
+      // 'transferToBasicBLock', otherwise, 'otherState' constraints will not
+      // match to the path.
+      return StatePair(otherState, &current);
+    }
 
     return StatePair(nullptr, &current);
   } else {
-    TimerStatIncrementer timer(stats::forkTime);
-    ExecutionState *falseState, *trueState = &current;
-
-    ++stats::forks;
-
-    falseState = trueState->branch();
-    addedStates.push_back(falseState);
-
-    if (it != seedMap.end()) {
-      std::vector<SeedInfo> seeds = it->second;
-      it->second.clear();
-      std::vector<SeedInfo> &trueSeeds = seedMap[trueState];
-      std::vector<SeedInfo> &falseSeeds = seedMap[falseState];
-      for (std::vector<SeedInfo>::iterator siit = seeds.begin(), 
-             siie = seeds.end(); siit != siie; ++siit) {
-        ref<ConstantExpr> res;
-        bool success = solver->getValue(current.constraints,
-                                        siit->assignment.evaluate(condition),
-                                        res, current.queryMetaData);
-        assert(success && "FIXME: Unhandled solver failure");
-        (void) success;
-        if (res->isTrue()) {
-          trueSeeds.push_back(*siit);
-        } else {
-          falseSeeds.push_back(*siit);
-        }
-      }
-      
-      bool swapInfo = false;
-      if (trueSeeds.empty()) {
-        if (&current == trueState) swapInfo = true;
-        seedMap.erase(trueState);
-      }
-      if (falseSeeds.empty()) {
-        if (&current == falseState) swapInfo = true;
-        seedMap.erase(falseState);
-      }
-      if (swapInfo) {
-        std::swap(trueState->coveredNew, falseState->coveredNew);
-        std::swap(trueState->coveredLines, falseState->coveredLines);
-      }
-    }
-
-    processTree->attach(current.ptreeNode, falseState, trueState, reason);
-
-    if (pathWriter) {
-      // Need to update the pathOS.id field of falseState, otherwise the same id
-      // is used for both falseState and trueState.
-      falseState->pathOS = pathWriter->open(current.pathOS);
-      if (!isInternal) {
-        trueState->pathOS << "1";
-        falseState->pathOS << "0";
-      }
-    }
-    if (symPathWriter) {
-      falseState->symPathOS = symPathWriter->open(current.symPathOS);
-      if (!isInternal) {
-        trueState->symPathOS << "1";
-        falseState->symPathOS << "0";
-      }
-    }
-
-    addConstraint(*trueState, condition);
-    addConstraint(*falseState, Expr::createIsZero(condition));
-
-    // Kinda gross, do we even really still want this option?
-    if (MaxDepth && MaxDepth<=trueState->depth) {
-      terminateStateEarly(*trueState, "max-depth exceeded.", StateTerminationType::MaxDepth);
-      terminateStateEarly(*falseState, "max-depth exceeded.", StateTerminationType::MaxDepth);
-      return StatePair(nullptr, nullptr);
-    }
-
-    return StatePair(trueState, falseState);
+    // modify by zgf
+    assert(false && "There is impossible to reach here in concrete Mode !");
   }
 }
 
@@ -1205,28 +1266,6 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
     return;
   }
 
-  // Check to see if this constraint violates seeds.
-  std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
-    seedMap.find(&state);
-  if (it != seedMap.end()) {
-    bool warn = false;
-    for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
-           siie = it->second.end(); siit != siie; ++siit) {
-      bool res;
-      bool success = solver->mustBeFalse(state.constraints,
-                                         siit->assignment.evaluate(condition),
-                                         res, state.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      (void) success;
-      if (res) {
-        siit->patchSeed(state, condition, solver);
-        warn = true;
-      }
-    }
-    if (warn)
-      klee_warning("seeds patched for violating constraint"); 
-  }
-
   state.addConstraint(condition);
   if (ivcEnabled)
     doImpliedValueConcretization(state, condition, 
@@ -1235,7 +1274,8 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
 
 const Cell& Executor::eval(KInstruction *ki, unsigned index, 
                            ExecutionState &state) const {
-  assert(index < ki->inst->getNumOperands());
+  //这里index是从1开始
+  assert(index < ki->inst->getNumOperands());//得到操作数的个数 调用函数的参数个数
   int vnumber = ki->operands[index];
 
   assert(vnumber != -1 &&
@@ -1262,7 +1302,7 @@ void Executor::bindArgument(KFunction *kf, unsigned index,
   getArgumentCell(state, kf, index).value = value;
 }
 
-ref<Expr> Executor::toUnique(const ExecutionState &state, 
+ref<Expr> Executor::toUnique(ExecutionState &state,
                              ref<Expr> &e) {
   ref<Expr> result = e;
 
@@ -1271,10 +1311,10 @@ ref<Expr> Executor::toUnique(const ExecutionState &state,
     bool isTrue = false;
     e = optimizer.optimizeExpr(e, true);
     solver->setTimeout(coreSolverTimeout);
-    if (solver->getValue(state.constraints, e, value, state.queryMetaData)) {
+    if (solver->getValue(state, e, value, state.queryMetaData)) {
       ref<Expr> cond = EqExpr::create(e, value);
       cond = optimizer.optimizeExpr(cond, false);
-      if (solver->mustBeTrue(state.constraints, cond, isTrue,
+      if (solver->mustBeTrue(state, cond, isTrue,
                              state.queryMetaData) &&
           isTrue)
         result = value;
@@ -1298,7 +1338,7 @@ Executor::toConstant(ExecutionState &state,
 
   ref<ConstantExpr> value;
   bool success =
-      solver->getValue(state.constraints, e, value, state.queryMetaData);
+      solver->getValue(state, e, value, state.queryMetaData);
   assert(success && "FIXME: Unhandled solver failure");
   (void) success;
 
@@ -1328,40 +1368,15 @@ void Executor::executeGetValue(ExecutionState &state,
     ref<ConstantExpr> value;
     e = optimizer.optimizeExpr(e, true);
     bool success =
-        solver->getValue(state.constraints, e, value, state.queryMetaData);
+        solver->getValue(state, e, value, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
     bindLocal(target, state, value);
   } else {
-    std::set< ref<Expr> > values;
-    for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
-           siie = it->second.end(); siit != siie; ++siit) {
-      ref<Expr> cond = siit->assignment.evaluate(e);
-      cond = optimizer.optimizeExpr(cond, true);
-      ref<ConstantExpr> value;
-      bool success =
-          solver->getValue(state.constraints, cond, value, state.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      (void) success;
-      values.insert(value);
-    }
-    
-    std::vector< ref<Expr> > conditions;
-    for (std::set< ref<Expr> >::iterator vit = values.begin(), 
-           vie = values.end(); vit != vie; ++vit)
-      conditions.push_back(EqExpr::create(e, *vit));
-
-    std::vector<ExecutionState*> branches;
-    branch(state, conditions, branches, BranchType::GetVal);
-    
-    std::vector<ExecutionState*>::iterator bit = branches.begin();
-    for (std::set< ref<Expr> >::iterator vit = values.begin(), 
-           vie = values.end(); vit != vie; ++vit) {
-      ExecutionState *es = *bit;
-      if (es)
-        bindLocal(target, *es, *vit);
-      ++bit;
-    }
+    // modify by zgf : getValue using 'state.assignSeed', if and only if has a value
+    // in concrete mode, don't need to fork.
+    ref<Expr> cond = state.assignSeed.evaluate(e);
+    bindLocal(target, state, cond);
   }
 }
 
@@ -1416,29 +1431,19 @@ void Executor::stepInstruction(ExecutionState &state) {
   state.prevPC = state.pc;
   ++state.pc;
 
-  if (stats::instructions == MaxInstructions)
-    haltExecution = true;
-}
+  //add by zgf : if current state search in deep loop
+  // give up this state
+  if (state.steppedInstructions == MaxConcreteInstructions){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+    klee_warning("Reach Max Concrete Instructions, give up this state!");
+  }
 
-static inline const llvm::fltSemantics *fpWidthToSemantics(unsigned width) {
-  switch (width) {
-#if LLVM_VERSION_CODE >= LLVM_VERSION(4, 0)
-  case Expr::Int32:
-    return &llvm::APFloat::IEEEsingle();
-  case Expr::Int64:
-    return &llvm::APFloat::IEEEdouble();
-  case Expr::Fl80:
-    return &llvm::APFloat::x87DoubleExtended();
-#else
-  case Expr::Int32:
-    return &llvm::APFloat::IEEEsingle;
-  case Expr::Int64:
-    return &llvm::APFloat::IEEEdouble;
-  case Expr::Fl80:
-    return &llvm::APFloat::x87DoubleExtended;
-#endif
-  default:
-    return 0;
+  // note by zgf : if total instructions visited by
+  // all path reaches 'MaxInstructions', stop the whole
+  // symbolic execution
+  if (stats::instructions == MaxInstructions){
+    haltExecution = true;
   }
 }
 
@@ -1675,6 +1680,118 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
   Instruction *i = ki->inst;
   if (isa_and_nonnull<DbgInfoIntrinsic>(i))
     return;
+
+  // add by zgf for DReal expression
+  if (SolverTypeDecision == SolverType::DREAL_FUZZ ||
+      SolverTypeDecision == SolverType::DREAL_IS ||
+      SolverTypeDecision == SolverType::JFS ||
+      SolverTypeDecision == SolverType::SMT_DREAL_JFS ||
+      SolverTypeDecision == SolverType::SMT_JFS ||
+      SolverTypeDecision == SolverType::GOSAT ||
+      SolverTypeDecision == SolverType::CVC5REAL ||
+      SolverTypeDecision == SolverType::MATHSAT5REAL){
+    std::string funcName = f->getName().str();
+    std::string CFName = "CF_" + funcName;
+    if (complexFuncSet.find(CFName) != complexFuncSet.end()){
+      if(funcName == "log"){
+        assert(arguments.size() == 1 && "invalid number of arguments to log");
+        ref<Expr> result = LOGExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "exp"){
+        assert(arguments.size() == 1 && "invalid number of arguments to exp");
+        ref<Expr> result = EXPExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "floor"){
+        assert(arguments.size() == 1 && "invalid number of arguments to exp");
+        ref<Expr> result = FLOORExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "ceil"){
+        assert(arguments.size() == 1 && "invalid number of arguments to exp");
+        ref<Expr> result = CEILExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "sin"){
+        assert(arguments.size() == 1 && "invalid number of arguments to sin");
+        ref<Expr> result = SINExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "cos"){
+        assert(arguments.size() == 1 && "invalid number of arguments to cos");
+        ref<Expr> result = COSExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "tan"){
+        assert(arguments.size() == 1 && "invalid number of arguments to tan");
+        ref<Expr> result = TANExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "asin"){
+        assert(arguments.size() == 1 && "invalid number of arguments to asin");
+        ref<Expr> result = ASINExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "acos"){
+        assert(arguments.size() == 1 && "invalid number of arguments to acos");
+        ref<Expr> result = ACOSExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "atan"){
+        assert(arguments.size() == 1 && "invalid number of arguments to atan");
+        ref<Expr> result = ATANExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "sinh"){
+        assert(arguments.size() == 1 && "invalid number of arguments to sinh");
+        ref<Expr> result = SINHExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "cosh"){
+        assert(arguments.size() == 1 && "invalid number of arguments to cosh");
+        ref<Expr> result = COSHExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "tanh"){
+        assert(arguments.size() == 1 && "invalid number of arguments to tanh");
+        ref<Expr> result = TANHExpr::create(arguments[0]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "pow"){
+        assert(arguments.size() == 2 && "invalid number of arguments to pow");
+        ref<Expr> result = POWExpr::create(arguments[0],arguments[1]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "atan2"){
+        assert(arguments.size() == 2 && "invalid number of arguments to atan2");
+        ref<Expr> result = ATAN2Expr::create(arguments[0],arguments[1]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "fmin"){
+        assert(arguments.size() == 2 && "invalid number of arguments to min");
+        ref<Expr> result = FMINExpr::create(arguments[0],arguments[1]);
+        bindLocal(ki, state, result);
+        return;
+      }else if (funcName == "fmax"){
+        assert(arguments.size() == 2 && "invalid number of arguments to max");
+        ref<Expr> result = FMAXExpr::create(arguments[0],arguments[1]);
+        bindLocal(ki, state, result);
+        return;
+      }
+    }
+  }else if(SolverTypeDecision == SolverType::SMT ||
+           SolverTypeDecision == SolverType::BITWUZLA ||
+           SolverTypeDecision == SolverType::CVC5 ||
+           SolverTypeDecision == SolverType::MATHSAT5 ||
+           SolverTypeDecision == SolverType::FP2INT){
+    std::string funcName = f->getName().str();
+    std::string CFName = "CF_" + funcName;
+    if (state.fpErrorStack == 0 &&
+      complexFuncSet.find(CFName) != complexFuncSet.end())
+      state.fpErrorStack = state.stack.size() + 1;
+  }
+
   if (f && f->isDeclaration()) {
     switch (f->getIntrinsicID()) {
     case Intrinsic::not_intrinsic:
@@ -1682,17 +1799,10 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       callExternalFunction(state, ki, f, arguments);
       break;
     case Intrinsic::fabs: {
-      ref<ConstantExpr> arg =
-          toConstant(state, arguments[0], "floating point");
-      if (!fpWidthToSemantics(arg->getWidth()))
-        return terminateStateOnExecError(
-            state, "Unsupported intrinsic llvm.fabs call");
-
-      llvm::APFloat Res(*fpWidthToSemantics(arg->getWidth()),
-                        arg->getAPValue());
-      Res = llvm::abs(Res);
-
-      bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+      // modify by zgf : copy from SpecialFunctionHandler.cpp
+      assert(arguments.size() == 1 && "invalid number of arguments to fabs");
+      ref<Expr> result = FAbsExpr::create(arguments[0]);
+      bindLocal(ki, state, result);
       break;
     }
 
@@ -2077,8 +2187,132 @@ Function* Executor::getTargetFunction(Value *calledVal, ExecutionState &state) {
   }
 }
 
+std::string getErrorCodeStr(int errorCode){
+  std::string errStr = "FloatPointCheck: Overflow found !";
+  if (errorCode == 2)
+    errStr = "FloatPointCheck: Underflow found !";
+  else if (errorCode == 3)
+    errStr = "FloatPointCheck: FDiv Invalid found !";
+  else if (errorCode == 4)
+    errStr = "FloatPointCheck: FDiv Divide-By-Zero found !";
+  else if (errorCode == 5)
+    errStr = "FloatPointCheck: FAdd Accuracy found !";
+  else if (errorCode == 6)
+    errStr = "FloatPointCheck: FSub Accuracy found !";
+  else if (errorCode == 7)
+    errStr = "FloatPointCheck: FMul Accuracy found !";
+  else if (errorCode == 8)
+    errStr = "FloatPointCheck: FDiv Accuracy found !";
+  else if (errorCode == 9)
+    errStr = "FloatPointCheck: FSqrt Invalid found !";
+  else if (errorCode == 10)
+    errStr = "FloatPointCheck: FLog Invalid found !";
+  else if (errorCode == 11)
+    errStr = "FloatPointCheck: FPow Invalid found !";
+  return errStr;
+}
+
+// add by zgf to support FP2INTchecker
+int Executor::FP2INTCheckHandler(ExecutionState &state,ref<Expr> result){
+  /*std::string funcName = state.stack.back().kf->function->getName();
+  llvm::errs()<<"[zgf dbg] return from fp2int : "<<funcName<<" result:\n"<<result<<"\n";
+  llvm::errs()<<"Eval result : \n"<<state.assignSeed.evaluate(result)<<"\n";*/
+  FP2INTState *fp2intState = &state.fp2intState;
+
+  // current state check or report has been get, so don't fork from it
+  if (checkedInstID.find(state.inst_id) != checkedInstID.end()){
+    addedStates.clear();
+    for (auto &s : states)
+      if (s->inst_id == state.inst_id)
+        states.erase(s);
+    removedStates.push_back(&state);
+    concreteHalt = true;
+    return 1;
+  }
+
+  // is current state just for FPChecker, don't fork it
+  if (state.fp2intCheckType > 0){
+    bool isChecker = false;
+    bool isSpecialKill = false;
+    if (ConstantExpr *resultCE = dyn_cast<ConstantExpr>(result)){
+//      result->dump();
+      isChecker = resultCE->isTrue();
+    }
+    else{
+      ref<Expr> limit = EqExpr::create(result,ConstantExpr::alloc(true,Expr::Bool));
+      state.addInitialConstraint(limit);
+      state.fakeState = true;
+
+      // from normal state trabcfilenamensfer to fakeState, but not terminate do not support,
+      // so add this state to "removeStates"
+      isSpecialKill = true;
+
+      getStateSeed(state,isChecker,"FP_"+std::to_string(filenamecnt++));
+    }
+
+    if (isChecker){
+      checkedInstID.insert(state.inst_id); // don't check a bug for multitime !
+      addedStates.clear();
+      for (auto &s : states)
+        if (s->inst_id == state.inst_id)
+          states.erase(s);
+
+      if (isSpecialKill){
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      terminateStateOnError(state,getErrorCodeStr(state.fp2intCheckType),
+                              StateTerminationType::Overflow);
+    }else{
+      // checker still not get, we allow it to fork more state
+      removedStates.push_back(&state);
+      concreteHalt = true;
+    }
+    return 1;
+  }
+
+  // current state is invalid when runtime, so we use result Expr to limit state
+  if (fp2intState->errCode > 0){
+    // TODO : return from softfloat, we must limit value, and kill current invalid state.
+    if (isa<ConstantExpr>(result)){
+      terminateState(state);
+    }else {
+      result->dump();
+      ref<Expr> limit = EqExpr::create(result,ConstantExpr::alloc(false,Expr::Bool));
+      ExecutionState *validState = state.copyConcrete();
+      validState->fp2intExecuteStack = 0;
+      validState->fp2intCheckType = 0;
+      validState->inst_id = 0;
+      validState->fp2intState.errCode = 0;
+      ++stats::forks;
+      validState->addInitialConstraint(limit);
+      addedStates.push_back(validState);
+      processTree->attach(state.ptreeNode, validState,&state, BranchType::NONE);
+      terminateStateOnError(state,getErrorCodeStr(fp2intState->errCode),
+                            StateTerminationType::Overflow);
+    }
+    return 1;
+  }else{
+    // current state do not have any problem
+    state.fp2intExecuteStack = 0;
+    state.fp2intCheckType = 0;
+    state.inst_id = 0;
+    state.fp2intState.errCode = 0;
+    return 0;
+  }
+}
+
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   Instruction *i = ki->inst;
+//  llvm::errs()<<"exeInstr:"<<*i<<"\n";
+  /// add by yx
+//  llvm::errs()<<"Executor:***\n";
+//  if(i->getFunction()->hasName() && i->getFunction()->getName() == "%0 = load double, double* %a, align 8"){
+//    i->print(llvm::errs());
+//  }
+//  llvm::errs()<<"\n";
+
+  //不同类型的指令，每种指令执行不同的代码
   switch (i->getOpcode()) {
     // Control flow
   case Instruction::Ret: {
@@ -2087,15 +2321,32 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     Instruction *caller = kcaller ? kcaller->inst : nullptr;
     bool isVoidReturn = (ri->getNumOperands() == 0);
     ref<Expr> result = ConstantExpr::alloc(0, Expr::Bool);
-    
+
     if (!isVoidReturn) {
       result = eval(ki, 0, state).value;
     }
-    
+
+    // add by zgf especially for softfloat lib fpcheck : FAdd / FSub / FMul / FDiv
+    if (state.fp2intExecuteStack != 0 &&
+        state.stack.size() == state.fp2intExecuteStack){
+      int res = FP2INTCheckHandler(state,result);
+      if (res > 0) break;
+    }
+
+    // add by zgf : to support filter lib math function check float errors
+    // cancel barrier to start error checking
+    if (state.fpErrorStack != 0 &&
+        state.stack.size() == state.fpErrorStack){
+      state.fpErrorStack = 0;
+    }
+
     if (state.stack.size() <= 1) {
       assert(!caller && "caller set on initial stack frame");
       terminateStateOnExit(state);
-    } else {
+    } else if (state.stack.back().kf->function->getName() == "float_raise") {
+      // add by zgf to special handler this invalid state in softfloat lib
+      terminateStateOnExit(state);
+    }else {
       state.popFrame();
 
       if (statsTracker)
@@ -2108,15 +2359,15 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         ++state.pc;
       }
 
-#ifdef SUPPORT_KLEE_EH_CXX
+      #ifdef SUPPORT_KLEE_EH_CXX
       if (ri->getFunction()->getName() == "_klee_eh_cxx_personality") {
         assert(dyn_cast<ConstantExpr>(result) &&
-               "result from personality fn must be a concrete value");
+        "result from personality fn must be a concrete value");
 
         auto *sui = dyn_cast_or_null<SearchPhaseUnwindingInformation>(
-            state.unwindingInformation.get());
+                  state.unwindingInformation.get());
         assert(sui && "return from personality function outside of "
-                      "search phase unwinding");
+                        "search phase unwinding");
 
         // unbind the MO we used to pass the serialized landingpad
         state.addressSpace.unbindObject(sui->serializedLandingpad);
@@ -2129,20 +2380,19 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           // a clause (or a catch-all clause or filter clause) matches:
           // remember the stack index and switch to cleanup phase
           state.unwindingInformation =
-              std::make_unique<CleanupPhaseUnwindingInformation>(
-                  sui->exceptionObject, cast<ConstantExpr>(result),
-                  sui->unwindingProgress);
+                    std::make_unique<CleanupPhaseUnwindingInformation>(
+                            sui->exceptionObject, cast<ConstantExpr>(result),
+                            sui->unwindingProgress);
           // this pointer is now invalidated
           sui = nullptr;
           // continue the unwinding process (which will now start with the
           // cleanup phase)
           unwindToNextLandingpad(state);
         }
-
         // never return normally from the personality fn
         break;
       }
-#endif // SUPPORT_KLEE_EH_CXX
+      #endif // SUPPORT_KLEE_EH_CXX
 
       if (!isVoidReturn) {
         Type *t = caller->getType();
@@ -2152,27 +2402,26 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           Expr::Width to = getWidthForLLVMType(t);
             
           if (from != to) {
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
+            #if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
             const CallBase &cs = cast<CallBase>(*caller);
-#else
+            #else
             const CallSite cs(isa<InvokeInst>(caller)
-                                  ? CallSite(cast<InvokeInst>(caller))
-                                  : CallSite(cast<CallInst>(caller)));
-#endif
+              ? CallSite(cast<InvokeInst>(caller))
+              : CallSite(cast<CallInst>(caller)));
+            #endif
 
             // XXX need to check other param attrs ?
-#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
+            #if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
             bool isSExt = cs.hasRetAttr(llvm::Attribute::SExt);
-#else
+            #else
             bool isSExt = cs.paramHasAttr(0, llvm::Attribute::SExt);
-#endif
+            #endif
             if (isSExt) {
               result = SExtExpr::create(result, to);
             } else {
               result = ZExtExpr::create(result, to);
             }
           }
-
           bindLocal(kcaller, state, result);
         }
       } else {
@@ -2183,10 +2432,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           terminateStateOnExecError(state, "return void when caller expected a result");
         }
       }
-    }      
-    break;
+    }
   }
+  break;
   case Instruction::Br: {
+
     BranchInst *bi = cast<BranchInst>(i);
     if (bi->isUnconditional()) {
       transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), state);
@@ -2194,11 +2444,16 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // FIXME: Find a way that we don't have this hidden dependency.
       assert(bi->getCondition() == bi->getOperand(0) &&
              "Wrong operand index!");
+
+      // add by zgf : record current state's basic block id
+      state.basicBlockEntry = state.stack.back().kf->basicBlockEntry[bi->getParent()];
+
       ref<Expr> cond = eval(ki, 0, state).value;
 
       cond = optimizer.optimizeExpr(cond, false);
       Executor::StatePair branches = fork(state, cond, false, BranchType::ConditionalBranch);
-
+//      cond->dump();
+//      llvm::errs()<<"this >>\n";
       // NOTE: There is a hidden dependency here, markBranchVisited
       // requires that we still be in the context of the branch
       // instruction (it reuses its statistic id). Should be cleaned
@@ -2216,197 +2471,159 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   case Instruction::IndirectBr: {
     // implements indirect branch to a label within the current function
     const auto bi = cast<IndirectBrInst>(i);
-    auto address = eval(ki, 0, state).value;
-    address = toUnique(state, address);
+    auto sym_address = eval(ki, 0, state).value;
+    auto val_address = toUnique(state, sym_address);
 
-    // concrete address
-    if (const auto CE = dyn_cast<ConstantExpr>(address.get())) {
-      const auto bb_address = (BasicBlock *) CE->getZExtValue(Context::get().getPointerWidth());
-      transferToBasicBlock(bb_address, bi->getParent(), state);
-      break;
-    }
+    // modify by zgf : Indirect branch need a symblic pointer to decide which
+    // successor to transfer in KLEE. But in concrete mode, a concrete pointer
+    // is determined at the beginning, it may reach 'illegal label address' first.
+    // So we will find all legal pointer and correspond succesor basic block.
+    // If current address value not equals to any legal pointer, report error.
+    // If current address value equals to a legal pointer, fork a error state
+    // which to check it may exist 'illegal address' error.
 
-    // symbolic address
-    const auto numDestinations = bi->getNumDestinations();
-    std::vector<BasicBlock *> targets;
-    targets.reserve(numDestinations);
-    std::vector<ref<Expr>> expressions;
-    expressions.reserve(numDestinations);
+    // get concrete address, in concrete mode, this must be concrete value
+    if (const auto CE = dyn_cast<ConstantExpr>(val_address.get())) {
+      const auto current_address = (BasicBlock *)
+                        CE->getZExtValue(Context::get().getPointerWidth());
+      if (isa<ConstantExpr>(sym_address) ||
+          (isa<ConstantExpr>(val_address))){
+        // if symbolic pointer 'sym_address' is still a constant,
+        // we have no choice to fork other state.
 
-    ref<Expr> errorCase = ConstantExpr::alloc(1, Expr::Bool);
-    SmallPtrSet<BasicBlock *, 5> destinations;
-    // collect and check destinations from label list
-    for (unsigned k = 0; k < numDestinations; ++k) {
-      // filter duplicates
-      const auto d = bi->getDestination(k);
-      if (destinations.count(d)) continue;
-      destinations.insert(d);
+        // or if current state is in 'Complex Function' and val_address here
+        // must be 'Constant', we are not allow to fork states in this function.
+        transferToBasicBlock(current_address, bi->getParent(),state);
+        break;
+      }
 
-      // create address expression
-      const auto PE = Expr::createPointer(reinterpret_cast<std::uint64_t>(d));
-      ref<Expr> e = EqExpr::create(address, PE);
+      const auto numDestinations = bi->getNumDestinations();
+      SmallPtrSet<BasicBlock *, 5> destinations;
 
-      // exclude address from errorCase
-      errorCase = AndExpr::create(errorCase, Expr::createIsZero(e));
+      std::vector<BasicBlock *> targets;
+      targets.reserve(numDestinations);
+      std::vector<ref<Expr>> expressions;
+      expressions.reserve(numDestinations);
 
-      // check feasibility
-      bool result;
-      bool success __attribute__((unused)) =
-          solver->mayBeTrue(state.constraints, e, result, state.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      if (result) {
+      for (unsigned k = 0; k < numDestinations; ++k) {
+        // filter duplicates
+        const auto d = bi->getDestination(k); // successor basic block
+        if (destinations.count(d)) continue;
+        destinations.insert(d);
+
+        // create address expression
+        const auto PE = Expr::createPointer(reinterpret_cast<std::uint64_t>(d));
+        ref<Expr> e = EqExpr::create(sym_address, PE);
+
         targets.push_back(d);
         expressions.push_back(e);
       }
-    }
-    // check errorCase feasibility
-    bool result;
-    bool success __attribute__((unused)) = solver->mayBeTrue(
-        state.constraints, errorCase, result, state.queryMetaData);
-    assert(success && "FIXME: Unhandled solver failure");
-    if (result) {
-      expressions.push_back(errorCase);
-    }
-
-    // fork states
-    std::vector<ExecutionState *> branches;
-    branch(state, expressions, branches, BranchType::IndirectBranch);
-
-    // terminate error state
-    if (result) {
-      terminateStateOnExecError(*branches.back(), "indirectbr: illegal label address");
-      branches.pop_back();
-    }
-
-    // branch states to resp. target blocks
-    assert(targets.size() == branches.size());
-    for (std::vector<ExecutionState *>::size_type k = 0; k < branches.size(); ++k) {
-      if (branches[k]) {
-        transferToBasicBlock(targets[k], bi->getParent(), *branches[k]);
+      // deal with legal successor fork
+      int legal_addr = false;
+      for(unsigned idx=0; idx<targets.size();idx++){
+        // if current state is legal address, add constraint
+        if (targets[idx] == current_address){
+          legal_addr = true;
+          state.addInitialConstraint(expressions[idx]);
+          transferToBasicBlock(targets[idx], bi->getParent(),state);
+          continue;
+        }
+        // fork state
+        ExecutionState *caseState = state.copyConcrete();
+        ++stats::forks;
+        caseState->addInitialConstraint(expressions[idx]);
+        addedStates.push_back(caseState);
+        processTree->attach(state.ptreeNode, caseState,
+                            &state, BranchType::IndirectBranch);
+        // link the fork state to successor basic block
+        transferToBasicBlock(targets[idx], bi->getParent(),*caseState);
       }
+
+      // if current state is not belong to any corrent address,
+      // means illegal, report error
+      if (!legal_addr)
+        terminateStateOnExecError(state, "indirectbr: illegal label address");
+
+    }else{
+      assert(false && "concrete mode 'IndirectBr' maybe error, please fix it!");
     }
 
     break;
   }
   case Instruction::Switch: {
     SwitchInst *si = cast<SwitchInst>(i);
-    ref<Expr> cond = eval(ki, 0, state).value;
+    // symbolic condition : don't simplify
+    ref<Expr> sym_cond = eval(ki, 0, state).value;
     BasicBlock *bb = si->getParent();
 
-    cond = toUnique(state, cond);
-    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(cond)) {
-      // Somewhat gross to create these all the time, but fine till we
-      // switch to an internal rep.
+    auto val_cond = toUnique(state, sym_cond);
+
+    // modify by zgf : In concrete mode, we need to get the correnspond case
+    // using concrete condition value. As for other cases, we can get the
+    // case values by 'si->cases()[i].getCaseValue()', then add 'Eq' expr to
+    // constraint path. If old condition 'ocond' is a constant value, it means
+    // we can not choose other case to execute.
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(val_cond)){
       llvm::IntegerType *Ty = cast<IntegerType>(si->getCondition()->getType());
       ConstantInt *ci = ConstantInt::get(Ty, CE->getZExtValue());
-#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
-      unsigned index = si->findCaseValue(ci)->getSuccessorIndex();
-#else
-      unsigned index = si->findCaseValue(ci).getSuccessorIndex();
-#endif
-      transferToBasicBlock(si->getSuccessor(index), si->getParent(), state);
-    } else {
-      // Handle possible different branch targets
+      unsigned target_index = si->findCaseValue(ci)->getSuccessorIndex();
+      transferToBasicBlock(si->getSuccessor(target_index), si->getParent(), state);
 
-      // We have the following assumptions:
-      // - each case value is mutual exclusive to all other values
-      // - order of case branches is based on the order of the expressions of
-      //   the case values, still default is handled last
-      std::vector<BasicBlock *> bbOrder;
-      std::map<BasicBlock *, ref<Expr> > branchTargets;
+      if (isa<ConstantExpr>(sym_cond)){
+        // if 'ocond' is constant, we have no choice to fork other case state
+      }else{
+        // deal with other case fork
 
-      std::map<ref<Expr>, BasicBlock *> expressionOrder;
+        // default case value
+        ref<Expr> defaultValue = ConstantExpr::alloc(1, Expr::Bool);
 
-      // Iterate through all non-default cases and order them by expressions
-      for (auto i : si->cases()) {
-        ref<Expr> value = evalConstant(i.getCaseValue());
+        for (auto switchCase : si->cases()) {
+          ref<Expr> value = evalConstant(switchCase.getCaseValue(),state.roundingMode);
+          ref<Expr> match = EqExpr::create(sym_cond, value);
+          if (match->isFalse()) continue;
+          // Make sure that the default value does not contain this target's value
+          defaultValue = AndExpr::create(defaultValue, Expr::createIsZero(match));
 
-        BasicBlock *caseSuccessor = i.getCaseSuccessor();
-        expressionOrder.insert(std::make_pair(value, caseSuccessor));
-      }
+          // skip current case in concrete mode
+          if(switchCase.getSuccessorIndex() == target_index ||
+             state.forkDisabled)
+            continue;
 
-      // Track default branch values
-      ref<Expr> defaultValue = ConstantExpr::alloc(1, Expr::Bool);
+          ExecutionState *caseState = state.copyConcrete();
+          ++stats::forks;
+          caseState->addInitialConstraint(match);
+          addedStates.push_back(caseState);
+          processTree->attach(state.ptreeNode, caseState,
+                              &state, BranchType::Switch);
+          // link the fork state to successor basic block
+          transferToBasicBlock(switchCase.getCaseSuccessor(),
+                               si->getParent(), *caseState);
+        }
 
-      // iterate through all non-default cases but in order of the expressions
-      for (std::map<ref<Expr>, BasicBlock *>::iterator
-               it = expressionOrder.begin(),
-               itE = expressionOrder.end();
-           it != itE; ++it) {
-        ref<Expr> match = EqExpr::create(cond, it->first);
+        // if current path not equal to default case, add default case fork
+        if(si->getSuccessor(target_index) != si->getDefaultDest() &&
+           ! state.forkDisabled){
+          ExecutionState *defaultCaseState = state.copyConcrete();
+          ++stats::forks;
+          defaultCaseState->addInitialConstraint(defaultValue);
+          addedStates.push_back(defaultCaseState);
+          processTree->attach(state.ptreeNode, defaultCaseState,
+                              &state, BranchType::Switch);
+          // link the fork state to successor basic block
+          transferToBasicBlock(si->getDefaultDest(),si->getParent(),*defaultCaseState);
 
-        // skip if case has same successor basic block as default case
-        // (should work even with phi nodes as a switch is a single terminating instruction)
-        if (it->second == si->getDefaultDest()) continue;
-
-        // Make sure that the default value does not contain this target's value
-        defaultValue = AndExpr::create(defaultValue, Expr::createIsZero(match));
-
-        // Check if control flow could take this case
-        bool result;
-        match = optimizer.optimizeExpr(match, false);
-        bool success = solver->mayBeTrue(state.constraints, match, result,
-                                         state.queryMetaData);
-        assert(success && "FIXME: Unhandled solver failure");
-        (void) success;
-        if (result) {
-          BasicBlock *caseSuccessor = it->second;
-
-          // Handle the case that a basic block might be the target of multiple
-          // switch cases.
-          // Currently we generate an expression containing all switch-case
-          // values for the same target basic block. We spare us forking too
-          // many times but we generate more complex condition expressions
-          // TODO Add option to allow to choose between those behaviors
-          std::pair<std::map<BasicBlock *, ref<Expr> >::iterator, bool> res =
-              branchTargets.insert(std::make_pair(
-                  caseSuccessor, ConstantExpr::alloc(0, Expr::Bool)));
-
-          res.first->second = OrExpr::create(match, res.first->second);
-
-          // Only add basic blocks which have not been target of a branch yet
-          if (res.second) {
-            bbOrder.push_back(caseSuccessor);
-          }
+          // Important : we must add current condition to this state, because
+          // when compute the symbolic address will use the constraint set.
+          state.addInitialConstraint(EqExpr::create(sym_cond, val_cond));
+        }else{
+          // if current is default case, we must add all cases' neg constraints
+          // conjuncts. If we only bind condition to a concrete value, we may
+          // lose many path.
+          state.addInitialConstraint(defaultValue);
         }
       }
-
-      // Check if control could take the default case
-      defaultValue = optimizer.optimizeExpr(defaultValue, false);
-      bool res;
-      bool success = solver->mayBeTrue(state.constraints, defaultValue, res,
-                                       state.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      (void) success;
-      if (res) {
-        std::pair<std::map<BasicBlock *, ref<Expr> >::iterator, bool> ret =
-            branchTargets.insert(
-                std::make_pair(si->getDefaultDest(), defaultValue));
-        if (ret.second) {
-          bbOrder.push_back(si->getDefaultDest());
-        }
-      }
-
-      // Fork the current state with each state having one of the possible
-      // successors of this switch
-      std::vector< ref<Expr> > conditions;
-      for (std::vector<BasicBlock *>::iterator it = bbOrder.begin(),
-                                               ie = bbOrder.end();
-           it != ie; ++it) {
-        conditions.push_back(branchTargets[*it]);
-      }
-      std::vector<ExecutionState*> branches;
-      branch(state, conditions, branches, BranchType::Switch);
-
-      std::vector<ExecutionState*>::iterator bit = branches.begin();
-      for (std::vector<BasicBlock *>::iterator it = bbOrder.begin(),
-                                               ie = bbOrder.end();
-           it != ie; ++it) {
-        ExecutionState *es = *bit;
-        if (es)
-          transferToBasicBlock(*it, bb, *es);
-        ++bit;
-      }
+    }else{
+      assert(false && "concrete mode 'switch' maybe error, please fix it!");
     }
     break;
   }
@@ -2419,119 +2636,132 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     break;
 
   case Instruction::Invoke:
-  case Instruction::Call: {
-    // Ignore debug intrinsic calls
-    if (isa<DbgInfoIntrinsic>(i))
-      break;
-
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
-    const CallBase &cs = cast<CallBase>(*i);
-    Value *fp = cs.getCalledOperand();
-#else
-    const CallSite cs(i);
-    Value *fp = cs.getCalledValue();
-#endif
-
-    unsigned numArgs = cs.arg_size();
-    Function *f = getTargetFunction(fp, state);
-
-    if (isa<InlineAsm>(fp)) {
-      terminateStateOnExecError(state, "inline assembly is unsupported");
-      break;
-    }
-    // evaluate arguments
-    std::vector< ref<Expr> > arguments;
-    arguments.reserve(numArgs);
-
-    for (unsigned j=0; j<numArgs; ++j)
-      arguments.push_back(eval(ki, j+1, state).value);
-
-    if (f) {
-      const FunctionType *fType = 
-        dyn_cast<FunctionType>(cast<PointerType>(f->getType())->getElementType());
-      const FunctionType *fpType =
-        dyn_cast<FunctionType>(cast<PointerType>(fp->getType())->getElementType());
-
-      // special case the call with a bitcast case
-      if (fType != fpType) {
-        assert(fType && fpType && "unable to get function type");
-
-        // XXX check result coercion
-
-        // XXX this really needs thought and validation
-        unsigned i=0;
-        for (std::vector< ref<Expr> >::iterator
-               ai = arguments.begin(), ie = arguments.end();
-             ai != ie; ++ai) {
-          Expr::Width to, from = (*ai)->getWidth();
-            
-          if (i<fType->getNumParams()) {
-            to = getWidthForLLVMType(fType->getParamType(i));
-
-            if (from != to) {
-              // XXX need to check other param attrs ?
-#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
-              bool isSExt = cs.paramHasAttr(i, llvm::Attribute::SExt);
-#else
-              bool isSExt = cs.paramHasAttr(i+1, llvm::Attribute::SExt);
-#endif
-              if (isSExt) {
-                arguments[i] = SExtExpr::create(arguments[i], to);
-              } else {
-                arguments[i] = ZExtExpr::create(arguments[i], to);
-              }
-            }
-          }
-            
-          i++;
-        }
-      }
-
-      executeCall(state, ki, f, arguments);
-    } else {
-      ref<Expr> v = eval(ki, 0, state).value;
-
-      ExecutionState *free = &state;
-      bool hasInvalid = false, first = true;
-
-      /* XXX This is wasteful, no need to do a full evaluate since we
-         have already got a value. But in the end the caches should
-         handle it for us, albeit with some overhead. */
-      do {
-        v = optimizer.optimizeExpr(v, true);
-        ref<ConstantExpr> value;
-        bool success =
-            solver->getValue(free->constraints, v, value, free->queryMetaData);
-        assert(success && "FIXME: Unhandled solver failure");
-        (void) success;
-        StatePair res = fork(*free, EqExpr::create(v, value), true, BranchType::Call);
-        if (res.first) {
-          uint64_t addr = value->getZExtValue();
-          auto it = legalFunctions.find(addr);
-          if (it != legalFunctions.end()) {
-            f = it->second;
-
-            // Don't give warning on unique resolution
-            if (res.second || !first)
-              klee_warning_once(reinterpret_cast<void*>(addr),
-                                "resolved symbolic function pointer to: %s",
-                                f->getName().data());
-
-            executeCall(*res.first, ki, f, arguments);
-          } else {
-            if (!hasInvalid) {
-              terminateStateOnExecError(state, "invalid function pointer");
-              hasInvalid = true;
-            }
-          }
-        }
-
-        first = false;
-        free = res.second;
-      } while (free);
-    }
-    break;
-  }
+//  case Instruction::Call: {  //Call is 54;  show in "instruction.def"
+////    FPExecutor::InvalidCall();
+//    // Ignore debug intrinsic calls
+//    if (isa<DbgInfoIntrinsic>(i))
+//      break;
+//
+//#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
+//    const CallBase &cs = cast<CallBase>(*i);
+//    Value *fp = cs.getCalledOperand();
+//#else
+//    const CallSite cs(i);
+//    Value *fp = cs.getCalledValue();
+//#endif
+//
+//    unsigned numArgs = cs.arg_size();
+//    Function *f = getTargetFunction(fp, state);
+////    llvm::errs() <<"begin: "<< *f->begin() << "\n";
+////    llvm::errs() <<"end: "<< *f->end() << "\n";
+////    for (auto I = f->begin(), E = f->end(); I != E; ++I)
+////      llvm::errs() <<"target func: "<< *I << "\n";
+//    if (isa<InlineAsm>(fp)) {
+//      terminateStateOnExecError(state, "inline assembly is unsupported");
+//      break;
+//    }
+//    // evaluate arguments
+//    std::vector< ref<Expr> > arguments;
+//    //reserve的作用是更改vector的容量（capacity），使vector至少可以容纳n个元素。
+//    //如果n大于vector当前的容量，reserve会对vector进行扩容。其他情况下都不会重新分配vector的存储空间.
+//    arguments.reserve(numArgs);
+//
+//    // add by zgf to ensure at least one argument is symbolic
+//    for (unsigned j=0; j<numArgs; ++j){
+//      ref<Expr> arg = eval(ki, j+1, state).value;
+//      //llvm::outs()<<"ref:"<<arg<<"\n";
+//      arguments.push_back(arg);
+//    }
+//
+//    if (f) {
+////      errs()<<"[zgf dbg] enter func : "<<f->getName()<<
+////            "  stack size : "<<state.stack.size()<<"\n";
+////      for (const auto &arg : arguments)
+////        errs()<<"  arg : "<<arg<<"\n";
+//
+//      const FunctionType *fType =
+//        dyn_cast<FunctionType>(cast<PointerType>(f->getType())->getElementType());
+//      const FunctionType *fpType =
+//        dyn_cast<FunctionType>(cast<PointerType>(fp->getType())->getElementType());
+//
+//      // special case the call with a bitcast case
+//      if (fType != fpType) {
+//        assert(fType && fpType && "unable to get function type");
+//        // XXX check result coercion
+//        // XXX this really needs thought and validation
+//
+//        unsigned idx=0;
+//        for (std::vector< ref<Expr> >::iterator
+//               ai = arguments.begin(), ie = arguments.end();
+//             ai != ie; ++ai) {
+//          Expr::Width to, from = (*ai)->getWidth();
+//
+//          if (idx < fType->getNumParams()) {
+//            to = getWidthForLLVMType(fType->getParamType(idx));
+//
+//            if (from != to) {
+//              // XXX need to check other param attrs ?
+//#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
+//              bool isSExt = cs.paramHasAttr(idx, llvm::Attribute::SExt);
+//#else
+//              bool isSExt = cs.paramHasAttr(i+1, llvm::Attribute::SExt);
+//#endif
+//              if (isSExt) {
+//                arguments[idx] = SExtExpr::create(arguments[idx], to);
+//              } else {
+//                arguments[idx] = ZExtExpr::create(arguments[idx], to);
+//              }
+//            }
+//          }
+//          i++;
+//        }
+//      }
+//
+//      executeCall(state, ki, f, arguments);
+//    } else {
+//      ref<Expr> v = eval(ki, 0, state).value;
+//
+//      ExecutionState *free = &state;
+//      bool hasInvalid = false, first = true;
+//
+//      /* XXX This is wasteful, no need to do a full evaluate since we
+//         have already got a value. But in the end the caches should
+//         handle it for us, albeit with some overhead. */
+//
+//      // modify by zgf : don't loop the false branch, because concrete mode
+//      // at all events will fork true and false states, and trapped in an
+//      // infinite loop. And states which are forked will be pushed into
+//      // 'addedStates', so we don't worry about losing path
+//      v = optimizer.optimizeExpr(v, true);
+//      ref<ConstantExpr> value;
+//      bool success =
+//          solver->getValue(*free, v, value, free->queryMetaData);
+//      assert(success && "FIXME: Unhandled solver failure");
+//      (void) success;
+//      StatePair res = fork(*free, EqExpr::create(v, value), true, BranchType::Call);
+//      if (res.first) {
+//        uint64_t addr = value->getZExtValue();
+//        auto it = legalFunctions.find(addr);
+//        if (it != legalFunctions.end()) {
+//          f = it->second;
+//
+//          // Don't give warning on unique resolution
+//          if (res.second || !first)
+//            klee_warning_once(reinterpret_cast<void*>(addr),
+//                              "resolved symbolic function pointer to: %s",
+//                              f->getName().data());
+//
+//          executeCall(*res.first, ki, f, arguments);
+//        } else {
+//          if (!hasInvalid) {
+//            terminateStateOnExecError(state, "invalid function pointer");
+//            hasInvalid = true;
+//          }
+//        }
+//      }
+//    }
+//    break;
+//  }
   case Instruction::PHI: {
     ref<Expr> result = eval(ki, state.incomingBBIndex, state).value;
     bindLocal(ki, state, result);
@@ -2558,6 +2788,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   case Instruction::Add: {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
+//    llvm::outs()<<left<<"\n";
+//    llvm::outs()<<right<<"\n";
     bindLocal(ki, state, AddExpr::create(left, right));
     break;
   }
@@ -2781,7 +3013,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> base = eval(ki, 0, state).value;
 
     for (std::vector< std::pair<unsigned, uint64_t> >::iterator 
-           it = kgepi->indices.begin(), ie = kgepi->indices.end(); 
+           it = kgepi->indices.begin(), ie = kgepi->indices.end();
          it != ie; ++it) {
       uint64_t elementSize = it->second;
       ref<Expr> index = eval(ki, it->first, state).value;
@@ -2857,271 +3089,20 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   }
 #endif
 
-  case Instruction::FAdd: {
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FAdd operation");
-
-    llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
-    Res.add(APFloat(*fpWidthToSemantics(right->getWidth()),right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
-    break;
-  }
-
-  case Instruction::FSub: {
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FSub operation");
-    llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
-    Res.subtract(APFloat(*fpWidthToSemantics(right->getWidth()), right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
-    break;
-  }
-
-  case Instruction::FMul: {
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FMul operation");
-
-    llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
-    Res.multiply(APFloat(*fpWidthToSemantics(right->getWidth()), right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
-    break;
-  }
-
-  case Instruction::FDiv: {
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FDiv operation");
-
-    llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
-    Res.divide(APFloat(*fpWidthToSemantics(right->getWidth()), right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
-    break;
-  }
-
-  case Instruction::FRem: {
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FRem operation");
-    llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
-    Res.mod(
-        APFloat(*fpWidthToSemantics(right->getWidth()), right->getAPValue()));
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
-    break;
-  }
-
-  case Instruction::FPTrunc: {
-    FPTruncInst *fi = cast<FPTruncInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                       "floating point");
-    if (!fpWidthToSemantics(arg->getWidth()) || resultType > arg->getWidth())
-      return terminateStateOnExecError(state, "Unsupported FPTrunc operation");
-
-    llvm::APFloat Res(*fpWidthToSemantics(arg->getWidth()), arg->getAPValue());
-    bool losesInfo = false;
-    Res.convert(*fpWidthToSemantics(resultType),
-                llvm::APFloat::rmNearestTiesToEven,
-                &losesInfo);
-    bindLocal(ki, state, ConstantExpr::alloc(Res));
-    break;
-  }
-
-  case Instruction::FPExt: {
-    FPExtInst *fi = cast<FPExtInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    if (!fpWidthToSemantics(arg->getWidth()) || arg->getWidth() > resultType)
-      return terminateStateOnExecError(state, "Unsupported FPExt operation");
-    llvm::APFloat Res(*fpWidthToSemantics(arg->getWidth()), arg->getAPValue());
-    bool losesInfo = false;
-    Res.convert(*fpWidthToSemantics(resultType),
-                llvm::APFloat::rmNearestTiesToEven,
-                &losesInfo);
-    bindLocal(ki, state, ConstantExpr::alloc(Res));
-    break;
-  }
-
-  case Instruction::FPToUI: {
-    FPToUIInst *fi = cast<FPToUIInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                       "floating point");
-    if (!fpWidthToSemantics(arg->getWidth()) || resultType > 64)
-      return terminateStateOnExecError(state, "Unsupported FPToUI operation");
-
-    llvm::APFloat Arg(*fpWidthToSemantics(arg->getWidth()), arg->getAPValue());
-    uint64_t value = 0;
-    bool isExact = true;
-#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
-    auto valueRef = makeMutableArrayRef(value);
-#else
-    uint64_t *valueRef = &value;
-#endif
-    Arg.convertToInteger(valueRef, resultType, false,
-                         llvm::APFloat::rmTowardZero, &isExact);
-    bindLocal(ki, state, ConstantExpr::alloc(value, resultType));
-    break;
-  }
-
-  case Instruction::FPToSI: {
-    FPToSIInst *fi = cast<FPToSIInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                       "floating point");
-    if (!fpWidthToSemantics(arg->getWidth()) || resultType > 64)
-      return terminateStateOnExecError(state, "Unsupported FPToSI operation");
-    llvm::APFloat Arg(*fpWidthToSemantics(arg->getWidth()), arg->getAPValue());
-
-    uint64_t value = 0;
-    bool isExact = true;
-#if LLVM_VERSION_CODE >= LLVM_VERSION(5, 0)
-    auto valueRef = makeMutableArrayRef(value);
-#else
-    uint64_t *valueRef = &value;
-#endif
-    Arg.convertToInteger(valueRef, resultType, true,
-                         llvm::APFloat::rmTowardZero, &isExact);
-    bindLocal(ki, state, ConstantExpr::alloc(value, resultType));
-    break;
-  }
-
-  case Instruction::UIToFP: {
-    UIToFPInst *fi = cast<UIToFPInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                       "floating point");
-    const llvm::fltSemantics *semantics = fpWidthToSemantics(resultType);
-    if (!semantics)
-      return terminateStateOnExecError(state, "Unsupported UIToFP operation");
-    llvm::APFloat f(*semantics, 0);
-    f.convertFromAPInt(arg->getAPValue(), false,
-                       llvm::APFloat::rmNearestTiesToEven);
-
-    bindLocal(ki, state, ConstantExpr::alloc(f));
-    break;
-  }
-
-  case Instruction::SIToFP: {
-    SIToFPInst *fi = cast<SIToFPInst>(i);
-    Expr::Width resultType = getWidthForLLVMType(fi->getType());
-    ref<ConstantExpr> arg = toConstant(state, eval(ki, 0, state).value,
-                                       "floating point");
-    const llvm::fltSemantics *semantics = fpWidthToSemantics(resultType);
-    if (!semantics)
-      return terminateStateOnExecError(state, "Unsupported SIToFP operation");
-    llvm::APFloat f(*semantics, 0);
-    f.convertFromAPInt(arg->getAPValue(), true,
-                       llvm::APFloat::rmNearestTiesToEven);
-
-    bindLocal(ki, state, ConstantExpr::alloc(f));
-    break;
-  }
-
+  case Instruction::FAdd:
+  case Instruction::FSub:
+  case Instruction::FMul:
+  case Instruction::FDiv:
+  case Instruction::FRem:
+  case Instruction::FPTrunc:
+  case Instruction::FPExt:
+  case Instruction::FPToUI:
+  case Instruction::FPToSI:
+  case Instruction::UIToFP:
+  case Instruction::SIToFP:
   case Instruction::FCmp: {
-    FCmpInst *fi = cast<FCmpInst>(i);
-    ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
-                                        "floating point");
-    ref<ConstantExpr> right = toConstant(state, eval(ki, 1, state).value,
-                                         "floating point");
-    if (!fpWidthToSemantics(left->getWidth()) ||
-        !fpWidthToSemantics(right->getWidth()))
-      return terminateStateOnExecError(state, "Unsupported FCmp operation");
-
-    APFloat LHS(*fpWidthToSemantics(left->getWidth()),left->getAPValue());
-    APFloat RHS(*fpWidthToSemantics(right->getWidth()),right->getAPValue());
-    APFloat::cmpResult CmpRes = LHS.compare(RHS);
-
-    bool Result = false;
-    switch( fi->getPredicate() ) {
-      // Predicates which only care about whether or not the operands are NaNs.
-    case FCmpInst::FCMP_ORD:
-      Result = (CmpRes != APFloat::cmpUnordered);
-      break;
-
-    case FCmpInst::FCMP_UNO:
-      Result = (CmpRes == APFloat::cmpUnordered);
-      break;
-
-      // Ordered comparisons return false if either operand is NaN.  Unordered
-      // comparisons return true if either operand is NaN.
-    case FCmpInst::FCMP_UEQ:
-      Result = (CmpRes == APFloat::cmpUnordered || CmpRes == APFloat::cmpEqual);
-      break;
-    case FCmpInst::FCMP_OEQ:
-      Result = (CmpRes != APFloat::cmpUnordered && CmpRes == APFloat::cmpEqual);
-      break;
-
-    case FCmpInst::FCMP_UGT:
-      Result = (CmpRes == APFloat::cmpUnordered || CmpRes == APFloat::cmpGreaterThan);
-      break;
-    case FCmpInst::FCMP_OGT:
-      Result = (CmpRes != APFloat::cmpUnordered && CmpRes == APFloat::cmpGreaterThan);
-      break;
-
-    case FCmpInst::FCMP_UGE:
-      Result = (CmpRes == APFloat::cmpUnordered || (CmpRes == APFloat::cmpGreaterThan || CmpRes == APFloat::cmpEqual));
-      break;
-    case FCmpInst::FCMP_OGE:
-      Result = (CmpRes != APFloat::cmpUnordered && (CmpRes == APFloat::cmpGreaterThan || CmpRes == APFloat::cmpEqual));
-      break;
-
-    case FCmpInst::FCMP_ULT:
-      Result = (CmpRes == APFloat::cmpUnordered || CmpRes == APFloat::cmpLessThan);
-      break;
-    case FCmpInst::FCMP_OLT:
-      Result = (CmpRes != APFloat::cmpUnordered && CmpRes == APFloat::cmpLessThan);
-      break;
-
-    case FCmpInst::FCMP_ULE:
-      Result = (CmpRes == APFloat::cmpUnordered || (CmpRes == APFloat::cmpLessThan || CmpRes == APFloat::cmpEqual));
-      break;
-    case FCmpInst::FCMP_OLE:
-      Result = (CmpRes != APFloat::cmpUnordered && (CmpRes == APFloat::cmpLessThan || CmpRes == APFloat::cmpEqual));
-      break;
-
-    case FCmpInst::FCMP_UNE:
-      Result = (CmpRes == APFloat::cmpUnordered || CmpRes != APFloat::cmpEqual);
-      break;
-    case FCmpInst::FCMP_ONE:
-      Result = (CmpRes != APFloat::cmpUnordered && CmpRes != APFloat::cmpEqual);
-      break;
-
-    default:
-      assert(0 && "Invalid FCMP predicate!");
-      break;
-    case FCmpInst::FCMP_FALSE:
-      Result = false;
-      break;
-    case FCmpInst::FCMP_TRUE:
-      Result = true;
-      break;
-    }
-
-    bindLocal(ki, state, ConstantExpr::alloc(Result, Expr::Bool));
-    break;
+    errs()<<ki->inst<<"\n";
+    assert(false && "This operate is supported in FPExecutor.cpp");
   }
   case Instruction::InsertValue: {
     KGEPInstruction *kgepi = static_cast<KGEPInstruction*>(ki);
@@ -3194,8 +3175,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     const unsigned elementCount = vt->getNumElements();
     llvm::SmallVector<ref<Expr>, 8> elems;
     elems.reserve(elementCount);
-    for (unsigned i = elementCount; i != 0; --i) {
-      auto of = i - 1;
+    for (unsigned index = elementCount; index != 0; --index) {
+      auto of = index - 1;
       unsigned bitOffset = EltBits * of;
       elems.push_back(
           of == iIdx ? newElt : ExtractExpr::create(vec, bitOffset, EltBits));
@@ -3339,22 +3320,25 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     terminateStateOnExecError(state, "illegal instruction");
     break;
   }
-}
+}//跳到FPEexcutor.cpp
 
 void Executor::updateStates(ExecutionState *current) {
   if (searcher) {
     searcher->update(current, addedStates, removedStates);
   }
-  
+
   states.insert(addedStates.begin(), addedStates.end());
   addedStates.clear();
-
   for (std::vector<ExecutionState *>::iterator it = removedStates.begin(),
                                                ie = removedStates.end();
        it != ie; ++it) {
     ExecutionState *es = *it;
     std::set<ExecutionState*>::iterator it2 = states.find(es);
-    assert(it2!=states.end());
+
+    //assert(it2!=states.end());
+    // modify by zgf
+    if (it2 == states.end()) continue ;
+
     states.erase(it2);
     std::map<ExecutionState*, std::vector<SeedInfo> >::iterator it3 = 
       seedMap.find(es);
@@ -3376,7 +3360,8 @@ void Executor::computeOffsetsSeqTy(KGEPInstruction *kgepi,
   const Value *operand = it.getOperand();
   if (const Constant *c = dyn_cast<Constant>(operand)) {
     ref<ConstantExpr> index =
-        evalConstant(c)->SExt(Context::get().getPointerWidth());
+        evalConstant(c,llvm::APFloat::rmNearestTiesToEven)->
+        SExt(Context::get().getPointerWidth());
     ref<ConstantExpr> addend = index->Mul(
         ConstantExpr::alloc(elementSize, Context::get().getPointerWidth()));
     constantOffset = constantOffset->Add(addend);
@@ -3441,7 +3426,8 @@ void Executor::bindModuleConstants() {
       std::unique_ptr<Cell[]>(new Cell[kmodule->constants.size()]);
   for (unsigned i=0; i<kmodule->constants.size(); ++i) {
     Cell &c = kmodule->constantTable[i];
-    c.value = evalConstant(kmodule->constants[i]);
+    // modify by zgf to set 'roundingMode'
+    c.value = evalConstant(kmodule->constants[i],llvm::APFloat::rmNearestTiesToEven);
   }
 }
 
@@ -3492,26 +3478,2075 @@ void Executor::doDumpStates() {
     interpreterHandler->incPathsExplored(states.size());
     return;
   }
-
+  // modify by zgf : if terminateEarly by halt, the states in queue don't
+  // have 'state.assignSeed' to get testcases. So using SMT solver to generate.
   klee_message("halting execution, dumping remaining states");
   for (const auto &state : states)
-    terminateStateEarly(*state, "Execution halting.", StateTerminationType::Interrupted);
+    terminateStateEarly(*state, "Execution halting.",
+            StateTerminationType::Interrupted);
   updateStates(nullptr);
 }
 
-void Executor::run(ExecutionState &initialState) {
+
+int Executor::checkAssignmentValid(Assignment &assign,
+                                   const ConstraintSet &constraints){
+  for (const auto &constraint : constraints) {
+
+    ref<Expr> ret = assign.evaluate(constraint);
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(ret)){
+      if (CE->isTrue())
+        continue;//全部continue，说明assign是符合要求的
+      else{
+//        llvm::outs()<<"1 con:"<<constraint<<"\n";
+        return 1;
+      }
+
+    }
+//    llvm::outs()<<"2 con:"<<constraint<<"\n";
+    return 2;
+  }
+  return 0;
+}
+
+void getConstraintVarName(ref<Expr> e,
+                          std::set<std::string> &varNameSet){
+  std::vector<ref<ReadExpr>> readExpr;
+  findReads(e,false,readExpr);
+  for (const auto& expr : readExpr)
+    varNameSet.insert(expr->updates.root->name);
+}
+
+bool checkConstraintVarName(ref<Expr> e,
+                          std::set<std::string> &varNameSet){
+  std::vector<ref<ReadExpr>> readExpr;
+  findReads(e,false,readExpr);
+  for (const auto& expr : readExpr)
+    if (varNameSet.find(expr->updates.root->name) != varNameSet.end())
+      return true;
+  return false;
+}
+
+/// add by zgf : at the beginning of concrete Execution,
+/// we use concrete constraints to compute values, which
+// are filled to 'state.assignSeed'
+void Executor::getConcreteAssignSeedSMT(ExecutionState &state, bool &checkValid){
+//  llvm::errs()<<"==============call Z3 solver==============\n";
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+
+  // try to use SMT to get 'constraints' value 约束中的变元
+  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+  {
+//    llvm::outs()<<state.symbolics[i].second->getName()<<"\n";
+    objects.push_back(state.symbolics[i].second);
+  }
+
+  ConstraintSet constraints(state.constraints);
+  if (DebugCons){
+    llvm::errs()<<"Allconstraints(Z3):\n";
+    for (auto &cons : constraints){
+      llvm::errs()<<cons<<"\n";
+    }
+    llvm::errs()<<"==============\n";
+  }
+
+
+  solver->setTimeout(coreSolverTimeout);
+  // getInitialValues是调求解器的地方    state.queryMetaData传入求解器的
+  auto start = std::chrono::high_resolution_clock::now();
+  bool success = solver->getInitialValues(state, objects, values, state.queryMetaData);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << ">>>Z3 exec time: " << milliseconds << " ms\n";
+  solver->setTimeout(time::Span());
+  if (success) {
+//    llvm::errs()<<"=================Z3 Result: SAT=================\n";
+    Assignment z3Assign = Assignment(objects,values,true);
+//    z3Assign.dump();
+    if (checkAssignmentValid(z3Assign,constraints) == 0){
+      klee_warning("Z3: Z3 solving SAT and evaluate SUCCESS !");
+      state.assignSeed = Assignment(objects, values,true);
+      checkValid = true;
+      return ;
+    }
+    klee_warning("Z3: Z3 solving SAT and evaluate FAILURE and remove the state !");
+  }
+  else{
+    klee_warning("Z3: Z3 solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+//add by yx   后面都没修改
+//void Executor::getConcreteAssignSeedBoolector(ExecutionState &state, bool &checkValid){
+//  llvm::outs()<<"==============call Boolector solver==============\n";
+//  std::vector< std::vector<unsigned char> > values;
+//  std::vector<const Array*> objects;
+//
+//  // try to use SMT to get 'constraints' value 约束中的变元
+//  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+//  {
+////    llvm::outs()<<state.symbolics[i].second->getName()<<"\n";
+//    objects.push_back(state.symbolics[i].second);
+////    objects.push_back(state.symbolics)
+//  }
+//
+//  ConstraintSet constraints(state.constraints);
+//
+//  llvm::outs()<<"Allconstraints:\n";
+//  for (auto &cons : constraints){
+//    llvm::outs()<<cons<<"\n";
+//  }
+////  llvm::outs()<<"==============\n";
+//
+//  solver->setTimeout(coreSolverTimeout);
+//  // getInitialValues是调求解器的地方    state.queryMetaData传入求解器的
+////  bool success = solver->getInitialValues(state, objects, values, state.queryMetaData);
+//  bool success = boolectorSolver.invokeBoolectorSolver(constraints, &objects, &values);
+//  solver->setTimeout(time::Span());
+//  if (success) {
+//    Assignment z3Assign = Assignment(objects,values,true);
+//    if (checkAssignmentValid(z3Assign,constraints) == 0){
+//      klee_warning("Z3: Z3 evaluate SUCCESS !");
+//      state.assignSeed = Assignment(objects, values,true);
+//      checkValid = true;
+//      return ;
+//    }
+//  }
+//  if (!state.fakeState){
+//    removedStates.push_back(&state);
+//    concreteHalt = true;
+//  }
+//  checkValid = false;
+//}
+
+void Executor::getConcreteAssignSeedDReal(ExecutionState &state, bool &checkValid){
+  std::vector<std::vector<unsigned char>> drealValues;
+  std::vector<const Array*> drealObjects;
+  ConstraintSet constraints(state.constraints), drealCons;
+  std::set<std::string> drealVarName;
+  std::map<std::string,std::string> varTypes;
+
+  bool unSupport = false;
+  for(const auto &cons : constraints){
+    if (sfcVisitor.visitDrealUnSupport(cons)){
+      unSupport = true;
+      continue;
+    }
+    drealCons.push_back(cons);
+//    llvm::errs()<<"[zgf dbg] dreal cons:\n"<<cons<<"\n";
+    getConstraintVarName(cons,drealVarName);//获得约束中涉及的符号变量,存放在drealVarName
+  }
+//  llvm::errs()<<"==========\n";
+
+  // try to use SMT to get 'constraints' value
+  for(const auto &symbolic : state.symbolics){//state.symbolics里面放的是符号化的一些字符
+    if (drealVarName.find(symbolic.second->name) != drealVarName.end()){
+      // get the Variable type in floatConstraints for DReal
+      std::string typeStr;
+      llvm::raw_string_ostream ss(typeStr);
+      symbolic.first->allocSite->getType()->print(ss);
+      ss.flush();
+      typeStr = typeStr.substr(0, typeStr.size() - 1);
+      varTypes[symbolic.second->name] = typeStr;
+
+      drealObjects.push_back(symbolic.second);
+    }
+  }
+
+  // get dreal solution  build一个dreal求解器，传入的参数是待求解的drealCons和变量类型
+  DRealBuilder dRealBuilder(drealCons,varTypes);
+  if (dRealBuilder.ackermannizeArrays()){ // transfer successfully
+    dreal::Formula f = dRealBuilder.generateFormular();
+    dreal::optional<dreal::Box> result = dRealBuilder.CheckSatisfiability(f, 0.001);
+
+    if (result) {
+      const dreal::Box &solution{*result};
+      std::map<std::string, uint64_t> fuzzSeeds;
+
+      for (const auto &array : drealObjects) {
+        bool matchFlag = false;
+        for (const dreal::Variable &v : solution.variables()) {
+          if (!matchObjDeclVarName(array->getName(), v.get_name(), false))
+            continue;
+          matchFlag = true;
+
+//          std::cerr << v << ",  " << solution[v].mid() << "\n";
+          std::string varType = varTypes[v.get_name()];
+          double realRes = solution[v].mid();
+
+          // fetch dreal solution for fuzzing, if check invalid
+          uint64_t valueAsBits = 0;
+          std::memcpy(&valueAsBits, &realRes, sizeof realRes);
+          fuzzSeeds[v.get_name()] = valueAsBits;
+
+          std::vector<unsigned char> data;
+          data.reserve(array->size);
+
+          getDataBytes(realRes,varType,data);
+          drealValues.push_back(data);
+        }
+        assert(matchFlag && "drealObject must be updated!");
+      }
+
+      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(drealAssign);
+
+      int res = checkAssignmentValid(currentAssign, constraints);
+      if (res == 0) {
+        klee_warning("DREAL-FUZZ: DREAL evaluate SUCCESS !");
+        state.assignSeed = currentAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      } else if (res == 1 && !unSupport) {
+        klee_warning("DREAL-FUZZ: DREAL evaluate FAILURE ! Using JFS with seed to solve.");
+        getConcreteAssignSeedFuzzWithSeeds(state, fuzzSeeds,checkValid,1);//no fix
+        return;
+      } else {
+        // there are unassigned variable exists, don't use seed
+        klee_warning("DREAL-FUZZ: UnAssigned variable exists ! Using JFS to solve.");
+        getConcreteAssignSeedFuzz(state,checkValid,1);//no fix
+        return;;
+      }
+    }else{
+      /*if (!unSupport){
+        klee_warning("DREAL-JFS: DReal solving UNSAT with all support. Remove this state !");
+        if (!state.fakeState){
+          removedStates.push_back(&state);
+          concreteHalt = true;
+        }
+        checkValid = false;
+        return;
+      }*/
+      klee_warning("DREAL-FUZZ: DReal solving UNSAT with unsupport. ! Using FUZZ to solve.");
+    }
+  }else{
+    // transfer to dreal formula failed
+    klee_warning("DREAL-FUZZ: DREAL unsupport it! Use FUZZ to solve !");
+  }
+  getConcreteAssignSeedFuzz(state,checkValid, 1);//no fix
+}
+
+bool directoryExists(const std::string& path) {
+  struct stat info;
+  return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+bool createDirectory(const std::string& path) {
+  if (mkdir(path.c_str(), 0777) == 0) {
+    return true;
+  }
+  return false;
+}
+
+// use z3Assign to simplify to constraints for drealCons
+void Executor::getConcreteAssignSeedSMTDReal(ExecutionState &state, bool &checkValid, std::string filename){
+  std::vector<std::vector<unsigned char>> easyValues, validValues, drealValues;
+  std::vector<const Array*> easyObjects, validObjects, drealObjects;
+  ConstraintSet easyCons, drealCons;
+  std::set<std::string> easyVarName,drealVarName,invalidVarName;
+
+  // get the Variable type
+  std::map<std::string,std::string> drealVarTypes;
+  ConstraintSet constraints(state.constraints);
+
+  if(smtLibPath!=""){
+    std::string smtLibStr = sfcTransformer.transformSMTLib(constraints);
+    std::string directoryPath = smtLibPath;
+    std::string filePath = directoryPath + filename + ".smt2";
+    llvm::errs()<<filePath<<"\n";
+    if (!directoryExists(directoryPath)) {
+      if (createDirectory(directoryPath)) {
+        std::cout << "目录 '" << directoryPath << "' 已成功创建。" << std::endl;
+      } else {
+        std::cerr << "无法创建目录 '" << directoryPath << "'。" << std::endl;
+      }
+    } else {
+      std::cout << "目录 '" << directoryPath << "' 已经存在。" << std::endl;
+    }
+    std::ofstream outFile(filePath);
+
+    if (!outFile.is_open()) {
+      std::cerr << "无法打开文件!" << std::endl;
+//    return 1;
+    }
+    outFile << smtLibStr << std::endl;
+    outFile << "(check-sat)" << std::endl;
+    outFile << "(exit)" << std::endl;
+
+    outFile.close();
+  }
+
+  if(DebugCons){
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for(const auto& cons : constraints){
+      // get the contraints which is easy
+      if ( !sfcVisitor.visitComplex2(cons)){
+        llvm::errs()<<"smt-dreal(easyCons):\n"<<cons<<"\n";
+        easyCons.push_back(cons);
+        getConstraintVarName(cons,easyVarName);
+        continue;
+      }
+      llvm::errs()<<"smt-dreal(complexcons):\n"<<cons<<"\n";
+    }
+  }else{
+    for(const auto& cons : constraints){
+      // get the contraints which is easy
+      if ( !sfcVisitor.visitComplex2(cons)){
+        easyCons.push_back(cons);
+        getConstraintVarName(cons,easyVarName);
+        continue;
+      }
+    }
+  }
+
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    if (easyVarName.find(symbolic.second->getName())
+        != easyVarName.end())
+      easyObjects.push_back(symbolic.second);
+  }
+
+  Assignment easyAssign;
+  // use z3 to check easy constraints fastly
+  if (! easyCons.empty() && ! easyObjects.empty()){
+    solver->setTimeout(coreSolverTimeout/3);
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = solver->getInitialValuesWithConstrintSet(easyCons, easyObjects,easyValues, state.queryMetaData);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>Synergy-Z3 exec time: " << milliseconds << " ms\n";
+    solver->setTimeout(time::Span()/3);
+
+    if (success){
+//      llvm::errs()<<"=================SMT-DREAL: Z3 Result: SAT=================\n";
+      easyAssign = Assignment(easyObjects,easyValues,true);
+      Assignment currAssign = state.assignSeed;
+      currAssign.updateValues(easyAssign);
+      if (checkAssignmentValid(currAssign,constraints) == 0){
+        klee_warning("SMT-DREAL: Z3 solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      }
+    }else{
+      // z3 not have solution, must be infeasible !
+      if (!state.fakeState){
+        klee_warning("SMT-DREAL: Z3 solving UNSAT and remove the state !");
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return ;
+    }
+  }
+
+  // get the drealCons and drealObjects
+  bool unSupport = false;
+  for (const auto &cons : constraints){
+    if (sfcVisitor.visitDrealUnSupport(cons)){
+//      llvm::outs()<<"smt-dreal(NoeasyCons):\n"<<cons<<"\n";
+      unSupport = true;
+      continue;
+    }
+    drealCons.push_back(cons);
+    getConstraintVarName(cons,drealVarName);
+  }
+  for (const auto &symbolic : state.symbolics){
+    if (drealVarName.find(symbolic.second->getName())
+        != drealVarName.end()){
+      drealObjects.push_back(symbolic.second);
+
+      std::string typeStr;
+      llvm::raw_string_ostream ss(typeStr);
+      symbolic.first->allocSite->getType()->print(ss);
+      ss.flush();
+      typeStr = typeStr.substr(0, typeStr.size() - 1);
+      drealVarTypes[symbolic.second->getName()] = typeStr;
+    }
+  }
+
+  // get dreal solution
+  DRealBuilder dRealBuilder(drealCons,drealVarTypes);
+  if (dRealBuilder.ackermannizeArrays()){
+    // transfer to dreal expr success
+    dreal::Formula f = dRealBuilder.generateFormular();
+    auto start = std::chrono::high_resolution_clock::now();
+    dreal::optional<dreal::Box> result = dRealBuilder.CheckSatisfiability(f, 0.001);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>Synergy-dreal exec time: " << milliseconds << " ms\n";
+
+    if (result) {
+      //std::cerr << f << "\n  is delta-sat:\n" << *result << "\n";
+      const dreal::Box &solution{*result};
+      std::map<std::string, uint64_t> fuzzSeeds;
+
+      for (const auto &array : drealObjects) {
+        bool matchFlag = false;
+        for (const dreal::Variable &v : solution.variables()) {
+          if (!matchObjDeclVarName(array->getName(), v.get_name(), false))
+            continue;
+          matchFlag = true;
+
+//          std::cerr << v << ",  " << solution[v].mid() << "\n";
+          std::string varType = drealVarTypes[v.get_name()];
+          double realRes = solution[v].mid();
+
+          // fetch dreal solution for fuzzing, if check invalid
+          uint64_t valueAsBits = 0;
+          std::memcpy(&valueAsBits, &realRes, sizeof realRes);
+          // valueAsBits belong little buttom data
+          double res = fuzzSeeds[v.get_name()] = valueAsBits;
+
+          std::vector<unsigned char> data;
+          data.reserve(array->size);
+
+          getDataBytes(realRes,varType,data);
+          drealValues.push_back(data);
+        }
+        assert(matchFlag && "drealObjects must be updated!");
+      }
+
+//      for(auto obj:drealObjects){
+//        llvm::outs()<<"obj:"<<obj->getName()<<"\n";
+//      }
+//      for(auto val:drealValues){
+//        llvm::outs()<<"val:"<<val.data()<<"\n";
+//      }
+
+      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(drealAssign);
+
+      int res = checkAssignmentValid(currentAssign, constraints);
+      if (res == 0) {
+        klee_warning("SMT-DReal: DReal solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      } else if (res == 1 && !unSupport){
+        // all constraints are pushed into dreal, so we can use seed.
+        klee_warning("SMT-DReal: DReal solving SAT and evaluate FAILURE and using JFS with seeds to solve !");
+        getConcreteAssignSeedFuzzWithSeeds(state, fuzzSeeds, checkValid, 3);
+        return;
+      } else {
+        // 1. there are unassigned variable exists, or
+        // 2. there are some dreal unsupport constraints,
+        // don't use seed
+        klee_warning("SMT-DReal: DReal solving SAT and evaluate FAILURE and (UnAssigned variable exists or no dreal support constraints) and Using JFS to solve !");
+        getConcreteAssignSeedFuzz(state,checkValid, 3);
+        return;
+      }
+    }
+    // dreal not have solution, but may be feasible !
+    if (!unSupport){
+      klee_warning("SMT-DREAL: DReal solving UNKNOWN with all support and remove this state !");
+      if (!state.fakeState){
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return;
+    }
+    klee_warning("SMT-DReal: DReal solving UNKNOWN with unsupport and Using JFS to solve !");
+  }
+  else {
+    // tranfer to dreal expr failed
+    klee_warning("SMT-DREAL: DReal transfer FAILURE and Using JFS to Solve !");
+  }
+  getConcreteAssignSeedFuzz(state,checkValid, 1.5);//smt is 1/3 so this is 2/3
+}
+
+// use z3Assign to simplify to constraints for drealCons
+void Executor::getConcreteAssignSeedSMTFUZZ(ExecutionState &state, bool &checkValid){
+  std::vector<std::vector<unsigned char>> easyValues;
+  std::vector<const Array*> easyObjects;
+  ConstraintSet easyCons;
+  std::set<std::string> easyVarName;
+  ConstraintSet constraints(state.constraints);
+
+  if(DebugCons){
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for(const auto& cons : constraints){
+      // get the contraints which is easy
+      if ( !sfcVisitor.visitComplex2(cons)){
+        llvm::errs()<<"smt-dreal(easyCons):\n"<<cons<<"\n";
+        easyCons.push_back(cons);
+        getConstraintVarName(cons,easyVarName);
+        continue;
+      }
+      llvm::errs()<<"smt-dreal(complexcons):\n"<<cons<<"\n";
+    }
+  }else{
+    for(const auto& cons : constraints){
+      // get the contraints which is easy
+      if ( !sfcVisitor.visitComplex2(cons)){
+        easyCons.push_back(cons);
+        getConstraintVarName(cons,easyVarName);
+        continue;
+      }
+    }
+  }
+
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    if (easyVarName.find(symbolic.second->getName())
+        != easyVarName.end())
+      easyObjects.push_back(symbolic.second);
+  }
+
+  bool seedFlag = false;
+  bool intosmtFlag = false;
+  Assignment easyAssign;
+  // use z3 to check easy constraints fastly
+  if (! easyCons.empty() && ! easyObjects.empty()){
+    intosmtFlag = true;
+    solver->setTimeout(coreSolverTimeout/2);
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = solver->getInitialValuesWithConstrintSet(easyCons, easyObjects,easyValues, state.queryMetaData);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>Synergy-Z3 exec time: " << milliseconds << " ms\n";
+    solver->setTimeout(time::Span()/2);
+
+    if (success){
+//      llvm::errs()<<"=================SMT-DREAL: Z3 Result: SAT=================\n";
+      easyAssign = Assignment(easyObjects,easyValues,true);
+      Assignment currAssign = state.assignSeed;
+      currAssign.updateValues(easyAssign);
+      if (checkAssignmentValid(currAssign,constraints) == 0){
+        klee_warning("SMT-DREAL: Z3 solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      }
+      seedFlag = true;
+      klee_warning("SMT-DReal: Z3 solving SAT and evaluate FAILURE and using JFS !");
+    }
+    else{
+      // z3 not have solution, must be infeasible !
+      if (!state.fakeState){
+        klee_warning("SMT-DREAL: Z3 solving UNSAT and remove the state !");
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return ;
+    }
+  }
+
+  if(seedFlag){
+    std::map<std::string, uint64_t> fuzzSeeds;
+    for (int i=0; i<easyValues.size(); i++) {
+      std::vector<unsigned char>& bytes = easyValues[i];
+//      if (bytes.empty() || bytes.size() > 8) {
+//        throw std::invalid_argument("Input vector is empty or too large.");
+//      }
+      uint64_t valueAsBits = 0;
+      // 从最高位开始，依次处理字节
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        // 将当前字节的值左移相应的位数，然后与结果相加
+        valueAsBits = (valueAsBits << 8) | static_cast<uint64_t>(bytes[i]);
+      }
+      // valueAsBits belong little buttom data
+      fuzzSeeds[easyObjects[i]->getName()] = valueAsBits;
+    }
+    getConcreteAssignSeedFuzzWithSeeds(state, fuzzSeeds, checkValid, 2);
+  }
+  else{
+    if(intosmtFlag)
+      getConcreteAssignSeedFuzz(state,checkValid, 2);
+    else
+      getConcreteAssignSeedFuzz(state,checkValid, 1);
+  }
+  return;
+}
+
+//// use z3Assign to simplify to constraints for jfsCons
+//void Executor::getConcreteAssignSeedSMTFUZZ(ExecutionState &state, bool &checkValid){
+//  std::vector<std::vector<unsigned char>> easyValues, validValues, complexValues;
+//  std::vector<const Array*> easyObjects, validObjects, complexObjects;
+//  ConstraintSet easyCons, complexCons;
+//  std::set<std::string> easyVarName,complexVarName,invalidVarName;
+//
+//  // get the Variable type
+//  std::map<std::string,std::string> complexVarTypes;
+//  ConstraintSet constraints(state.constraints);
+//  if(DebugCons){
+//    llvm::errs()<<"[by yx]==============>>: \n";
+//    for(const auto& cons : constraints){
+//      // get the contraints which is easy
+//      if ( !sfcVisitor.visitComplex2(cons)){
+//        llvm::errs()<<"smt-jfs(easyCons):\n"<<cons<<"\n";
+//        easyCons.push_back(cons);
+//        getConstraintVarName(cons,easyVarName);
+//        continue;
+//      }
+//      llvm::errs()<<"smt-jfs(complexcons):\n"<<cons<<"\n";
+//    }
+//  }else{
+//    for(const auto& cons : constraints){
+//      // get the contraints which is easy
+//      if ( !sfcVisitor.visitComplex2(cons)){
+//        easyCons.push_back(cons);
+//        getConstraintVarName(cons,easyVarName);
+//        continue;
+//      }
+//    }
+//  }
+//
+//  // get the variable type
+//  for (const auto &symbolic : state.symbolics){
+//    if (easyVarName.find(symbolic.second->getName())
+//        != easyVarName.end())
+//      easyObjects.push_back(symbolic.second);
+//  }
+//
+//  Assignment easyAssign;
+//  // use z3 to check easy constraints fastly
+//  if (! easyCons.empty() && ! easyObjects.empty()){
+//    solver->setTimeout(coreSolverTimeout);
+//    auto start = std::chrono::high_resolution_clock::now();
+//    bool success = solver->getInitialValuesWithConstrintSet(easyCons, easyObjects,easyValues, state.queryMetaData);
+//    auto end = std::chrono::high_resolution_clock::now();
+//    std::chrono::duration<double> duration = end - start;
+//    double milliseconds = duration.count() * 1000.0;
+//    llvm::errs() << ">>>Synergy-Z3 exec time: " << milliseconds << " ms\n";
+//    solver->setTimeout(time::Span());
+//
+//    if (success){
+////      llvm::errs()<<"=================SMT-DREAL: Z3 Result: SAT=================\n";
+//      easyAssign = Assignment(easyObjects,easyValues,true);
+//      Assignment currAssign = state.assignSeed;
+//      currAssign.updateValues(easyAssign);
+//      if (checkAssignmentValid(currAssign,constraints) == 0){
+//        klee_warning("SMT-DREAL: Z3 solving SAT and evaluate SUCCESS !");
+//        state.assignSeed = currAssign; //refresh state.assignSeed
+//        checkValid = true;
+//        return;
+//      }
+//      // z3 solve easy cons success, but unsatisfy all cons
+//    }else{
+//      // z3 not have solution, must be infeasible !
+//      if (!state.fakeState){
+//        klee_warning("SMT-DREAL: Z3 solving UNSAT and remove the state !");
+//        removedStates.push_back(&state);
+//        concreteHalt = true;
+//      }
+//      checkValid = false;
+//      return ;
+//    }
+//  }
+//
+//
+//
+//  // get the drealCons and drealObjects
+//  bool unSupport = false;
+//  for (const auto &cons : constraints){
+//    if (sfcVisitor.visitDrealUnSupport(cons)){
+////      llvm::outs()<<"smt-dreal(NoeasyCons):\n"<<cons<<"\n";
+//      unSupport = true;
+//      continue;
+//    }
+//    drealCons.push_back(cons);
+//    getConstraintVarName(cons,drealVarName);
+//  }
+//  for (const auto &symbolic : state.symbolics){
+//    if (drealVarName.find(symbolic.second->getName())
+//        != drealVarName.end()){
+//      drealObjects.push_back(symbolic.second);
+//
+//      std::string typeStr;
+//      llvm::raw_string_ostream ss(typeStr);
+//      symbolic.first->allocSite->getType()->print(ss);
+//      ss.flush();
+//      typeStr = typeStr.substr(0, typeStr.size() - 1);
+//      drealVarTypes[symbolic.second->getName()] = typeStr;
+//    }
+//  }
+//
+//  // get dreal solution
+//  DRealBuilder dRealBuilder(drealCons,drealVarTypes);
+//  if (dRealBuilder.ackermannizeArrays()){
+//    // transfer to dreal expr success
+//    dreal::Formula f = dRealBuilder.generateFormular();
+//    auto start = std::chrono::high_resolution_clock::now();
+//    dreal::optional<dreal::Box> result = dRealBuilder.CheckSatisfiability(f, 0.001);
+//    auto end = std::chrono::high_resolution_clock::now();
+//    std::chrono::duration<double> duration = end - start;
+//    double milliseconds = duration.count() * 1000.0;
+//    llvm::errs() << ">>>Synergy-dreal exec time: " << milliseconds << " ms\n";
+//
+//    if (result) {
+//      //std::cerr << f << "\n  is delta-sat:\n" << *result << "\n";
+//      const dreal::Box &solution{*result};
+//      std::map<std::string, uint64_t> fuzzSeeds;
+//
+//      for (const auto &array : drealObjects) {
+//        bool matchFlag = false;
+//        for (const dreal::Variable &v : solution.variables()) {
+//          if (!matchObjDeclVarName(array->getName(), v.get_name(), false))
+//            continue;
+//          matchFlag = true;
+//
+////          std::cerr << v << ",  " << solution[v].mid() << "\n";
+//          std::string varType = drealVarTypes[v.get_name()];
+//          double realRes = solution[v].mid();
+//
+//          // fetch dreal solution for fuzzing, if check invalid
+//          uint64_t valueAsBits = 0;
+//          std::memcpy(&valueAsBits, &realRes, sizeof realRes);
+//          double res = fuzzSeeds[v.get_name()] = valueAsBits;
+//
+//          std::vector<unsigned char> data;
+//          data.reserve(array->size);
+//
+//          getDataBytes(realRes,varType,data);
+//          drealValues.push_back(data);
+//        }
+//        assert(matchFlag && "drealObjects must be updated!");
+//      }
+//
+////      for(auto obj:drealObjects){
+////        llvm::outs()<<"obj:"<<obj->getName()<<"\n";
+////      }
+////      for(auto val:drealValues){
+////        llvm::outs()<<"val:"<<val.data()<<"\n";
+////      }
+//
+//      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+//      Assignment currentAssign = state.assignSeed;
+//      currentAssign.updateValues(drealAssign);
+//
+//      int res = checkAssignmentValid(currentAssign, constraints);
+//      if (res == 0) {
+//        klee_warning("SMT-DReal: DReal solving SAT and evaluate SUCCESS !");
+//        state.assignSeed = currentAssign; //refresh state.assignSeed
+//        checkValid = true;
+//        return;
+//      } else if (res == 1 && !unSupport){
+//        // all constraints are pushed into dreal, so we can use seed.
+//        klee_warning("SMT-DReal: DReal solving SAT and evaluate FAILURE and using JFS with seeds to solve !");
+//        getConcreteAssignSeedFuzzWithSeeds(state, fuzzSeeds, checkValid);
+//        return;
+//      } else {
+//        // 1. there are unassigned variable exists, or
+//        // 2. there are some dreal unsupport constraints,
+//        // don't use seed
+//        klee_warning("SMT-DReal: DReal solving SAT and evaluate FAILURE and (UnAssigned variable exists or no dreal support constraints) and Using JFS to solve !");
+//        getConcreteAssignSeedFuzz(state,checkValid);
+//        return;
+//      }
+//    }
+//    // dreal not have solution, but may be feasible !
+//    if (!unSupport){
+//      klee_warning("SMT-DREAL: DReal solving UNKNOWN with all support and remove this state !");
+//      if (!state.fakeState){
+//        removedStates.push_back(&state);
+//        concreteHalt = true;
+//      }
+//      checkValid = false;
+//      return;
+//    }
+//    klee_warning("SMT-DReal: DReal solving UNKNOWN with unsupport and Using JFS to solve !");
+//  }else {
+//    // tranfer to dreal expr failed
+//    klee_warning("SMT-DREAL: DReal transfer FAILURE and Using JFS to Solve !");
+//  }
+//  getConcreteAssignSeedFuzz(state,checkValid);
+//}
+
+void Executor::getConcreteAssignSeedDRealSearch(ExecutionState &state, bool &checkValid){
+//  llvm::errs()<<"==============call dreal solver==============\n";
+  std::vector<std::vector<unsigned char>> intValues, drealValues;
+  std::vector<const Array*> intObjects, drealObjects;
+  ConstraintSet intCons, drealCons;
+  std::set<std::string> intVarName, drealVarName;
+
+  // get the Variable type
+  std::map<std::string,std::string> allVarTypes, drealVarTypes;
+
+  ConstraintSet constraints(state.constraints);
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for (auto &cons : constraints){
+      llvm::errs()<<cons<<"\n";
+    }
+    llvm::errs()<<"==============\n";
+  }
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    // check which variable is Int
+    std::string typeStr;
+    llvm::raw_string_ostream ss(typeStr);
+    symbolic.first->allocSite->getType()->print(ss);
+    ss.flush();
+    typeStr = typeStr.substr(0, typeStr.size() - 1);
+    allVarTypes[symbolic.second->getName()] = typeStr;
+
+    if (typeStr[0] == 'i')
+      intVarName.insert(symbolic.second->getName());
+  }
+
+  for(const auto& cons : constraints){
+    // get the contraints which is pure int
+    if (checkConstraintVarName(cons,intVarName) &&
+        ! sfcVisitor.visitComplex(cons)){
+//      llvm::errs()<<"intCons:"<<cons<<"\n";
+      intCons.push_back(cons);
+      continue;
+    }
+    if(sfcVisitor.visitDrealUnSupport(cons))
+      continue;
+//    llvm::errs()<<"complex:"<<cons<<"\n";
+    drealCons.push_back(cons);
+    getConstraintVarName(cons,drealVarName);
+  }
+
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    if (drealVarName.find(symbolic.second->getName()) != drealVarName.end()){
+      drealObjects.push_back(symbolic.second);
+      drealVarTypes[symbolic.second->getName()] =
+              allVarTypes[symbolic.second->getName()];
+
+      // if a int variable relative to FP constraint, don't solve it by Z3
+      continue;
+    }
+    if (intVarName.find(symbolic.second->getName()) != intVarName.end())
+      intObjects.push_back(symbolic.second);
+  }
+
+  Assignment intAssign;
+  // use z3 first to compute
+  if (!intObjects.empty() && !intCons.empty()){
+    solver->setTimeout(coreSolverTimeout);
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = solver->getInitialValuesWithConstrintSet(intCons, intObjects,intValues,state.queryMetaData);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>Dreal-Z3 exec time: " << milliseconds << " ms\n";
+    solver->setTimeout(time::Span());
+
+    if (success){
+      //get 'commonConstraints' concrete value from SMT solver
+//      llvm::errs()<<"=================DReal: Z3 Result: SAT=================\n";
+      intAssign = Assignment(intObjects,intValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(intAssign);
+
+      bool useDrealFlag = false;
+      for(const auto &cons : constraints){
+        ref<Expr> simCons = currentAssign.evaluate(cons);
+        // if simplified constaint is BOOL
+        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(simCons)){
+          if (CE->isFalse()){ // invalid for float point constraint
+            useDrealFlag = true;
+          }
+        }else
+          useDrealFlag = true;
+      }
+      // easy constaints solution luckcy satisfied hard constaints
+      if (!useDrealFlag){
+        klee_warning("DREAL-IS: Z3 solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign;
+        checkValid = true;
+        return ;
+      }
+    }else{
+      if (!state.fakeState){
+        klee_warning("DREAL-IS: Z3 solving UNSAT and evaluate SUCCESS and remove the state !");
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return;
+    }
+  }
+
+  ConstraintSet evalCons;
+  // use intAssign to simplify all constraints
+  if (intAssign.bindings.empty())
+    evalCons = drealCons;
+  else{
+    for (auto &cons : drealCons){
+//      llvm::outs()<<cons<<"\n";
+      ref<Expr> simCons = intAssign.evaluate(cons);
+      evalCons.push_back(cons);
+    }
+  }
+
+  // get dreal solution
+  DRealBuilder dRealBuilder(evalCons,drealVarTypes);
+  if (dRealBuilder.ackermannizeArrays()){
+    // transfer to dreal expr success
+    dreal::Formula f = dRealBuilder.generateFormular();
+    auto start = std::chrono::high_resolution_clock::now();
+    dreal::optional<dreal::Box> result = dRealBuilder.CheckSatisfiability(f, 0.0001);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>Dreal-dreal exec time: " << milliseconds << " ms\n";
+
+    std::vector<DataInterval> dataIntervalVec;
+
+    if (result) {
+//      llvm::errs()<<"=================DReal Result: SAT=================\n";
+      const dreal::Box &solution{*result};
+      std::map<std::string, uint64_t> fuzzSeeds;
+
+      for (const auto &array : drealObjects) {
+        bool matchFlag = false;
+        for (const dreal::Variable &v : solution.variables()) {
+          if (!matchObjDeclVarName(array->getName(), v.get_name(), false))
+            continue;
+          matchFlag = true;
+
+//          std::cerr << v << ",  " << solution[v].mid() << "\n";
+          std::string varType = drealVarTypes[v.get_name()];
+          bool isInt = true;
+          if(varType.find("float") != std::string::npos ||
+             varType.find("double") != std::string::npos)
+            isInt = false;
+          double realRes = solution[v].mid();
+
+          DataInterval DI = DataInterval(realRes,v.get_name(),varType);
+          dataIntervalVec.push_back(DI);
+
+          std::vector<unsigned char> data;
+          data.reserve(array->size);
+
+          getDataBytes(realRes,varType,data);
+          drealValues.push_back(data);
+        }
+        assert(matchFlag && "drealObjects must be updated!");
+      }
+
+      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+
+      if (! intAssign.bindings.empty())
+        state.assignSeed.updateValues(intAssign);
+
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(drealAssign);
+//      currentAssign.dump();
+      int res = checkAssignmentValid(currentAssign, constraints);
+      if (res == 0) {
+        klee_warning("DReal-IS: DReal solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      } else {
+        klee_warning("DReal-IS: DReal solving SAT and evaluate FAILURE and use search !");
+        getConcreteAssignSeedSearch(state,drealObjects,dataIntervalVec,drealVarTypes,checkValid);
+        return;
+      }
+    }
+    // dreal not have solution, may be infeasible !
+    // TODO : no solution we use last value to search
+    klee_warning("DReal-IS: DReal solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+  else{
+    // tranfer to dreal expr failed
+    klee_warning("DReal-IS: transfer FAILURE and remove the state !(special)");
+  }
+  //getConcreteAssignSeedFuzz(state,checkValid);
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+
+/// 计算前缀表达式的值
+
+// 辅助函数，判断一个字符是否是空白字符（包括空格、制表符、换行符、回车符和括号）
+bool isWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')';
+}
+
+// 辅助函数，判断一个字符是否是操作符
+bool isOperator(char c) {
+  return c == '+' || c == '-' || c == '*' || c == '/';
+}
+
+// 辅助函数，将字符串转换为对应的操作数类型（可以扩展支持更多类型）
+double convertToOperand(std::string str) {
+  if (str == "real.pi") {
+    return M_PI;
+  } else {
+    double operand;
+    std::stringstream ss(str);
+    ss >> operand;
+    return operand;
+  }
+}
+
+// 递归函数，解析前缀表达式并计算结果
+double evaluatePrefixExpression(std::string expression, int& index) {
+  if (index >= expression.length()) {
+    // 表达式已经解析完毕
+    return 0;
+  }
+
+  char currentChar = expression[index];
+  if (isWhitespace(currentChar)) {
+    // 忽略空白字符
+    index++;
+    return evaluatePrefixExpression(expression, index);
+  } else if (isOperator(currentChar)) {
+    // 处理操作符
+    index++;
+    double operand1 = evaluatePrefixExpression(expression, index);
+    double operand2 = evaluatePrefixExpression(expression, index);
+
+    // 根据操作符计算结果
+    switch (currentChar) {
+      case '+':
+        return operand1 + operand2;
+      case '-':
+        return operand1 - operand2;
+      case '*':
+        return operand1 * operand2;
+      case '/':
+        return operand1 / operand2;
+    }
+  } else {
+    // 处理操作数
+    std::string operandStr;
+    while (index < expression.length() && !isWhitespace(expression[index]) && !isOperator(expression[index]) && expression[index] != '(' && expression[index] != ')') {
+      operandStr += expression[index];
+      index++;
+    }
+    return convertToOperand(operandStr);
+  }
+
+  return 0;
+}
+
+void Executor::getConcreteAssignSeedCVC5Real(ExecutionState &state, bool &checkValid){
+//  llvm::errs()<<"==============call cvc5Real solver==============\n";
+  std::vector<std::vector<unsigned char>> intValues, drealValues;
+  std::vector<const Array*> intObjects, drealObjects;
+  ConstraintSet intCons, drealCons;
+  std::set<std::string> intVarName, drealVarName;
+
+  // get the Variable type
+  std::map<std::string,std::string> allVarTypes, drealVarTypes;
+
+  ConstraintSet constraints(state.constraints);
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for (auto &cons : constraints){
+      llvm::errs()<<cons<<"\n";
+    }
+    llvm::errs()<<"==============\n";
+  }
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    // check which variable is Int
+    std::string typeStr;
+    llvm::raw_string_ostream ss(typeStr);
+    symbolic.first->allocSite->getType()->print(ss);
+    ss.flush();
+    typeStr = typeStr.substr(0, typeStr.size() - 1);
+    allVarTypes[symbolic.second->getName()] = typeStr;
+
+    if (typeStr[0] == 'i')
+      intVarName.insert(symbolic.second->getName());
+  }
+
+  for(const auto& cons : constraints){
+    // get the contraints which is pure int
+    if (checkConstraintVarName(cons,intVarName) && ! sfcVisitor.visitComplex(cons)){
+//      llvm::errs()<<"intCons:"<<cons<<"\n";
+      intCons.push_back(cons);
+      continue;
+    }
+    if(sfcVisitor.visitCVC5RealUnSupport(cons))
+      continue;
+//    llvm::errs()<<"complex:"<<cons<<"\n";
+    drealCons.push_back(cons);
+    getConstraintVarName(cons,drealVarName);
+  }
+
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+    if (drealVarName.find(symbolic.second->getName()) != drealVarName.end()){
+      drealObjects.push_back(symbolic.second);
+      drealVarTypes[symbolic.second->getName()] =
+              allVarTypes[symbolic.second->getName()];
+
+      // if a int variable relative to FP constraint, don't solve it by Z3
+      continue;
+    }
+    if (intVarName.find(symbolic.second->getName()) != intVarName.end())
+      intObjects.push_back(symbolic.second);
+  }
+
+  Assignment intAssign;
+  // use z3 first to compute
+  if (!intObjects.empty() && !intCons.empty()){
+    solver->setTimeout(coreSolverTimeout);
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = solver->getInitialValuesWithConstrintSet(intCons, intObjects,intValues,state.queryMetaData);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>CVC5Real-Z3 exec time: " << milliseconds << " ms\n";
+    solver->setTimeout(time::Span());
+
+    if (success){
+      //get 'commonConstraints' concrete value from SMT solver
+//      llvm::errs()<<"=================DReal: Z3 Result: SAT=================\n";
+      intAssign = Assignment(intObjects,intValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(intAssign);
+
+      bool useDrealFlag = false;
+      for(const auto &cons : constraints){
+        ref<Expr> simCons = currentAssign.evaluate(cons);
+        // if simplified constaint is BOOL
+        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(simCons)){
+          if (CE->isFalse()){ // invalid for float point constraint
+            useDrealFlag = true;
+          }
+        }else
+          useDrealFlag = true;
+      }
+      // easy constaints solution luckcy satisfied hard constaints
+      if (!useDrealFlag){
+        klee_warning("CVC5Real: Z3 solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign;
+        checkValid = true;
+        return ;
+      }
+    }else{
+      if (!state.fakeState){
+        klee_warning("CVC5Real: Z3 solving UNSAT and evaluate SUCCESS and remove the state !");
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return;
+    }
+  }
+
+  ConstraintSet evalCons;
+  // use intAssign to simplify all constraints
+  if (intAssign.bindings.empty())
+    evalCons = drealCons;
+  else{
+    for (auto &cons : drealCons){
+//      llvm::outs()<<cons<<"\n";
+      ref<Expr> simCons = intAssign.evaluate(cons);
+      evalCons.push_back(cons);
+    }
+  }
+
+  // get dreal solution
+  CVC5RealBuilder CVC5Solver(drealCons,drealVarTypes);
+  if (CVC5Solver.ackermannizeArrays()){
+    auto start = std::chrono::high_resolution_clock::now();
+    Result result = CVC5Solver.generateFormular();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>CVC5Real-cvc5 exec time: " << milliseconds << " ms\n";
+
+    std::vector<DataInterval> dataIntervalVec;
+    if (result.isSat()) {
+//      llvm::errs()<<"=================CVC5Real Result: SAT=================\n";
+      for (const auto &array : drealObjects) {
+          Term TermVar = CVC5Solver.variableMap[array->getName()];
+//          llvm::outs() << array->getName() << ",  " << TermVar.toString() << "\n";
+          std::string varType = drealVarTypes[array->getName()];
+//          bool isInt = true;
+//          if(varType.find("float") != std::string::npos ||
+//             varType.find("double") != std::string::npos)
+//            isInt = false;
+//          Sort realSort = CVC5Solver.CVC5Realsolver.getRealSort();
+//          Term x = CVC5Solver.CVC5Realsolver.mkConst(realSort, "x");
+//          Term bb = CVC5Solver.CVC5Realsolver.mkConst(realSort, "b");
+//          Term Term1 = CVC5Builder.CVC5solver.getValue(CVC5solver.);
+//          Term ttt = CVC5Solver.VarVec.front();
+          Term TermRes = CVC5Solver.CVC5Realsolver.getValue(TermVar);
+
+//          llvm::outs()<<"RealValue:\n";
+//          std::pair<int64_t, uint64_t> Val = TermRes.getReal64Value();
+//          llvm::outs()<<Val.first<<" "<<Val.second<<"\n";
+
+          double realRes=0;
+          std::string str = TermRes.toString();
+          size_t found = str.find("real.pi");
+          if(found != std::string::npos){
+//            string prefixExpression = "(* (/ real.pi 2) real.pi)";  // 输入前缀表达式
+            int index = 0;
+            realRes = evaluatePrefixExpression(str, index);
+//            if (index < prefixExpression.length()-1) {
+//              cout << "解析错误：未解析完整表达式" << endl;
+//            } else {
+//              cout << "结果: " << result << endl;
+//            }
+          }
+          else{
+            std::string resStr = TermRes.getRealValue();
+  //          llvm::outs() << TermVar.toString() << ",  " << TermRes.getRealValue() << "\n";
+
+            std::string firstStr = "";
+            std::string secondStr = "";
+            int flag = 0;
+            for(int i=0; i<resStr.size(); i++){
+              char ch = resStr[i];
+              if(ch=='/'){
+                flag = 1;
+                continue;
+              }
+              if(flag)
+                secondStr += ch;
+              else
+                firstStr += ch;
+            }
+            mpf_class first_num(firstStr);
+            mpf_class second_num(secondStr);
+            mpf_class resNum = first_num / second_num;
+  //          std::cout<<resNum<<"\n"<<firstStr<<"\n"<<secondStr<<"\n";
+            realRes = resNum.get_d();
+          }
+
+//          std::cout<<"double Value: "<<realRes<<"\n";
+          DataInterval DI = DataInterval(realRes,array->getName(),varType);
+          dataIntervalVec.push_back(DI);
+
+          std::vector<unsigned char> data;
+          data.reserve(array->size);
+
+          getDataBytes(realRes,varType,data);
+          drealValues.push_back(data);
+      }
+
+      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(drealAssign);
+//      drealAssign.dump();
+      int res = checkAssignmentValid(currentAssign, constraints);
+      if (res == 0) {
+        klee_warning("CVC5Real: CVC5Real solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      } else {
+        klee_warning("CVC5Real: CVC5Real solving SAT and evaluate FAILURE and use search !");
+        getConcreteAssignSeedSearch(state,drealObjects,dataIntervalVec,drealVarTypes,checkValid);
+        return;
+      }
+    }
+    else if(result.isUnsat()) {
+      klee_warning("CVC5Real: CVC5Real solving UNSAT and remove the state !");
+    }
+    else{
+      klee_warning("CVC5Real: CVC5Real solving UNKNOWN and remove the state !");
+    }
+  }else{
+    // tranfer to dreal expr failed
+    klee_warning("CVC5Real: transfer FAILURE and remove the state !");
+  }
+  //getConcreteAssignSeedFuzz(state,checkValid);
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void Executor::getConcreteAssignSeedMathSAT5Real(ExecutionState &state, bool &checkValid){
+  std::vector<std::vector<unsigned char>> drealValues;
+  std::vector<const Array*> drealObjects;
+  ConstraintSet drealCons;
+  std::set<std::string> drealVarName;
+
+  // get the Variable type
+  std::map<std::string,std::string> drealVarTypes;
+
+  ConstraintSet constraints(state.constraints);
+
+  for(const auto& cons : constraints){
+    // get the contraints which is pure int
+    llvm::outs()<<*cons<<"\n";
+    drealCons.push_back(cons);
+    getConstraintVarName(cons,drealVarName);
+  }
+
+  // get the variable type
+  for (const auto &symbolic : state.symbolics){
+//    symbolic.first->allocSite->getType()->print(llvm::outs());
+    llvm::outs()<<"----\n";
+//    llvm::outs()<<symbolic.first->allocSite->getName()<<"\n";
+    symbolic.first->allocSite->getType()->print(llvm::outs());
+    llvm::outs()<<"----\n";
+    llvm::outs()<<symbolic.second->getName()<<"\n";
+    if (drealVarName.find(symbolic.second->getName()) != drealVarName.end()){
+      llvm::outs()<<"***\n";
+//      llvm::outs()<<symbolic.first->allocSite->getName()<<"\n";
+      symbolic.first->allocSite->getType()->print(llvm::outs());
+      llvm::outs()<<"***\n";
+      llvm::outs()<<symbolic.second->getName()<<"\n";
+
+      std::string typeStr;
+      llvm::raw_string_ostream ss(typeStr);
+      symbolic.first->allocSite->getType()->print(ss);
+      ss.flush();
+      typeStr = typeStr.substr(0, typeStr.size() - 1);
+      drealVarTypes[symbolic.second->getName()] = typeStr;
+      drealObjects.push_back(symbolic.second);
+    }
+  }
+
+//  for(auto &cons:drealCons)
+//  {
+//    llvm::outs()<<"realcons:"<<cons<<"\n";
+//  }
+
+  for(auto it = drealVarTypes.begin(); it!=drealVarTypes.end(); it++){
+    llvm::outs()<<it->first<<"\n";
+    llvm::outs()<<it->second<<"\n";
+  }
+
+  // get dreal solution
+    MathSAT5Builder msat5Solver;
+    // transfer to dreal expr success
+    msat5Solver.initSolver();
+
+//  Z3_set_ast_print_mode(Z3_context c, Z3_ast_print_mode mode)
+//  Z3_benchmark_to_smtlib_string(c,
+//          Z3_string name,
+//          Z3_string logic,
+//          Z3_string status,
+//          Z3_string attributes,
+//          unsigned num_assumptions,
+//          Z3_ast const assumptions[],
+//  Z3_ast formula);
+
+//  Z3_benchmark_to_smtlib_string(f.ctx_ref(), name, logic, status, "", 0, v, f.as_ast());
+
+    std::string smtLibStr = sfcTransformer.transformSMTLib(constraints);
+    msat_term msatTerm = msat_from_smtlib2(msat5Solver.env, smtLibStr.c_str());
+    assert(MSAT_ERROR_TERM(msatTerm)==0);
+
+//    llvm::outs()<<"+++++smt2+++++\n";
+//    char* smtStr = msat_to_smtlib2(msat5Solver.env, msatTerm);
+//    llvm::outs()<<smtStr<<"\n";
+
+    int flag = msat_assert_formula(msat5Solver.env, msatTerm);
+    assert(!flag);
+
+    msat_result result = msat_solve(msat5Solver.env);
+
+    std::vector<DataInterval> dataIntervalVec;
+
+    if (result==MSAT_SAT) {
+      std::map<std::string, std::string> model_map = msat5Solver.get_model(msat5Solver.env);
+      for (const auto &array : drealObjects) {
+        std::string arrName = array->name;
+        bool matchFlag = false;
+        for (auto it=model_map.begin(); it!=model_map.end(); it++) {
+          std::string msatVarName = it->first;
+          if (!matchObjDeclVarName(arrName, msatVarName, false))
+            continue;
+          matchFlag = true;
+          std::string strRes = it->second;//这里的model_vec是gosat求解出的symblic直,double形式
+          std::string varType = drealVarTypes[arrName];
+          double realRes = std::stod(strRes);
+          llvm::outs()<<"solution : "<<arrName<<"  type: "<<varType<<" val : "<<strRes<<"\n";
+
+          DataInterval DI = DataInterval(realRes,array->getName(),varType);
+          dataIntervalVec.push_back(DI);
+
+          std::vector<unsigned char> data;
+          data.reserve(array->size);
+          getDataBytes(strRes,varType,data);
+          drealValues.push_back(data);
+        }
+        assert(matchFlag && "drealObjects must be updated!");
+      }
+
+      Assignment drealAssign = Assignment(drealObjects, drealValues, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(drealAssign);
+
+      int res = checkAssignmentValid(currentAssign, constraints);
+      if (res == 0) {
+        klee_warning("DReal-IS: DReal evaluate SAT !");
+        state.assignSeed = currentAssign; //refresh state.assignSeed
+        checkValid = true;
+        return;
+      } else {
+        klee_warning("DReal-IS: DReal evaluate UNSAT, use search !");
+        getConcreteAssignSeedSearch(state,drealObjects,dataIntervalVec,drealVarTypes,checkValid);
+        return;
+      }
+    }
+    // dreal not have solution, may be infeasible !
+    // TODO : no solution we use last value to search
+    klee_warning("DReal-IS: DReal solving UNSAT! Remove the state !");
+  //getConcreteAssignSeedFuzz(state,checkValid);
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void getSearchData(std::vector<DataInterval> &dataInterVec,
+                   std::vector<std::vector<double>> &allSearchData){
+  std::vector<std::vector<double>> worklist;
+  for (auto &dataInter : dataInterVec){
+    if (worklist.empty()){
+      std::vector<double> expandVal;
+      expandVal.push_back(dataInter.getInit());
+      for (int cnt = 0; cnt < MaxSearchTime; cnt ++){
+        expandVal.push_back(dataInter.getNext());
+        expandVal.push_back(dataInter.getPrev());
+      }
+
+      for (auto val : expandVal){
+        std::vector<double> newVec;
+        newVec.push_back(val);
+        worklist.push_back(newVec);
+      }
+    }else{
+      std::vector<std::vector<double>> newWorklist;
+      std::vector<double> expandVal;
+
+      expandVal.push_back(dataInter.getInit());
+      for (int cnt = 0; cnt < MaxSearchTime; cnt ++){
+        expandVal.push_back(dataInter.getNext());
+        expandVal.push_back(dataInter.getPrev());
+      }
+
+      while(! worklist.empty()){
+        for (auto val : expandVal){
+          std::vector<double> newVec(worklist.back());
+          newVec.push_back(val);
+          newWorklist.push_back(newVec);
+        }
+        worklist.pop_back();
+      }
+      worklist = newWorklist;
+    }
+  }
+  allSearchData = worklist;
+}
+
+void Executor::getConcreteAssignSeedSearch(
+        ExecutionState &state,
+        std::vector<const Array*> &objects,
+        std::vector<DataInterval> &dataInterVec,
+        std::map<std::string,std::string> &varTypes,
+        bool &checkValid){
+
+//  llvm::errs()<<"==========use seed search==========\n";
+  std::vector<std::vector<double>> allSearchData;
+  getSearchData(dataInterVec,allSearchData);
+
+  for (const auto &dataVec : allSearchData){//根据实数求解器求解得到的实数解datainterVec，搜索浮点解
+    std::vector<std::vector<unsigned char>> values;
+    for (int i=0; i<objects.size(); i++){
+      std::vector<unsigned char> data;
+      std::string varType = varTypes[objects[i]->name];
+      getDataBytes(dataVec[i],varType,data);
+      values.push_back(data);
+    }
+    Assignment searchAssign = Assignment(objects,values,true);
+    Assignment currentAssign = state.assignSeed;
+    currentAssign.updateValues(searchAssign);
+//    llvm::errs()<<"------:\n";
+//    currentAssign.dump();
+    int res = checkAssignmentValid(currentAssign,state.constraints);
+    if(res == 0){
+      klee_warning("DReal-IS-Search: search SUCCESS !");
+      state.assignSeed = currentAssign;
+      return ;
+    }
+  }
+  klee_warning("DReal-IS-Search: search FAILURE and remove the state !");
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+/// add by zgf : expriment mode for Constraints split into two parts
+void Executor::getConcreteAssignSeedFuzz(ExecutionState &state, bool &checkValid, int split_t){
+//  llvm::errs()<<"==============call jfs solver==============\n";
+  std::vector< std::vector<unsigned char> > values;
+  std::vector< const Array*> objects;
+  std::set<std::string> varName;
+  ConstraintSet constraints(state.constraints);
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for(const auto &cons : constraints){
+    llvm::errs()<<cons<<"\n";
+      getConstraintVarName(cons,varName);
+    }
+    llvm::errs()<<"========\n";
+  }else{
+    for(const auto &cons : constraints){
+      getConstraintVarName(cons,varName);
+    }
+  }
+
+  // try to use SMT to get 'commonConstraints' value
+  for (const auto &symbolic : state.symbolics)
+    if (varName.find(symbolic.second->name) != varName.end())
+      objects.push_back(symbolic.second);
+
+  std::string smtLibStr = sfcTransformer.transformSMTLib(constraints);
+  //errs()<<"[zgf dbg] smt str:\n"<<smtLibStr<<"\n";
+  // get fuzz result and put it in 'values', and get update var names.
+  __attribute__((unused)) std::map<std::string, uint64_t> fuzzSeeds;
+  auto start = std::chrono::high_resolution_clock::now();
+  int success = jfsSolver.invokeJFSGetFuzzingResult(smtLibStr,objects,values,fuzzSeeds, split_t);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << ">>>JFS exec time: " << milliseconds << " ms\n";
+
+  if (success==1){
+//    llvm::errs()<<"=================JFS: JFS Result: SAT=================\n";
+    Assignment fuzzAssign = Assignment(objects,values,true);
+//    fuzzAssign.dump();
+    Assignment currentAssign = state.assignSeed;
+    currentAssign.updateValues(fuzzAssign);
+    int res = checkAssignmentValid(currentAssign,constraints);
+    if (res == 0){
+      klee_warning("FUZZ: JFS solving SAT and evaluate SUCCESS !");
+      state.assignSeed = currentAssign;
+      checkValid = true;
+      return ;
+    }
+    klee_warning("FUZZ: JFS solving SAT and evaluate FAILURE and remove the state !");
+  }
+  else if(success==0){
+    // solve failed, remove this fuzzing failed state
+    klee_warning("FUZZ: JFS solving UNSAT and evaluate FAILURE and remove the state !");
+  }
+  else {
+    // solve failed, remove this fuzzing failed state
+    klee_warning("FUZZ: JFS solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void Executor::getConcreteAssignSeedGoSAT(ExecutionState &state, bool &checkValid){
+//  llvm::errs()<<"===========call gosat solver===========\n";
+  std::vector< std::vector<unsigned char> > z3Values,gosatValues;
+  std::vector< const Array*> z3Objects, gosatObjects;
+  std::map<std::string,std::string> varTypes;
+  std::set<std::string> z3VarName, gosatVarName;
+  ConstraintSet constraints(state.constraints),z3Cons, gosatCons;
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for (auto cons : constraints){
+      llvm::errs()<<cons<< "\n";
+    }
+    llvm::errs()<<"===========\n";
+  }
+  bool unSupport = false;
+  for (const auto &cons : constraints){
+    if (sfcVisitor.visitGosatUnSupport(cons)){
+      unSupport = true;
+//      llvm::outs()<<"[gosat unsupport cons]:\n"<<cons<<"\n";
+      z3Cons.push_back(cons);
+      getConstraintVarName(cons,z3VarName);
+      continue;
+    }
+//    llvm::outs()<<"[gosat support cons]:\n"<<cons<<"\n";
+    gosatCons.push_back(cons);
+    getConstraintVarName(cons,gosatVarName);
+  }
+
+//  llvm::errs()<<"by yx(z3) ========>:\n";
+//  for (auto cons : z3Cons){
+//    llvm::errs()<<cons<< "\n";
+//  }
+//  llvm::errs()<<"===========\n";
+
+  // use z3 to solve all unsupport contraints related to variable
+  for (const auto &symbolic : state.symbolics){
+    if (z3VarName.find(symbolic.second->getName()) != z3VarName.end()){
+      z3Objects.push_back(symbolic.second);
+    }
+    if (gosatVarName.find(symbolic.second->getName()) != gosatVarName.end()){ //find sumbolic variable
+      gosatObjects.push_back(symbolic.second);
+      std::string typeStr;
+      llvm::raw_string_ostream ss(typeStr);
+      symbolic.first->allocSite->getType()->print(ss);
+      ss.flush();
+      typeStr = typeStr.substr(0, typeStr.size() - 1);
+      varTypes[symbolic.second->name] = typeStr;
+    }
+  }
+
+  Assignment z3Assign;
+  bool z3AssignValid = true;
+  // use z3 first to compute
+  if (!z3Objects.empty() && !z3Cons.empty()){//z3 objective noempty; have gosat unsupport cons
+    solver->setTimeout(coreSolverTimeout);
+    //调求解器判断约束集合中的约束是否满足，赋值一个初始值
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = solver->getInitialValuesWithConstrintSet(z3Cons, z3Objects,z3Values,state.queryMetaData);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>GoSat-Z3 exec time: " << milliseconds << " ms\n";
+    solver->setTimeout(time::Span());
+
+    if (success){
+      //get 'commonConstraints' concrete value from SMT solver
+      z3Assign = Assignment(z3Objects,z3Values, true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(z3Assign);
+
+      bool useGosatFlag = false;
+      for(const auto &cons : constraints){
+        ref<Expr> simCons = currentAssign.evaluate(cons);
+        // if simplified constaint is BOOL
+        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(simCons)){
+          if (CE->isFalse()){ // invalid for float point constraint
+            useGosatFlag = true;
+            z3AssignValid = false;
+          }
+        }else
+          useGosatFlag = true;
+      }
+      // easy constaints solution luckcy satisfied hard constaints
+      if (!useGosatFlag){//no gosat constaints, don't need gosat solving.
+        klee_warning("GOSAT: Z3 evaluate SUCCESS !");
+        state.assignSeed = currentAssign;
+        checkValid = true;
+        return ;
+      }
+    }
+    else{
+      if (!state.fakeState){
+        klee_warning("GOSAT: Z3 solving UNSAT and remove the state !");
+        removedStates.push_back(&state);
+        concreteHalt = true;
+      }
+      checkValid = false;
+      return;
+    }
+  }
+
+  ConstraintSet evalCons;
+  // use intAssign to simplify all constraints
+  if (z3Assign.bindings.empty() || !z3AssignValid)
+    evalCons = gosatCons;
+  else{
+    state.assignSeed.updateValues(z3Assign);
+    for (auto &cons : gosatCons){
+      ref<Expr> simCons = z3Assign.evaluate(cons);
+      if (ConstantExpr *CE = dyn_cast<ConstantExpr>(simCons)){
+        if (CE->isFalse())
+          assert(false && "z3Assignment is invalid");
+        else
+          continue;
+      }
+      evalCons.push_back(cons);
+    }
+  }
+
+//  llvm::errs()<<"by yx[gosat] ========>:\n";
+//  for (auto cons : evalCons){
+//    llvm::errs()<<cons<< "\n";
+//  }
+//  llvm::errs()<<"===========\n";
+
+  if (!evalCons.empty()){
+    std::string smtLibStr = sfcTransformer.transformSMTLib(evalCons);
+    // add by yx
+//    MathSAT5Builder msat5Solver;
+//    // transfer to dreal expr success
+//    msat5Solver.initSolver();
+//    msat_term msatTerm = msat_from_smtlib2(msat5Solver.env, smtLibStr.c_str());
+//    assert(MSAT_ERROR_TERM(msatTerm)==0);
+//    char* smtStr = msat_to_smtlib2(msat5Solver.env, msatTerm);
+//    llvm::outs()<<"+++++smt2+++++\n";
+//    llvm::outs()<<smtStr<<"\n";
+
+//    llvm::outs()<<"*******************\n";
+//    llvm::outs()<<smtLibStr<<"\n";
+    // get fuzz result and put it in 'values', and get update var names.
+//    bool success = invokeGoSAT(smtStr,varTypes, gosatObjects,gosatValues);
+    auto start = std::chrono::high_resolution_clock::now();
+    bool success = invokeGoSAT(smtLibStr.c_str(),varTypes, gosatObjects,gosatValues);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double milliseconds = duration.count() * 1000.0;
+    llvm::errs() << ">>>GoSat-gosat exec time: " << milliseconds << " ms\n";
+
+    if (success){
+//      llvm::errs()<<"=================GOSAT: GOSAT Result: SAT=================\n";
+      Assignment gosatAssign = Assignment(gosatObjects,gosatValues,true);
+      Assignment currentAssign = state.assignSeed;
+      currentAssign.updateValues(gosatAssign);
+//      currentAssign.dump();
+      int res = checkAssignmentValid(currentAssign,constraints);//检查gosat求出来的解是否 是有效解
+      if (res == 0){
+        klee_warning("GOSAT: GOSAT solving SAT and evaluate SUCCESS !");
+        state.assignSeed = currentAssign;
+        checkValid = true;
+        return ;
+      }
+      // solve failed, remove this fuzzing failed state
+      klee_warning("GOSAT: GOSAT solving SAT and evaluate FAILURE and remove the state !");
+    }
+    else
+      klee_warning("GOSAT: GOSAT solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+
+  if (! state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+
+//void Executor::getConcreteAssignSeedMathSAT5Real(ExecutionState &state, bool &checkValid){
+//  llvm::outs()<<"===========call gosat solver===========\n";
+//  std::vector< std::vector<unsigned char> > Values;
+//  std::vector< const Array*> Objects;
+//  std::map<std::string,std::string> varTypes;
+//  std::set<std::string> varName;
+//  ConstraintSet constraints(state.constraints);
+//
+////  std::vector< std::vector<unsigned char> > values;
+////  std::vector< const Array*> objects;
+////  std::set<std::string> varName;
+////  ConstraintSet constraints(state.constraints);
+//
+//  llvm::outs()<<"Allconstraints:\n";
+//  for (auto cons : constraints){
+//    llvm::outs()<<cons<< "\n";
+//  }
+//
+//  for(const auto &cons : constraints){
+//    llvm::errs()<<"[zgf dbg] fuzz cons:\n"<<cons<<"\n";
+//    getConstraintVarName(cons,varName);
+//  }
+//
+//  for (const auto &symbolic : state.symbolics){
+//    if (varName.find(symbolic.second->getName()) != varName.end()){ //find sumbolic variable
+//      Objects.push_back(symbolic.second);
+//      std::string typeStr;
+//      llvm::raw_string_ostream ss(typeStr);
+//      symbolic.first->allocSite->getType()->print(ss);
+//      ss.flush();
+//      typeStr = typeStr.substr(0, typeStr.size() - 1);
+//      varTypes[symbolic.second->name] = typeStr;
+//    }
+//  }
+//
+//  std::string smtLibStr = sfcTransformer.transformSMTLib(constraints);
+//  // get fuzz result and put it in 'values', and get update var names.
+//  bool success = mathsat5Builder.invokeMathSAT5GetResult(smtLibStr,varTypes, Objects, Values);
+//  if (success){
+//    Assignment gosatAssign = Assignment(Objects,Values,true);
+//    Assignment currentAssign = state.assignSeed;
+//    currentAssign.updateValues(gosatAssign);
+//
+//    int res = checkAssignmentValid(currentAssign,constraints);//检查gosat求出来的解是否 是有效解
+//    if (res == 0){
+//      klee_warning("GOSAT: evaluate SUCCESS !");
+//      state.assignSeed = currentAssign;
+//      checkValid = true;
+//      return ;
+//    }
+//    else {
+//      klee_warning("DReal-IS: DReal evaluate UNSAT, use search !");
+//      getConcreteAssignSeedSearch(state,Objects,Values,varTypes,checkValid);
+//      return;
+//    }
+//  }
+//  else
+//    klee_warning("GOSAT: evaluate FAILED(gosat solve failed) ! Remove this state !");
+//
+//  klee_warning("GOSAT: UNKNOW ! Remove this state !");
+//  if (! state.fakeState){
+//    removedStates.push_back(&state);
+//    concreteHalt = true;
+//  }
+//  checkValid = false;
+//}
+
+void Executor::getConcreteAssignSeedBitwuzla(ExecutionState &state, bool &checkValid){//no fixed at time
+//  llvm::errs()<<"===========call bitwuzla solver===========\n";
+//  BitwuzlaSolver bitwuzlaSolver;
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+
+  // try to use SMT to get 'constraints' value
+  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+    objects.push_back(state.symbolics[i].second);
+
+  ConstraintSet constraints(state.constraints);
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for (auto &cons : constraints){
+      llvm::errs()<<cons<<"\n";
+    }
+    llvm::errs()<<"==============\n";
+  }
+
+  auto start = std::chrono::high_resolution_clock::now();
+  int success = bitwuzlaSolver.invokeBitwuzlaSolver(constraints,&objects, &values);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << ">>>Bitwuzla exec time: " << milliseconds << " ms\n";
+
+  if (success==1) {
+//    llvm::errs()<<"=================Bitwuzla Result: SAT=================\n";
+    Assignment bitwuzlaAssign = Assignment(objects,values,true);
+//    bitwuzlaAssign.dump();
+//    llvm::outs()<<"assign:\n";
+//    for(auto iter=bitwuzlaAssign.bindings.begin(); iter!=bitwuzlaAssign.bindings.end(); iter++){
+//      llvm::outs()<<iter->first->getName()<<" "<<*iter->second.data()<<"\n";
+//    }
+    if (checkAssignmentValid(bitwuzlaAssign,constraints) == 0){
+      klee_warning("Bitwuzla: Bitwuzla solving SAT and evaluate SUCCESS !");
+      state.assignSeed = Assignment(objects, values,true);
+      checkValid = true;
+      return ;
+    }
+    klee_warning("Bitwuzla: Bitwuzla solving SAT and evaluate FAILURE and remove the state !");
+  }
+  else if(success==0){
+    klee_warning("Bitwuzla: Bitwuzla solving UNSAT and evaluate FAILURE and remove the state !");
+  }
+  else{
+    klee_warning("Bitwuzla: Bitwuzla solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void Executor::getConcreteAssignSeedMathSAT5(ExecutionState &state, bool &checkValid){//no fixed at time
+//  llvm::errs()<<"===========call Mathsat5 solver===========\n";
+//  MathSATSolver mathsat5Solver;
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+
+  // try to use SMT to get 'constraints' value
+  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+    objects.push_back(state.symbolics[i].second);
+
+  ConstraintSet constraints(state.constraints);
+  if(DebugCons) {
+    llvm::errs()<<"[by yx]==============>>: \n";
+    for (auto &cons : constraints){
+      llvm::errs()<<cons<<"\n";
+    }
+    llvm::errs()<<"==============\n";
+  }
+  auto start = std::chrono::high_resolution_clock::now();
+  int success = mathsat5Solver.invokeMathSATSolver(constraints,&objects, &values);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << ">>>MathSAT5 exec time: " << milliseconds << " ms\n";
+
+  if (success==1) {
+//    llvm::errs()<<"=================MathSAT5 Result: SAT=================\n";
+    Assignment mathsat5Assign = Assignment(objects,values,true);
+//    mathsat5Assign.dump();
+    int checki = checkAssignmentValid(mathsat5Assign,constraints);
+//    llvm::outs()<<"check constraints:"<<"\n";
+//    for (auto &cons : constraints){
+//      llvm::outs()<<"[yx] cons : \n"<<cons<<"\n";
+//    }
+    if (checki == 0){
+      klee_warning("MathSAT5: MathSAT5 solving SAT and evaluate SUCCESS !");
+      state.assignSeed = Assignment(objects, values,true);
+      checkValid = true;
+      return ;
+    }
+    klee_warning("MathSAT5: MathSAT5 solving SAT and evaluate FAILURE and remove the state !");
+  }
+  else if(success==0){
+    klee_warning("MathSAT5: MathSAT5 solving UNSAT and evaluate FAILURE and remove the state !");
+  }
+  else{
+    klee_warning("MathSAT5: MathSAT5 solving UNKNOWN and evaluate FAILURE and remove the state !");
+  }
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void Executor::getConcreteAssignSeedCVC5(ExecutionState &state, bool &checkValid){
+  llvm::outs()<<"===========call cvc5 solver===========\n";
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+
+  // try to use SMT to get 'constraints' value
+  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+    objects.push_back(state.symbolics[i].second);
+
+  ConstraintSet constraints(state.constraints);
+//  llvm::outs()<<"[by yx]==============>>: \n";
+//  for (auto &cons : constraints){
+//    llvm::outs()<<cons<<"\n";
+//  }
+//  llvm::outs()<<"==============\n";
+
+  bool success = cvc5Solver.invokeCVC5Solver(constraints,&objects, &values);
+  if (success) {
+    Assignment cvc4Assign = Assignment(objects,values,true);
+//    cvc4Assign.dump();
+    if (checkAssignmentValid(cvc4Assign,constraints) == 0){
+      klee_warning("CVC5: CVC5 evaluate SUCCESS !");
+      state.assignSeed = Assignment(objects, values,true);
+      checkValid = true;
+      return ;
+    }
+  }
+  if (!state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+void Executor::getConcreteAssignSeedFuzzWithSeeds(
+        ExecutionState &state,
+        std::map<std::string, uint64_t> &fuzzSeeds,
+        bool &checkValid, int split_t){
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+  std::set<std::string> varName;
+  ConstraintSet constraints(state.constraints);
+
+  for (const auto &cons : constraints)
+    getConstraintVarName(cons,varName);
+
+  for(const auto &symbolic : state.symbolics)
+    if (varName.find(symbolic.second->name) != varName.end())
+      objects.push_back(symbolic.second);
+
+  std::string smtLibStr = sfcTransformer.transformSMTLib(constraints);
+  // get fuzz result and put it in 'values', and get update var names.
+  auto start = std::chrono::high_resolution_clock::now();
+  int success = jfsSolver.invokeJFSGetFuzzingResult(smtLibStr,objects,values,fuzzSeeds, split_t);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration = end - start;
+  double milliseconds = duration.count() * 1000.0;
+  llvm::errs() << ">>>Fuzz with seed exec time: " << milliseconds << " ms\n";
+
+  if (success==1){
+    Assignment fuzzAssign = Assignment(objects,values,true);
+    Assignment currentAssign = state.assignSeed;
+    currentAssign.updateValues(fuzzAssign);
+
+    int res = checkAssignmentValid(currentAssign,constraints);
+    if (res == 0){
+      klee_warning("FUZZ with seed: solving SAT and evaluate SUCCESS !");
+      state.assignSeed = currentAssign;
+      checkValid = true;
+      return ;
+    }
+    // solve failed, remove this fuzzing failed state
+    klee_warning("FUZZ with seed: solving SAT and evaluate FAILURE and remove the state !");
+  }
+  else if(success==0){
+    // solve failed, remove this fuzzing failed state
+    klee_warning("FUZZ with seed: solving UNSAT evalute FAILURE and remove the state !");
+  }
+  else{
+    klee_warning("FUZZ with seed: solving UNKNOWN evalute FAILURE and remove the state !");
+  }
+  if (! state.fakeState){
+    removedStates.push_back(&state);
+    concreteHalt = true;
+  }
+  checkValid = false;
+}
+
+
+
+//add by zgf --link-llvm-lib=/home/aaa/klee-uclibc/lib/libm.a
+// 正对不同的求解器，选择不同的种子     solvertype==
+void Executor::getStateSeed(ExecutionState &state, bool &checkValid, std::string filename) {
+  if (SolverTypeDecision == SolverType::SMT)//Bit-blasting //   BVFP
+//    SMT：约束都是bvfp格式表示，丢给smt solver之前已经转成了bvfp，smt内部直接对bvfp进行操作。
+    getConcreteAssignSeedSMT(state,checkValid);
+  else if (SolverTypeDecision == SolverType::BITWUZLA)//propagate-based local search bit-blasting
+    getConcreteAssignSeedBitwuzla(state,checkValid);
+  else if (SolverTypeDecision == SolverType::MATHSAT5)//propagate-based local search bit-blasting
+    getConcreteAssignSeedMathSAT5(state, checkValid);
+  else if (SolverTypeDecision == SolverType::DREAL_IS)//Interval solving  //RSO
+    getConcreteAssignSeedDRealSearch(state,checkValid);
+  else if (SolverTypeDecision == SolverType::CVC5REAL)//propagate-based local search bit-blasting
+    getConcreteAssignSeedCVC5Real(state,checkValid);
+  else if (SolverTypeDecision == SolverType::JFS)//fuzzing
+    getConcreteAssignSeedFuzz(state,checkValid,1);
+  else if (SolverTypeDecision == SolverType::GOSAT)//Mathematical optimisation   //search
+//    gosat：约束的smtlib格式转成代码（代码的输入是自变量x，输出是因变量y），代码相当于目标函数，优化求出来的解是double类型，求解成果后，将double解转成bvfp形式存起来。
+    getConcreteAssignSeedGoSAT(state,checkValid);
+  else if (SolverTypeDecision == SolverType::SMT_DREAL_JFS)//synergy
+    getConcreteAssignSeedSMTDReal(state,checkValid, filename);
+  else if (SolverTypeDecision == SolverType::SMT_JFS)//synergy
+    getConcreteAssignSeedSMTFUZZ(state,checkValid);
+//  else if (SolverTypeDecision == SolverType::BOOLECTOR)//Bit-blasting //
+////    SMT：约束都是bvfp格式表示，丢给smt solver之前已经转成了bvfp，smt内部直接对bvfp进行操作。
+//    getConcreteAssignSeedBoolector(state,checkValid);
+//  else if (SolverTypeDecision == SolverType::MATHSAT5REAL)//propagate-based local search bit-blasting
+//    getConcreteAssignSeedMathSAT5Real(state,checkValid);
+//  else if (SolverTypeDecision == SolverType::CVC5)//propagate-based local search bit-blasting
+//    getConcreteAssignSeedCVC5(state,checkValid);
+//  else if (SolverTypeDecision == SolverType::DREAL_FUZZ)
+//    getConcreteAssignSeedDReal(state,checkValid);
+  else
+    klee_error("--solver-type not set correctly !");
+}
+
+void Executor::run(ExecutionState &initialState) {//
   bindModuleConstants();
-
+//  llvm::outs()<<"init: "<<*initialState.pc->inst<<"\n";
   // Delay init till now so that ticks don't accrue during optimization and such.
+  // 延迟初始化
   timers.reset();
+  states.insert(&initialState);//states是一个set，先将初始化的state放进弃
 
-  states.insert(&initialState);
+  if (usingSeeds) {//执行过程需要的seed，不为空  //这里没用到
+    std::vector<SeedInfo> &v = seedMap[&initialState];//map   key是state，value是vector<seedInfo>
 
-  if (usingSeeds) {
-    std::vector<SeedInfo> &v = seedMap[&initialState];
-    
-    for (std::vector<KTest*>::const_iterator it = usingSeeds->begin(), 
-           ie = usingSeeds->end(); it != ie; ++it)
+    for (std::vector<KTest*>::const_iterator it = usingSeeds->begin(),
+           ie = usingSeeds->end(); it != ie; ++it)//每个测试样例一个seed，相当于遍历每个测试样例，然后push到v中
       v.push_back(SeedInfo(*it));
 
     int lastNumSeeds = usingSeeds->size()+10;
@@ -3531,7 +5566,7 @@ void Executor::run(ExecutionState &initialState) {
       ExecutionState &state = *lastState;
       KInstruction *ki = state.pc;
       stepInstruction(state);
-
+      //调用指令执行函数，传入当前状态和执行的第几条指令
       executeInstruction(state, ki);
       timers.invoke();
       if (::dumpStates) dumpStates();
@@ -3576,27 +5611,64 @@ void Executor::run(ExecutionState &initialState) {
   searcher->update(0, newStates, std::vector<ExecutionState *>());
 
   // main interpreter loop
-  while (!states.empty() && !haltExecution) {
+  // 循环一次得到一个测试样例，ktest
+  while (!states.empty() && !haltExecution) {//states是个set，不为空，说明里面还有状态
     ExecutionState &state = searcher->selectState();
-    KInstruction *ki = state.pc;
-    stepInstruction(state);
-
-    executeInstruction(state, ki);
-    timers.invoke();
-    if (::dumpStates) dumpStates();
-    if (::dumpPTree) dumpPTree();
-
-    updateStates(&state);
-
-    if (!checkMemoryUsage()) {
-      // update searchers when states were terminated early due to memory pressure
-      updateStates(nullptr);
+    concreteHalt = false;
+    //每个state的第一条指令，state可以理解成是符号执行树中的一个节点。
+//    llvm::errs()<<"+++++++++++++++ state first: "<<*state.pc->inst<<"\n";//第一条指令，是call 入口看书main
+    // add by zgf : get new 'state.assignSeed' for next concrete execution
+    // if the first time running without any seed, it will automatic
+    // generated in 'executeMakeSymbolic'
+    //判断一下还有没有约束，如果还有的话，把它给求解来，用种子的方法。
+//    llvm::errs()<<"cons size:"<<state.constraints.size()<<"\n";
+    if (state.constraints.size() > 0) {
+//      ConstraintSet cons1(state.constraints);
+//      for (auto &con : cons1){
+//        llvm::outs()<<"[yx] cons:"<<con<<"\n";
+//      }
+      bool checkValid = false;
+      getStateSeed(state,checkValid,"FP_"+std::to_string(filenamecnt++));// 打印WARNING: Z3: Z3 evaluate SUCCESS !
+//      llvm::outs()<<checkValid<<"\n";
     }
-  }
+//    else{
+//      ConstraintSet cons1(state.constraints);
+//      for (auto &con : cons1){
+//        llvm::outs()<<"[yx] cons:"<<con<<"\n";
+//      }
+//    }
 
+    //add by yx
+    //int cntyx=0;
+    // concreteHalt:  label whether this state execute finish, and select next state
+    while(!concreteHalt){//很重要，就是在循环这个     循环遍历该状态路径下的所有指令
+      //llvm::errs()<<cntyx++;
+      KInstruction *ki = state.pc;
+//      llvm::errs()<<"ki:"<<*ki->inst<<"\n";
+      stepInstruction(state); //更新状态，走到下一个指令
+      //这里调用的是PPExecutor.cpp 里面的
+      //调用指令执行函数，传入当前状态和执行的第几条指令   这里是一条条指令的执行    该函数有求解约束的作用，只是使用了带种子的方法
+      executeInstruction(state, ki);//run里面调用了executeInstruction()，所以，调用run，直接实际是执行executeInstruction.
+      timers.invoke();
+      if (::dumpStates) dumpStates();
+      if (::dumpPTree) dumpPTree();
+      if (haltExecution) {
+//        llvm::errs()<<"11111\n";
+        doDumpStates();
+//        llvm::errs()<<"22222\n";
+        return;
+      }
+      if (!checkMemoryUsage()) {
+        // update searchers when states were terminated early due to memory pressure
+        updateStates(nullptr);
+        updateStates(nullptr);
+      }
+    }
+//    llvm::errs()<<"+++++++++++++++ state end\n";
+    updateStates(&state); //一个状态下的指令执行完成,   一个状态就是一条约束路经，
+  }
   delete searcher;
   searcher = nullptr;
-
   doDumpStates();
 }
 
@@ -3610,18 +5682,18 @@ std::string Executor::getAddressInfo(ExecutionState &state,
     example = CE->getZExtValue();
   } else {
     ref<ConstantExpr> value;
-    bool success = solver->getValue(state.constraints, address, value,
+    bool success = solver->getValue(state, address, value,
                                     state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
     example = value->getZExtValue();
     info << "\texample: " << example << "\n";
     std::pair<ref<Expr>, ref<Expr>> res =
-        solver->getRange(state.constraints, address, state.queryMetaData);
+        solver->getRange(state, address, state.queryMetaData);
     info << "\trange: [" << res.first << ", " << res.second <<"]\n";
   }
-  
-  MemoryObject hack((unsigned) example);    
+
+  MemoryObject hack((unsigned) example);
   MemoryMap::iterator lower = state.addressSpace.objects.upper_bound(&hack);
   info << "\tnext: ";
   if (lower==state.addressSpace.objects.end()) {
@@ -3643,11 +5715,12 @@ std::string Executor::getAddressInfo(ExecutionState &state,
       const MemoryObject *mo = lower->first;
       std::string alloc_info;
       mo->getAllocInfo(alloc_info);
-      info << "object at " << mo->address 
+      info << "object at " << mo->address
            << " of size " << mo->size << "\n"
            << "\t\t" << alloc_info << "\n";
     }
   }
+
 
   return info.str();
 }
@@ -3658,18 +5731,23 @@ void Executor::terminateState(ExecutionState &state) {
     klee_warning_once(replayKTest,
                       "replay did not consume all objects in test input.");
   }
-
   interpreterHandler->incPathsExplored();
+
+  // modify by zgf : if this state is fakeState created by raise error,
+  // don't add it into 'addedStates' or 'removedStates'
+  if (state.fakeState){
+    delete &state;
+    return ;
+  }
 
   std::vector<ExecutionState *>::iterator it =
       std::find(addedStates.begin(), addedStates.end(), &state);
   if (it==addedStates.end()) {
     state.pc = state.prevPC;
-
     removedStates.push_back(&state);
   } else {
     // never reached searcher, just delete immediately
-    std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it3 = 
+    std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it3 =
       seedMap.find(&state);
     if (it3 != seedMap.end())
       seedMap.erase(it3);
@@ -3693,7 +5771,7 @@ static std::string terminationTypeFileExtension(StateTerminationType type) {
 #undef TTYPE
 #undef MARK
   return ret;
-};
+}
 
 void Executor::terminateStateOnExit(ExecutionState &state) {
   if (shouldWriteTest(state) || (AlwaysOutputSeeds && seedMap.count(&state)))
@@ -3703,6 +5781,8 @@ void Executor::terminateStateOnExit(ExecutionState &state) {
 
   interpreterHandler->incPathsCompleted();
   terminateState(state);
+  // add by zgf : to set execute finish flag, then select next state
+  concreteHalt = true;
 }
 
 void Executor::terminateStateEarly(ExecutionState &state, const Twine &message,
@@ -3716,6 +5796,8 @@ void Executor::terminateStateEarly(ExecutionState &state, const Twine &message,
   }
 
   terminateState(state);
+  // add by zgf : to set execute finish flag, then select next state
+  concreteHalt = true;
 }
 
 void Executor::terminateStateOnUserError(ExecutionState &state, const llvm::Twine &message) {
@@ -3774,7 +5856,8 @@ void Executor::terminateStateOnError(ExecutionState &state,
                                      const llvm::Twine &messaget,
                                      StateTerminationType terminationType,
                                      const llvm::Twine &info,
-                                     const char *suffix) {
+                                     const char *suffix,
+                                     bool isConcreteHalt) {
   std::string message = messaget.str();
   static std::set< std::pair<Instruction*, std::string> > emittedErrors;
   Instruction * lastInst;
@@ -3811,11 +5894,14 @@ void Executor::terminateStateOnError(ExecutionState &state,
     const char * file_suffix = suffix ? suffix : ext.c_str();
     interpreterHandler->processTestCase(state, msg.str().c_str(), file_suffix);
   }
-
   terminateState(state);
+  // add by zgf : to set execute finish flag, then select next state
+  if (isConcreteHalt)
+    concreteHalt = true;
 
-  if (shouldExitOn(terminationType))
+  if (shouldExitOn(terminationType)){
     haltExecution = true;
+  }
 }
 
 void Executor::terminateStateOnExecError(ExecutionState &state,
@@ -3867,7 +5953,7 @@ void Executor::callExternalFunction(ExecutionState &state,
       *ai = optimizer.optimizeExpr(*ai, true);
       ref<ConstantExpr> ce;
       bool success =
-          solver->getValue(state.constraints, *ai, ce, state.queryMetaData);
+          solver->getValue(state, *ai, ce, state.queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");
       (void) success;
       ce->toMemory(&args[wordIndex]);
@@ -3880,7 +5966,7 @@ void Executor::callExternalFunction(ExecutionState &state,
       wordIndex += (ce->getWidth()+63)/64;
     } else {
       ref<Expr> arg = toUnique(state, *ai);
-      if (ConstantExpr *ce = dyn_cast<ConstantExpr>(arg)) {
+      if (auto *ce = dyn_cast<ConstantExpr>(arg)) {
         // fp80 must be aligned to 16 according to the System V AMD 64 ABI
         if (ce->getWidth() == Expr::Fl80 && wordIndex & 0x01)
           wordIndex++;
@@ -3937,8 +6023,9 @@ void Executor::callExternalFunction(ExecutionState &state,
     else
       klee_warning_once(function, "%s", os.str().c_str());
   }
-
-  bool success = externalDispatcher->executeCall(function, target->inst, args);
+  // modify by zgf to assign roundingMode
+  bool success = externalDispatcher->executeCall(function,
+                 target->inst,args,llvm::APFloat::rmNearestTiesToEven);
   if (!success) {
     terminateStateOnError(state, "failed external call: " + function->getName(),
                           StateTerminationType::External);
@@ -4063,7 +6150,7 @@ void Executor::executeAlloc(ExecutionState &state,
 
     ref<ConstantExpr> example;
     bool success =
-        solver->getValue(state.constraints, size, example, state.queryMetaData);
+        solver->getValue(state, size, example, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
     
@@ -4073,7 +6160,7 @@ void Executor::executeAlloc(ExecutionState &state,
       ref<ConstantExpr> tmp = example->LShr(ConstantExpr::alloc(1, W));
       bool res;
       bool success =
-          solver->mayBeTrue(state.constraints, EqExpr::create(tmp, size), res,
+          solver->mayBeTrue(state, EqExpr::create(tmp, size), res,
                             state.queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");      
       (void) success;
@@ -4088,12 +6175,12 @@ void Executor::executeAlloc(ExecutionState &state,
     if (fixedSize.second) { 
       // Check for exactly two values
       ref<ConstantExpr> tmp;
-      bool success = solver->getValue(fixedSize.second->constraints, size, tmp,
+      bool success = solver->getValue(*fixedSize.second, size, tmp,
                                       fixedSize.second->queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");      
       (void) success;
       bool res;
-      success = solver->mustBeTrue(fixedSize.second->constraints,
+      success = solver->mustBeTrue(*fixedSize.second,
                                    EqExpr::create(tmp, size), res,
                                    fixedSize.second->queryMetaData);
       assert(success && "FIXME: Unhandled solver failure");      
@@ -4121,8 +6208,11 @@ void Executor::executeAlloc(ExecutionState &state,
           ExprPPrinter::printOne(info, "  size expr", size);
           info << "  concretization : " << example << "\n";
           info << "  unbound example: " << tmp << "\n";
+          // modify by zgf : this terminate error is not current state concrete
+          // execution stop flag, it's only a check, so set the flag 'false'.
+          hugeSize.second->fakeState = true;
           terminateStateOnError(*hugeSize.second, "concretized symbolic size",
-                                StateTerminationType::Model, info.str());
+                                StateTerminationType::Model, info.str(), nullptr,false);
         }
       }
     }
@@ -4151,13 +6241,21 @@ void Executor::executeFree(ExecutionState &state,
            ie = rl.end(); it != ie; ++it) {
       const MemoryObject *mo = it->first.first;
       if (mo->isLocal) {
+        // modify by zgf : this terminate error is not current state concrete
+        // execution stop flag, it's only a check, so set the flag 'false'.
+        it->second->fakeState = true;
         terminateStateOnError(*it->second, "free of alloca",
                               StateTerminationType::Free,
-                              getAddressInfo(*it->second, address));
+                              getAddressInfo(*it->second, address),
+                              nullptr,false);
       } else if (mo->isGlobal) {
+        // modify by zgf : this terminate error is not current state concrete
+        // execution stop flag, it's only a check, so set the flag 'false'.
+        it->second->fakeState = true;
         terminateStateOnError(*it->second, "free of global",
                               StateTerminationType::Free,
-                              getAddressInfo(*it->second, address));
+                              getAddressInfo(*it->second, address),
+                              nullptr,false);
       } else {
         it->second->addressSpace.unbindObject(mo);
         if (target)
@@ -4175,36 +6273,53 @@ void Executor::resolveExact(ExecutionState &state,
   // XXX we may want to be capping this?
   ResolutionList rl;
   state.addressSpace.resolve(state, solver, p, rl);
-  
-  ExecutionState *unbound = &state;
+
+  // modify by zgf : don't use *unbound to replace &state, it will cause
+  // problem when 'terminateState' erase 'state.assignSeed'. The address of &state
+  // has been changed by this operation.
+
+  //ExecutionState *unbound = &state;
+  ExecutionState* new_unbound = nullptr;
   for (ResolutionList::iterator it = rl.begin(), ie = rl.end(); 
        it != ie; ++it) {
     ref<Expr> inBounds = EqExpr::create(p, it->first->getBaseExpr());
 
     StatePair branches =
-        fork(*unbound, inBounds, true, BranchType::ResolvePointer);
+        fork(state, inBounds, true, BranchType::ResolvePointer);
 
     if (branches.first)
       results.push_back(std::make_pair(*it, branches.first));
 
-    unbound = branches.second;
-    if (!unbound) // Fork failure
+    new_unbound = branches.second;
+    if (!new_unbound){// Fork failure
       break;
+    }
   }
 
-  if (unbound) {
-    terminateStateOnError(*unbound, "memory error: invalid pointer: " + name,
-                          StateTerminationType::Ptr, getAddressInfo(*unbound, p));
+  if (new_unbound) {
+    // modify by zgf : this terminate error is not current state concrete
+    // execution stop flag, it's only a check, so set the flag 'false'.
+    new_unbound->fakeState = true;
+    terminateStateOnError(*new_unbound, "memory error: invalid pointer: " + name,
+                          StateTerminationType::Ptr,
+                          getAddressInfo(*new_unbound, p),nullptr,false);
   }
+  // add by zgf : cann't get any resolution, means current state must be error, so set the
+  // current state's concrete execution HALT !
+  if (rl.empty())
+    terminateStateOnError(state, "memory error: invalid pointer: " + name,
+                        StateTerminationType::Ptr,
+                        getAddressInfo(state, p));
 }
 
+// modify by zgf : different logic in concreteMode to deal with memory
 void Executor::executeMemoryOperation(ExecutionState &state,
                                       bool isWrite,
                                       ref<Expr> address,
                                       ref<Expr> value /* undef if read */,
                                       KInstruction *target /* undef if write */) {
-  Expr::Width type = (isWrite ? value->getWidth() : 
-                     getWidthForLLVMType(target->inst->getType()));
+  Expr::Width type = (isWrite ? value->getWidth() :
+                      getWidthForLLVMType(target->inst->getType()));
   unsigned bytes = Expr::getMinBytesForWidth(type);
 
   if (SimplifySymIndices) {
@@ -4213,14 +6328,15 @@ void Executor::executeMemoryOperation(ExecutionState &state,
     if (isWrite && !isa<ConstantExpr>(value))
       value = ConstraintManager::simplifyExpr(state.constraints, value);
   }
-
   address = optimizer.optimizeExpr(address, true);
 
   // fast path: single in-bounds resolution
   ObjectPair op;
   bool success;
   solver->setTimeout(coreSolverTimeout);
-  if (!state.addressSpace.resolveOne(state, solver, address, op, success)) {
+  // note by zgf : we first check current state
+  if (!state.addressSpace.resolveOne(state, solver, address,
+                                     op, success,true)) {
     address = toConstant(state, address, "resolveOne failure");
     success = state.addressSpace.resolveOne(cast<ConstantExpr>(address), op);
   }
@@ -4228,27 +6344,32 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
   if (success) {
     const MemoryObject *mo = op.first;
-
     if (MaxSymArraySize && mo->size >= MaxSymArraySize) {
       address = toConstant(state, address, "max-sym-array-size");
     }
-    
+
     ref<Expr> offset = mo->getOffsetExpr(address);
     ref<Expr> check = mo->getBoundsCheckOffset(offset, bytes);
-    check = optimizer.optimizeExpr(check, true);
 
-    bool inBounds;
-    solver->setTimeout(coreSolverTimeout);
-    bool success = solver->mustBeTrue(state.constraints, check, inBounds,
-                                      state.queryMetaData);
-    solver->setTimeout(time::Span());
-    if (!success) {
-      state.pc = state.prevPC;
-      terminateStateOnSolverError(state, "Query timed out (bounds check).");
-      return;
+    // add by zgf to add lowerBoundCheck
+    if (!isa<ConstantExpr>(offset)){
+      ref<Expr> lowerCheck = mo->getLowerBoundsCheckOffset(offset,bytes);
+      check = AndExpr::create(lowerCheck,check);
     }
 
-    if (inBounds) {
+    ref<Expr> unBoundCheck = Expr::createIsZero(check);
+    //check = optimizer.optimizeExpr(check, true);
+
+    // finally, check current state whether inBound
+    bool currentInBounds = false;
+    solver->mustBeTrue(state, check, currentInBounds,
+                       state.queryMetaData);
+    // if current state truely inBound, bindLocal
+    if (currentInBounds){
+      // add current inBound constraints to restrict state
+      if (!isa<ConstantExpr>(check))
+        state.addInitialConstraint(check);
+
       const ObjectState *os = op.second;
       if (isWrite) {
         if (os->readOnly) {
@@ -4257,72 +6378,90 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         } else {
           ObjectState *wos = state.addressSpace.getWriteable(mo, os);
           wos->write(offset, value);
-        }          
+        }
       } else {
         ref<Expr> result = os->read(offset, type);
-        
         if (interpreterOpts.MakeConcreteSymbolic)
           result = replaceReadWithSymbolic(state, result);
-        
         bindLocal(target, state, result);
       }
-
-      return;
+      return ;
     }
-  } 
+
+    // if current state not inBound, try to get 'inBound' prossibility
+  }
 
   // we are on an error path (no resolution, multiple resolution, one
   // resolution with out of bounds)
 
+  // modify by zgf : when reach here, it means there is unbound happend in
+  // current state, we must report unbound bug using 'terminateStateOnError',
+  // then fork inbound state.
+
+  bool stateUsedFlag = false;
+
   address = optimizer.optimizeExpr(address, true);
-  ResolutionList rl;  
+  ResolutionList rl;
   solver->setTimeout(coreSolverTimeout);
+  // note by zgf : must be use seed to get all prossibility address !!!
   bool incomplete = state.addressSpace.resolve(state, solver, address, rl,
-                                               0, coreSolverTimeout);
+                                               0, coreSolverTimeout,true);
   solver->setTimeout(time::Span());
-  
-  // XXX there is some query wasteage here. who cares?
-  ExecutionState *unbound = &state;
-  
+
+  // Note by zgf : if there some solutions, we use constraints to fork
+  // these valid states
   for (ResolutionList::iterator i = rl.begin(), ie = rl.end(); i != ie; ++i) {
     const MemoryObject *mo = i->first;
     const ObjectState *os = i->second;
     ref<Expr> inBounds = mo->getBoundsCheckPointer(address, bytes);
-    
-    StatePair branches = fork(*unbound, inBounds, true, BranchType::MemOp);
-    ExecutionState *bound = branches.first;
 
-    // bound can be 0 on failure or overlapped 
-    if (bound) {
+    // current state satified inBounds check, avoid multi fork
+    if (state.checkConstraintExists(inBounds)){
       if (isWrite) {
+        ObjectState *wos = state.addressSpace.getWriteable(mo, os);
+        wos->write(mo->getOffsetExpr(address), value);
         if (os->readOnly) {
-          terminateStateOnError(*bound, "memory error: object read only",
+          terminateStateOnError(state, "memory error: object read only",
                                 StateTerminationType::ReadOnly);
         } else {
-          ObjectState *wos = bound->addressSpace.getWriteable(mo, os);
+          ObjectState *wos = state.addressSpace.getWriteable(mo, os);
           wos->write(mo->getOffsetExpr(address), value);
         }
       } else {
         ref<Expr> result = os->read(mo->getOffsetExpr(address), type);
-        bindLocal(target, *bound, result);
+        bindLocal(target, state, result);
       }
+      stateUsedFlag = true;
     }
 
-    unbound = branches.second;
-    if (!unbound)
-      break;
-  }
-  
-  // XXX should we distinguish out of bounds and overlapped cases?
-  if (unbound) {
-    if (incomplete) {
-      terminateStateOnSolverError(*unbound, "Query timed out (resolve).");
-    } else {
-      terminateStateOnError(*unbound, "memory error: out of bound pointer",
-                            StateTerminationType::Ptr,
-                            getAddressInfo(*unbound, address));
+    if (!isa<ConstantExpr>(inBounds) &&
+        !state.checkConstraintExists(inBounds)){
+      ExecutionState *otherState = state.copyConcrete();
+      ++stats::forks;
+      otherState->addInitialConstraint(inBounds);
+      if (isWrite) {
+        if (os->readOnly) {
+          terminateStateOnError(*otherState, "memory error: object read only",
+                                StateTerminationType::ReadOnly);
+        } else {
+          ObjectState *wos = otherState->addressSpace.getWriteable(mo, os);
+          wos->write(mo->getOffsetExpr(address), value);
+        }
+      } else {
+        ref<Expr> result = os->read(mo->getOffsetExpr(address), type);
+        bindLocal(target, *otherState, result);
+      }
+      addedStates.push_back(otherState);
+      processTree->attach(state.ptreeNode, otherState,
+                          &state, BranchType::MemOp);
     }
   }
+
+  // kill this unbound state
+  if (!stateUsedFlag)
+    terminateStateOnError(state, "memory error: out of bound pointer",
+                        StateTerminationType::Ptr,
+                        getAddressInfo(state, address));
 }
 
 void Executor::executeMakeSymbolic(ExecutionState &state, 
@@ -4340,49 +6479,12 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
-    
-    std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
-      seedMap.find(&state);
-    if (it!=seedMap.end()) { // In seed mode we need to add this as a
-                             // binding.
-      for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
-             siie = it->second.end(); siit != siie; ++siit) {
-        SeedInfo &si = *siit;
-        KTestObject *obj = si.getNextInput(mo, NamedSeedMatching);
 
-        if (!obj) {
-          if (ZeroSeedExtension) {
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
-            values = std::vector<unsigned char>(mo->size, '\0');
-          } else if (!AllowSeedExtension) {
-            terminateStateOnUserError(state, "ran out of inputs during seeding");
-            break;
-          }
-        } else {
-          if (obj->numBytes != mo->size &&
-              ((!(AllowSeedExtension || ZeroSeedExtension)
-                && obj->numBytes < mo->size) ||
-               (!AllowSeedTruncation && obj->numBytes > mo->size))) {
-	    std::stringstream msg;
-	    msg << "replace size mismatch: "
-		<< mo->name << "[" << mo->size << "]"
-		<< " vs " << obj->name << "[" << obj->numBytes << "]"
-		<< " in test\n";
+    // add by zgf to support automatic filled with zero
+    // each state has it own 'state.assignSeed'
+    std::vector<unsigned char> values(mo->size);
+    state.assignSeed.bindings[array] = values;
 
-            terminateStateOnUserError(state, msg.str());
-            break;
-          } else {
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
-            values.insert(values.begin(), obj->bytes, 
-                          obj->bytes + std::min(obj->numBytes, mo->size));
-            if (ZeroSeedExtension) {
-              for (unsigned i=obj->numBytes; i<mo->size; ++i)
-                values.push_back('\0');
-            }
-          }
-        }
-      }
-    }
   } else {
     ObjectState *os = bindObjectInState(state, mo, false);
     if (replayPosition >= replayKTest->numObjects) {
@@ -4400,17 +6502,18 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
 }
 
 /***/
-
 void Executor::runFunctionAsMain(Function *f,
-				 int argc,
-				 char **argv,
+				 int argc, //参数数量
+				 char **argv, //二维数组的每一维：   bc文件名加输入该bc文件的参数
 				 char **envp) {
-  std::vector<ref<Expr> > arguments;
+  //定义局部变量 创建Expr向量arguments
+  std::vector<ref<Expr> > arguments;// add yx: store arg info
 
   // force deterministic initialization of memory objects
   srand(1);
   srandom(1);
-  
+
+  //创建MemoryObject* argvMO, 为argv和envp参数分配空间并压到arguments中
   MemoryObject *argvMO = 0;
 
   // In order to make uclibc happy and be closer to what the system is
@@ -4422,13 +6525,15 @@ void Executor::runFunctionAsMain(Function *f,
   for (envc=0; envp[envc]; ++envc) ;
 
   unsigned NumPtrBytes = Context::get().getPointerWidth() / 8;
-  KFunction *kf = kmodule->functionMap[f];
+  KFunction *kf = kmodule->functionMap[f];//传过来的入口函数 mainFn
+
   assert(kf);
+  //f->arg_end() = f->arg_begin()+NumArgs 这里的NumArgs是函数f的参数，如果是main()默认里面有两个argc, argv[]。
   Function::arg_iterator ai = f->arg_begin(), ae = f->arg_end();
-  if (ai!=ae) {
-    arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));
-    if (++ai!=ae) {
-      Instruction *first = &*(f->begin()->begin());
+  if (ai!=ae) {//说明有多个参数
+    arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));//push是参数argc(参数数量)将参数的数量push进来
+    if (++ai!=ae) {//下一个不等于最后一个
+      Instruction *first = &*(f->begin()->begin());//bc文件转为可看的字节码后，一行行的子令
       argvMO =
           memory->allocate((argc + 1 + envc + 1 + 1) * NumPtrBytes,
                            /*isLocal=*/false, /*isGlobal=*/true,
@@ -4437,33 +6542,35 @@ void Executor::runFunctionAsMain(Function *f,
       if (!argvMO)
         klee_error("Could not allocate memory for function arguments");
 
-      arguments.push_back(argvMO->getBaseExpr());
+      arguments.push_back(argvMO->getBaseExpr());//这里push的是字令
 
       if (++ai!=ae) {
         uint64_t envp_start = argvMO->address + (argc+1)*NumPtrBytes;
         arguments.push_back(Expr::createPointer(envp_start));
 
-        if (++ai!=ae)
+        if (++ai!=ae)//到这里算是明白了，这里是分析入口函数main函数的参数 ai加了三次后，还没到ae，main函数希望的是0-3个参数
           klee_error("invalid main function (expect 0-3 arguments)");
       }
     }
   }
 
+  //创建ExecutionState *state实例  state 正在探索的路径
   ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
 
-  if (pathWriter) 
+  if (pathWriter) //完整的路径
     state->pathOS = pathWriter->open();
-  if (symPathWriter) 
+  if (symPathWriter) //符号化的路径
     state->symPathOS = symPathWriter->open();
-
 
   if (statsTracker)
     statsTracker->framePushed(*state, 0);
 
   assert(arguments.size() == f->arg_size() && "wrong number of arguments");
-  for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
-    bindArgument(kf, i, *state, arguments[i]);
+  for (unsigned i = 0, e = f->arg_size(); i != e; ++i)//->arg_size() main函数的参数的数量
+    //绑定参数调用点，将参数绑定到调用点上
+    bindArgument(kf, i, *state, arguments[i]);//kf klee包装后的函数指针
 
+  //进行一系列的内存分配操作
   if (argvMO) {
     ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
 
@@ -4493,10 +6600,11 @@ void Executor::runFunctionAsMain(Function *f,
   initializeGlobals(*state);
 
   processTree = std::make_unique<PTree>(state);
+  //run 核心
   run(*state);
   processTree = nullptr;
 
-  // hack to clear memory objects
+  // hack to clear memory objects//下面是各种释放
   delete memory;
   memory = new MemoryManager(NULL);
 
@@ -4551,7 +6659,33 @@ void Executor::getConstraintLog(const ExecutionState &state, std::string &res,
   }
 }
 
-bool Executor::getSymbolicSolution(const ExecutionState &state,
+/// add by zgf : more detail to see Executor.h
+bool Executor::getConcreteSymbolicSolution(const ExecutionState &state,
+                                   std::vector<
+                                   std::pair<std::string,
+                                   std::vector<unsigned char> > >
+                                   &res){
+  std::map<const Array*, std::vector<unsigned char> >
+      bindings = state.assignSeed.bindings;
+  std::map<const Array*, std::vector<unsigned char> >::iterator
+      binding_it = bindings.begin();
+  for (unsigned i = 0; i != state.symbolics.size(); ++i){
+    binding_it = bindings.begin();
+    for(; binding_it != bindings.end(); binding_it++){
+      if (binding_it->first->getName() == state.symbolics[i].first->name){
+        res.push_back(std::make_pair(state.symbolics[i].first->name,
+                                     binding_it->second));
+        break;
+      }
+    }
+    if(binding_it == bindings.end()) return false; // correspond value not found
+  }
+  return true;
+}
+
+// modify by zgf : this function not used,
+// it repalced by getConcreteSymbolicSolution in concrete mode
+bool Executor::getSymbolicSolution(ExecutionState &state,
                                    std::vector< 
                                    std::pair<std::string,
                                    std::vector<unsigned char> > >
@@ -4572,28 +6706,30 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
     bool mustBeTrue;
     // Attempt to bound byte to constraints held in cexPreferences
     bool success =
-      solver->mustBeTrue(extendedConstraints, Expr::createIsZero(pi),
-        mustBeTrue, state.queryMetaData);
+      solver->mustBeTrue(state, Expr::createIsZero(pi),
+        mustBeTrue, state.queryMetaData,false);
     // If it isn't possible to add the condition without making the entire list
     // UNSAT, then just continue to the next condition
     if (!success) break;
     // If the particular constraint operated on in this iteration through
     // the loop isn't implied then add it to the list of constraints.
-    if (!mustBeTrue)
-      cm.addConstraint(pi);
+    if (!mustBeTrue){
+      cm.addInitialConstraint(pi);
+    }
   }
 
   std::vector< std::vector<unsigned char> > values;
   std::vector<const Array*> objects;
   for (unsigned i = 0; i != state.symbolics.size(); ++i)
     objects.push_back(state.symbolics[i].second);
-  bool success = solver->getInitialValues(extendedConstraints, objects, values,
-                                          state.queryMetaData);
+  bool success = solver->getInitialValuesWithConstrintSet(extendedConstraints,
+                         objects, values,state.queryMetaData);
   solver->setTimeout(time::Span());
   if (!success) {
-    klee_warning("unable to compute initial values (invalid constraints?)!");
-    ExprPPrinter::printQuery(llvm::errs(), state.constraints,
-                             ConstantExpr::alloc(0, Expr::Bool));
+      // modify by zgf : don't print warning message
+//    klee_warning("unable to compute initial values (invalid constraints?)!");
+//    ExprPPrinter::printQuery(llvm::errs(), state.constraints,
+//                             ConstantExpr::alloc(0, Expr::Bool));
     return false;
   }
   
@@ -4793,9 +6929,11 @@ void Executor::dumpStates() {
   ::dumpStates = 0;
 }
 
-///
-
 Interpreter *Interpreter::create(LLVMContext &ctx, const InterpreterOptions &opts,
                                  InterpreterHandler *ih) {
-  return new Executor(ctx, opts, ih);
+  if (FPToIntTransfrom != ""){
+    SolverTypeDecision.setInitialValue(SolverType::SMT);
+    return new FP2IntExecutor(ctx, opts, ih);
+  }
+  return new FPExecutor(ctx, opts, ih);//浮點執行引擎
 }

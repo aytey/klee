@@ -140,6 +140,16 @@ public:
     }
   }
 
+  // add by zgf : add lower bound check in concreteMode to restrict value
+  ref<Expr> getLowerBoundsCheckOffset(ref<Expr> offset, unsigned bytes) const {
+    if (bytes<=size) {
+      return UltExpr::create(
+          ConstantExpr::alloc(0,Context::get().getPointerWidth()),offset);
+    } else {
+      return ConstantExpr::alloc(0, Expr::Bool);
+    }
+  }
+
   /// Compare this object with memory object b.
   /// \param b memory object to compare with
   /// \return <0 if this is smaller, 0 if both are equal, >0 if b is smaller
@@ -235,7 +245,7 @@ public:
     from the solver and puts them in the concreteStore.
   */
   void flushToConcreteStore(TimingSolver *solver,
-                            const ExecutionState &state) const;
+                            ExecutionState &state) const;
 
 private:
   const UpdateList &getUpdates() const;

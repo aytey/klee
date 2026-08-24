@@ -43,7 +43,7 @@ public:
   virtual void incPathsCompleted() = 0;
   virtual void incPathsExplored(std::uint32_t num = 1) = 0;
 
-  virtual void processTestCase(const ExecutionState &state,
+  virtual void processTestCase(ExecutionState &state,
                                const char *err,
                                const char *suffix) = 0;
 };
@@ -155,7 +155,7 @@ public:
                                 std::string &res,
                                 LogType logFormat = STP) = 0;
 
-  virtual bool getSymbolicSolution(const ExecutionState &state,
+  virtual bool getSymbolicSolution(ExecutionState &state,
                                    std::vector<
                                    std::pair<std::string,
                                    std::vector<unsigned char> > >
@@ -163,6 +163,11 @@ public:
 
   virtual void getCoveredLines(const ExecutionState &state,
                                std::map<const std::string*, std::set<unsigned> > &res) = 0;
+
+  // add by zgf : to get testCase using 'state.assignSeed', avoid using too many SMT solver
+  virtual bool getConcreteSymbolicSolution(
+      const ExecutionState &state,
+      std::vector<std::pair<std::string, std::vector<unsigned char>>> &res) = 0;
 };
 
 } // End klee namespace

@@ -176,3 +176,40 @@ klee::ConstraintSet::constraint_iterator ConstraintSet::end() const {
 size_t ConstraintSet::size() const noexcept { return constraints.size(); }
 
 void ConstraintSet::push_back(const ref<Expr> &e) { constraints.push_back(e); }
+
+// add by zgf : don't use simplify
+void ConstraintManager::addInitialConstraint(const ref<Expr> &e) {
+  // rewrite any known equalities and split Ands into different conjuncts
+  switch (e->getKind()) {
+  case Expr::Constant:
+    assert(cast<ConstantExpr>(e)->isTrue() &&
+           "attempt to add invalid (false) constraint");
+    break;
+
+  case Expr::And: {
+    BinaryExpr *be = cast<BinaryExpr>(e);
+    addInitialConstraint(be->left);
+    addInitialConstraint(be->right);
+    break;
+  }
+  case Expr::Eq: {
+    constraints.push_back(e);
+    break;
+  }
+  default:
+    constraints.push_back(e);
+    break;
+  }
+}
+
+void ConstraintSet::reverseLastConstraint(){
+  ref<Expr> lastConstraint = constraints.at(constraints.size()-1);
+  constraints.back() = Expr::createIsZero(lastConstraint);
+}
+
+void ConstraintSet::leftNConstraints(unsigned leftSize){
+  unsigned removeSize = constraints.size() - leftSize;
+  for (unsigned i = 0; i < removeSize ; i++)
+    constraints.pop_back();
+}
+

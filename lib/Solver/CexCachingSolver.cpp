@@ -229,8 +229,7 @@ bool CexCachingSolver::getAssignment(const Query& query, Assignment *&result) {
 
   std::vector< std::vector<unsigned char> > values;
   bool hasSolution;
-  if (!solver->impl->computeInitialValues(query, objects, values, 
-                                          hasSolution))
+  if (!solver->impl->computeInitialValues(query, objects, values, hasSolution))
     return false;
     
   Assignment *binding;

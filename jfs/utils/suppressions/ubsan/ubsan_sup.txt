@@ -1,0 +1,9 @@
+# Apparently `vptr` is incompatible with
+# `-fno-rtti` which we use. I guess this is
+# why UBSan complains. This suppression file
+# suppresses these warnings.
+vptr:gtest.cc
+vptr:gtest.h
+# We seem to get pointer alignment problems with libstdc++'s
+# std::shared_ptr<...>. Ignore for now.
+alignment:shared_ptr_base.h

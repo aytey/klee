@@ -64,7 +64,7 @@ cl::opt<bool> TrackInstructionTime(
     cl::cat(StatsCat));
 
 cl::opt<bool>
-    OutputStats("output-stats", cl::init(true),
+    OutputStats("output-stats", cl::init(false),
                 cl::desc("Write running stats trace file (default=true)"),
                 cl::cat(StatsCat));
 
@@ -115,6 +115,11 @@ cl::opt<bool> UseCallPaths("use-call-paths", cl::init(true),
                            cl::cat(StatsCat));
 
 } // namespace
+
+// add by zgf to support
+namespace klee{
+extern cl::opt<std::string> FPToIntTransfrom;
+}
 
 ///
 
@@ -207,7 +212,10 @@ StatsTracker::StatsTracker(Executor &_executor, std::string _objectFilename,
 
   for (auto &kfp : km->functions) {
     KFunction *kf = kfp.get();
-    kf->trackCoverage = 1;
+    kf->trackCoverage = true;
+    if (km->excludeFuncSet.find(kf->function->getName()) !=
+        km->excludeFuncSet.end())
+      kf->trackCoverage = false;
 
     for (unsigned i=0; i<kf->numInstructions; ++i) {
       KInstruction *ki = kf->instructions[i];
@@ -289,7 +297,8 @@ StatsTracker::StatsTracker(Executor &_executor, std::string _objectFilename,
   if (OutputIStats) {
     istatsFile = executor.interpreterHandler->openOutputFile("run.istats");
     if (istatsFile) {
-      if (iStatsWriteInterval)
+      // modify by zgf
+      if (iStatsWriteInterval  && FPToIntTransfrom.empty())
         executor.timers.add(std::make_unique<Timer>(iStatsWriteInterval, [&]{
           writeIStats();
         }));
@@ -320,7 +329,8 @@ void StatsTracker::done() {
   if (OutputIStats) {
     if (updateMinDistToUncovered)
       computeReachableUncovered();
-    if (istatsFile)
+    // modify by gf
+    if (istatsFile && FPToIntTransfrom.empty())
       writeIStats();
   }
 }
@@ -362,11 +372,11 @@ void StatsTracker::stepInstruction(ExecutionState &es) {
         //
         // FIXME: This trick no longer works, we should fix this in the line
         // number propogation.
-          es.coveredLines[&ii.file].insert(ii.line);
-	es.coveredNew = true;
+        es.coveredLines[&ii.file].insert(ii.line);
+	    es.coveredNew = true;
         es.instsSinceCovNew = 1;
-	++stats::coveredInstructions;
-	stats::uncoveredInstructions += (uint64_t)-1;
+	    ++stats::coveredInstructions;
+	    stats::uncoveredInstructions += (uint64_t)-1;
       }
     }
   }
@@ -375,8 +385,10 @@ void StatsTracker::stepInstruction(ExecutionState &es) {
       stats::instructions % StatsWriteAfterInstructions.getValue() == 0)
     writeStatsLine();
 
+  // modify by zgf
   if (istatsFile && IStatsWriteAfterInstructions &&
-      stats::instructions % IStatsWriteAfterInstructions.getValue() == 0)
+      stats::instructions % IStatsWriteAfterInstructions.getValue() == 0 &&
+      FPToIntTransfrom.empty())
     writeIStats();
 }
 
@@ -729,8 +741,6 @@ void StatsTracker::writeIStats() {
   
   of.flush();
 }
-
-///
 
 typedef std::map<Instruction*, std::vector<Function*> > calltargets_ty;
 

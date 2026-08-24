@@ -58,12 +58,12 @@ if (TARGET gtest)
     "prevents building unit tests in LLVM (but not in KLEE) and exporting the "
     "target to the build tree.")
 
-  if (GTEST_SRC_DIR)
-    message(FATAL_ERROR "Cannot use GTEST_SRC_DIR when target 'gtest' is"
-      "already defined.\n"
-      "Either reuse LLVM's Google Test setup by not setting GTEST_SRC_DIR or "
-      "choose one of the options to prevent LLVM from exporting this target.")
-  endif()
+#  if (GTEST_SRC_DIR)
+#    message(FATAL_ERROR "Cannot use GTEST_SRC_DIR when target 'gtest' is"
+#      "already defined.\n"
+#      "Either reuse LLVM's Google Test setup by not setting GTEST_SRC_DIR or "
+#      "choose one of the options to prevent LLVM from exporting this target.")
+#  endif()
 
   # check if it's really LLVM that exports the 'gtest' target
   list(FIND LLVM_EXPORTED_TARGETS "gtest" _GTEST_INDEX)

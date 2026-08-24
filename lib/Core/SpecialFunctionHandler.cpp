@@ -27,12 +27,14 @@
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Support/OptionCategories.h"
 
+#include "CoreStats.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 
 #include <errno.h>
+#include <klee/klee.h>
 #include <sstream>
 
 using namespace llvm;
@@ -146,6 +148,33 @@ static SpecialFunctionHandler::HandlerInfo handlerInfo[] = {
   add("__ubsan_handle_mul_overflow", handleMulOverflow, false),
   add("__ubsan_handle_divrem_overflow", handleDivRemOverflow, false),
 
+  // add by zgf to support : float classification instrinsics
+  add("klee_is_nan_float", handleIsNaN, true),
+  add("klee_is_nan_double", handleIsNaN, true),
+  add("klee_is_nan_long_double", handleIsNaN, true),
+  add("klee_is_infinite_float", handleIsInfinite, true),
+  add("klee_is_infinite_double", handleIsInfinite, true),
+  add("klee_is_infinite_long_double", handleIsInfinite, true),
+  add("klee_is_normal_float", handleIsNormal, true),
+  add("klee_is_normal_double", handleIsNormal, true),
+  add("klee_is_normal_long_double", handleIsNormal, true),
+  add("klee_is_subnormal_float", handleIsSubnormal, true),
+  add("klee_is_subnormal_double", handleIsSubnormal, true),
+  add("klee_is_subnormal_long_double", handleIsSubnormal, true),
+  // Rounding mode intrinsics
+  add("klee_get_rounding_mode", handleGetRoundingMode, true),
+  add("klee_set_rounding_mode_internal", handleSetConcreteRoundingMode,
+      false),
+  // square root
+  add("klee_sqrt_float", handleSqrt, true),
+  add("klee_sqrt_double", handleSqrt, true),
+    // FIXME: Guard based on target
+  add("klee_sqrt_long_double", handleSqrt, true),
+  // floating point absolute
+  add("klee_abs_float", handleFAbs, true),
+  add("klee_abs_double", handleFAbs, true),
+    // FIXME: Guard based on target
+  add("klee_abs_long_double", handleFAbs, true),
 #undef addDNR
 #undef add
 };
@@ -438,7 +467,7 @@ void SpecialFunctionHandler::handleMemalign(ExecutionState &state,
   }
 
   std::pair<ref<Expr>, ref<Expr>> alignmentRangeExpr =
-      executor.solver->getRange(state.constraints, arguments[0],
+      executor.solver->getRange(state, arguments[0],
                                 state.queryMetaData);
   ref<Expr> alignmentExpr = alignmentRangeExpr.first;
   auto alignmentConstExpr = dyn_cast<ConstantExpr>(alignmentExpr);
@@ -507,21 +536,89 @@ void SpecialFunctionHandler::handleAssume(ExecutionState &state,
   
   if (e->getWidth() != Expr::Bool)
     e = NeExpr::create(e, ConstantExpr::create(0, e->getWidth()));
-  
-  bool res;
-  bool success __attribute__((unused)) = executor.solver->mustBeFalse(
-      state.constraints, e, res, state.queryMetaData);
-  assert(success && "FIXME: Unhandled solver failure");
-  if (res) {
+
+  state.addConstraint(e);
+  std::vector< std::vector<unsigned char> > values;
+  std::vector<const Array*> objects;
+  for (unsigned i = 0; i != state.symbolics.size(); ++i)
+    objects.push_back(state.symbolics[i].second);
+
+  bool success = executor.solver->getInitialValues(state, objects, values,
+                                          state.queryMetaData);
+  if (!success) {
     if (SilentKleeAssume) {
       executor.terminateState(state);
     } else {
       executor.terminateStateOnUserError(
           state, "invalid klee_assume call (provably false)");
     }
-  } else {
-    executor.addConstraint(state, e);
+  }else{
+    state.assignSeed = Assignment(objects, values,true);
   }
+
+  // Note by zgf : The models write by KLEE have a variable
+  // named 'model-version'. This 'model-version' is a symbolic value,
+  // it's corrent concrete value is 1. However, in concrete mode,
+  // we set all concrete value to 0. it may cause path number increase !
+  // So the best solution is that : don't use seed to compute Assume.
+//  bool res;
+//  bool success __attribute__((unused)) = executor.solver->mustBeFalse(
+//      state, e, res, state.queryMetaData,false);
+//  assert(success && "FIXME: Unhandled solver failure");
+//  if (res) {
+//    // only if current state is not in 'Complex Function', we can fork
+//    if (!state.CFLabel){
+//      state.addInitialConstraint(e);
+//      ExecutionState *otherState = state.copyConcrete();
+//      ++stats::forks;
+//      otherState->reverseLastConstraint();
+//      executor.addedStates.push_back(otherState);
+//      executor.processTree->attach(state.ptreeNode,
+//                                   otherState,&state,
+//                                   BranchType::NONE);
+//    }
+//
+//    if (SilentKleeAssume) {
+//      executor.terminateState(state);
+//    } else {
+//      executor.terminateStateOnUserError(
+//          state, "invalid klee_assume call (provably false)");
+//    }
+//  } else {
+//    // add by zgf : we don't care 'model_version' assume in concreteMode,
+//    // if we find this assume is about 'model_version', skip it!
+//    std::vector<ref<ReadExpr>> readExpr;
+//    findReads(e,false,readExpr);
+//    for (auto const &exp : readExpr)
+//      if (exp->updates.root->name == "model_version")
+//        return ;
+//
+//    // note by zgf : if 'mustBeFalse' is false, means current state maybe true,
+//    // however, this expr solving don't using 'state.assignSeed', although
+//    // current state passes klee_assume(), state's concrete values maybe invalid.
+//    // So we using 'state.assignSeed' to check again, ensure current state is
+//    // satisfied this condition which is created in klee_assume, otherwise we can
+//    // fork state with correct constraints to get satisfied value.
+//
+//    executor.solver->mustBeTrue(state,e,res,state.queryMetaData);
+//    if (res)
+//      executor.addConstraint(state, e);
+//    else{
+//      // only if current state is not in 'Complex Function', we can fork
+//      if (!state.CFLabel){
+//        state.addInitialConstraint(e);
+//        ExecutionState *otherState = state.copyConcrete();
+//        ++stats::forks;
+//        executor.addedStates.push_back(otherState);
+//        executor.processTree->attach(state.ptreeNode,otherState,&state,
+//                                     BranchType::NONE);
+//      }
+//
+//      // kill this state
+//      executor.terminateStateOnUserError(
+//          state, "invalid klee_assume call (provably false)");
+//    }
+//  }
 }
 
 void SpecialFunctionHandler::handleIsSymbolic(ExecutionState &state,
@@ -617,10 +714,10 @@ void SpecialFunctionHandler::handlePrintRange(ExecutionState &state,
     // FIXME: Pull into a unique value method?
     ref<ConstantExpr> value;
     bool success __attribute__((unused)) = executor.solver->getValue(
-        state.constraints, arguments[1], value, state.queryMetaData);
+        state, arguments[1], value, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     bool res;
-    success = executor.solver->mustBeTrue(state.constraints,
+    success = executor.solver->mustBeTrue(state,
                                           EqExpr::create(arguments[1], value),
                                           res, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
@@ -629,7 +726,7 @@ void SpecialFunctionHandler::handlePrintRange(ExecutionState &state,
     } else { 
       llvm::errs() << " ~= " << value;
       std::pair<ref<Expr>, ref<Expr>> res = executor.solver->getRange(
-          state.constraints, arguments[1], state.queryMetaData);
+          state, arguments[1], state.queryMetaData);
       llvm::errs() << " (in [" << res.first << ", " << res.second <<"])";
     }
   }
@@ -716,10 +813,11 @@ void SpecialFunctionHandler::handleRealloc(ExecutionState &state,
   ref<Expr> size = arguments[1];
 
   Executor::StatePair zeroSize =
-      executor.fork(state, Expr::createIsZero(size), true, BranchType::Realloc);
+      executor.fork(state, Expr::createIsZero(size),
+                    true, BranchType::Realloc);
 
   if (zeroSize.first) { // size == 0
-    executor.executeFree(*zeroSize.first, address, target);   
+    executor.executeFree(*zeroSize.first, address, target);
   }
   if (zeroSize.second) { // size != 0
     Executor::StatePair zeroPointer =
@@ -728,14 +826,14 @@ void SpecialFunctionHandler::handleRealloc(ExecutionState &state,
 
     if (zeroPointer.first) { // address == 0
       executor.executeAlloc(*zeroPointer.first, size, false, target);
-    } 
+    }
     if (zeroPointer.second) { // address != 0
       Executor::ExactResolutionList rl;
       executor.resolveExact(*zeroPointer.second, address, rl, "realloc");
-      
-      for (Executor::ExactResolutionList::iterator it = rl.begin(), 
+
+      for (Executor::ExactResolutionList::iterator it = rl.begin(),
              ie = rl.end(); it != ie; ++it) {
-        executor.executeAlloc(*it->second, size, false, target, false, 
+        executor.executeAlloc(*it->second, size, false, target, false,
                               it->first.second);
       }
     }
@@ -847,7 +945,7 @@ void SpecialFunctionHandler::handleMakeSymbolic(ExecutionState &state,
     // FIXME: Type coercion should be done consistently somewhere.
     bool res;
     bool success __attribute__((unused)) = executor.solver->mustBeTrue(
-        s->constraints,
+        *s,
         EqExpr::create(
             ZExtExpr::create(arguments[1], Context::get().getPointerWidth()),
             mo->getSizeExpr()),
@@ -905,4 +1003,123 @@ void SpecialFunctionHandler::handleDivRemOverflow(
     std::vector<ref<Expr>> &arguments) {
   executor.terminateStateOnError(state, "overflow on division or remainder",
                                  StateTerminationType::Overflow);
+}
+
+// add by zgf to support floating point
+void SpecialFunctionHandler::handleIsNaN(ExecutionState &state,
+                                         KInstruction *target,
+                                         std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to IsNaN");
+  ref<Expr> result = IsNaNExpr::create(arguments[0]);
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleIsInfinite(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to IsInfinite");
+  ref<Expr> result = IsInfiniteExpr::create(arguments[0]);
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleIsNormal(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to IsNormal");
+  ref<Expr> result = IsNormalExpr::create(arguments[0]);
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleIsSubnormal(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to IsSubnormal");
+  ref<Expr> result = IsSubnormalExpr::create(arguments[0]);
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleGetRoundingMode(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 0 &&
+         "invalid number of arguments to GetRoundingMode");
+  unsigned returnValue = 0;
+  switch (state.roundingMode) {
+  case llvm::APFloat::rmNearestTiesToEven:
+    returnValue = KLEE_FP_RNE;
+    break;
+  case llvm::APFloat::rmNearestTiesToAway:
+    returnValue = KLEE_FP_RNA;
+    break;
+  case llvm::APFloat::rmTowardPositive:
+    returnValue = KLEE_FP_RU;
+    break;
+  case llvm::APFloat::rmTowardNegative:
+    returnValue = KLEE_FP_RD;
+    break;
+  case llvm::APFloat::rmTowardZero:
+    returnValue = KLEE_FP_RZ;
+    break;
+  default:
+    // FIXME: Emit warning
+    returnValue = KLEE_FP_UNKNOWN;
+  }
+  // FIXME: The width is fragile. It's dependent on what the compiler
+  // choose to be the width of the enum.
+  ref<Expr> result = ConstantExpr::create(returnValue, Expr::Int32);
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleSetConcreteRoundingMode(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 &&
+         "invalid number of arguments to SetRoundingMode");
+  llvm::APFloat::roundingMode newRoundingMode = llvm::APFloat::rmNearestTiesToEven;
+  ref<Expr> roundingModeArg = arguments[0];
+  if (!isa<ConstantExpr>(roundingModeArg)) {
+    executor.terminateStateOnError(state, "argument should be concrete",
+                                   StateTerminationType::User);
+    return;
+  }
+  const ConstantExpr* CE = dyn_cast<ConstantExpr>(roundingModeArg);
+  switch (CE->getZExtValue()) {
+  case KLEE_FP_RNE:
+    newRoundingMode = llvm::APFloat::rmNearestTiesToEven;
+    break;
+  case KLEE_FP_RNA:
+    newRoundingMode = llvm::APFloat::rmNearestTiesToAway;
+    break;
+  case KLEE_FP_RU:
+    newRoundingMode = llvm::APFloat::rmTowardPositive;
+    break;
+  case KLEE_FP_RD:
+    newRoundingMode = llvm::APFloat::rmTowardNegative;
+    break;
+  case KLEE_FP_RZ:
+    newRoundingMode = llvm::APFloat::rmTowardZero;
+    break;
+  default:
+    executor.terminateStateOnError(state, "Invalid rounding mode",
+                                   StateTerminationType::User);
+    return;
+  }
+  state.roundingMode = newRoundingMode;
+}
+
+void SpecialFunctionHandler::handleSqrt(ExecutionState &state,
+                                        KInstruction *target,
+                                        std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to sqrt");
+  ref<Expr> result = FSqrtExpr::create(arguments[0], state.roundingMode);
+
+  executor.bindLocal(target, state, result);
+}
+
+void SpecialFunctionHandler::handleFAbs(ExecutionState &state,
+                                        KInstruction *target,
+                                        std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to fabs");
+  ref<Expr> result = FAbsExpr::create(arguments[0]);
+  executor.bindLocal(target, state, result);
 }

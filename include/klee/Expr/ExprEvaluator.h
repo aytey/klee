@@ -26,9 +26,36 @@ namespace klee {
     Action visitURem(const URemExpr &e);
     Action visitSRem(const SRemExpr &e);
     Action visitExprPost(const Expr& e);
+
       
   public:
     ExprEvaluator() {}
+
+    /// getInitialValue - Return the initial value for a symbolic byte.
+    ///
+    /// This will only be called for constant arrays if the index is
+    /// out-of-bounds. If the value is unknown then the user should return a
+    /// ReadExpr at the initial version of this array.
+    virtual ref<Expr> getInitialValue(const Array& os, unsigned index) = 0;
+  };
+
+  // add by zgf : to evaluate 'SFC'
+  class SFCExprEvaluator : public SFCExprVisitor {
+  protected:
+    Action evalRead(const UpdateList &ul, unsigned index);
+    Action visitRead(const ReadExpr &re);
+    Action visitExpr(const Expr &e);
+
+    Action protectedDivOperation(const BinaryExpr &e);
+    Action visitUDiv(const UDivExpr &e);
+    Action visitSDiv(const SDivExpr &e);
+    Action visitURem(const URemExpr &e);
+    Action visitSRem(const SRemExpr &e);
+    Action visitExprPost(const Expr& e);
+
+
+  public:
+    SFCExprEvaluator() {}
 
     /// getInitialValue - Return the initial value for a symbolic byte.
     ///

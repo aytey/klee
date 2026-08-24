@@ -158,8 +158,56 @@ extern "C" {
 
   /* Get errno value of the current state */
   int klee_get_errno(void);
+
+// add by zgf to support float point
+#ifdef __cplusplus
+#define KLEE_BOOL_TYPE bool
+#else
+#define KLEE_BOOL_TYPE _Bool
+#endif
+  KLEE_BOOL_TYPE klee_is_nan_float(float f);
+  KLEE_BOOL_TYPE klee_is_nan_double(double d);
+  KLEE_BOOL_TYPE klee_is_infinite_float(float f);
+  KLEE_BOOL_TYPE klee_is_infinite_double(double d);
+  KLEE_BOOL_TYPE klee_is_normal_float(float f);
+  KLEE_BOOL_TYPE klee_is_normal_double(double d);
+  KLEE_BOOL_TYPE klee_is_subnormal_float(float f);
+  KLEE_BOOL_TYPE klee_is_subnormal_double(double d);
+#if defined(__x86_64__) || defined(__i386__)
+  KLEE_BOOL_TYPE klee_is_nan_long_double(long double f);
+  KLEE_BOOL_TYPE klee_is_infinite_long_double(long double d);
+  KLEE_BOOL_TYPE klee_is_normal_long_double(long double d);
+  KLEE_BOOL_TYPE klee_is_subnormal_long_double(long double f);
+#endif
+
+#undef KLEE_BOOL_TYPE
 #ifdef __cplusplus
 }
+#endif
+
+enum KleeRoundingMode {
+  KLEE_FP_RNE = 0, // Round to nearest ties to even.
+  KLEE_FP_RNA,
+  KLEE_FP_RU,
+  KLEE_FP_RD,
+  KLEE_FP_RZ,
+  KLEE_FP_UNKNOWN
+};
+
+void klee_set_rounding_mode(enum KleeRoundingMode rm);
+enum KleeRoundingMode klee_get_rounding_mode();
+
+int klee_internal_finitef(float f);
+int klee_internal_finite(double f);
+int klee_internal_finitel(long double f);
+
+float klee_sqrt_float(float f);
+double klee_sqrt_double(double d);
+float klee_abs_float(float);
+double klee_abs_double(double);
+#if defined(__x86_64__) || defined(__i386__)
+long double klee_sqrt_long_double(long double d);
+long double klee_abs_long_double(long double);
 #endif
 
 #endif /* KLEE_H */

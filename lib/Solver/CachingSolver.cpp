@@ -80,8 +80,7 @@ public:
                             std::vector< std::vector<unsigned char> > &values,
                             bool &hasSolution) {
     ++stats::queryCacheMisses;
-    return solver->impl->computeInitialValues(query, objects, values, 
-                                              hasSolution);
+    return solver->impl->computeInitialValues(query, objects, values,hasSolution);
   }
   SolverRunStatus getOperationStatusCode();
   char *getConstraintLog(const Query&);

@@ -14,7 +14,6 @@ cmake_minimum_required(VERSION 3.5.0)
 if (POLICY CMP0054)
   cmake_policy(SET CMP0054 NEW)
 endif()
-
 if (POLICY CMP0042)
   # Enable `MACOSX_RPATH` by default.
   cmake_policy(SET CMP0042 NEW)
@@ -24,6 +23,46 @@ if (POLICY CMP0037)
   # Disallow reserved target names
   cmake_policy(SET CMP0037 NEW)
 endif()
+
+# add by zgf
+set(LLVM_CONFIG_BINARY /home/aaa/fp-solver/llvm-6/install/bin/llvm-config)
+set(ENABLE_SOLVER_Z3 ON)
+set(ENABLE_KLEE_UCLIBC ON)
+set(ENABLE_POSIX_RUNTIME ON)
+set(ENABLE_KLEE_EH_CXX OFF)
+set(ENABLE_SOLVER_STP OFF)
+set(ENABLE_UNIT_TESTS OFF)
+set(ENABLE_SYSTEM_TESTS OFF)
+set(KLEE_UCLIBC_PATH /home/aaa/fp-solver/klee-uclibc)
+#set(Z3_DIR /home/aaa/fp-solver/z3-4.6.2/install)
+#set(Z3_INCLUDE_DIRS /home/aaa/fp-solver/z3-4.6.2/install/include)
+#set(Z3_LIBRARIES /home/aaa/fp-solver/z3-4.6.2/install/lib/libz3.so)
+set(Z3_DIR /home/aaa/fp-solver/z3-4.13.0/install)
+set(Z3_INCLUDE_DIRS /home/aaa/fp-solver/z3-4.13.0/install/include)
+set(Z3_LIBRARIES /home/aaa/fp-solver/z3-4.13.0/install/lib/libz3.so)
+
+set(NLOPT_LIBRARIES /home/aaa/fp-solver/nlopt/build/libnlopt.so)
+set(NLOPT_INCLUDE_DIRS /home/aaa/fp-solver/nlopt/install/include)
+set(json-c_INCLUDE_DIR /home/aaa/fp-solver/json-c/install/include)
+set(json-c_LIBRARIES /home/aaa/fp-solver/json-c/install/lib/libjson-c.so)
+set(GMP_INCLUDE_DIRS /usr/local/include)
+set(GMP_LIBRARIES /usr/local/lib/libgmp.so)
+set(GMPxx_LIBRARIES /usr/local/lib/libgmpxx.so)
+
+##add by yx
+set(GOSAT_INCLUDE_DIRS /home/aaa/fp-solver/gosat/src)
+set(GOSAT_LIBRARIES /home/aaa/fp-solver/gosat/build/libGOSAT.so)
+set(Bitwuzla_INCLUDE_DIRS /home/aaa/fp-solver/bitwuzla/install/include)
+set(Bitwuzla_LIBRARIES /home/aaa/fp-solver/bitwuzla/install/lib/libbitwuzla.so)
+#set(BitwuzlaMain_LIBRARIES /home/aaa/fp-solver/bitwuzla/build/src/CMakeFiles/bitwuzla-bin.dir/bzlamain.c.o)
+#set(Boolector_INCLUDE_DIRS /home/aaa/fp-solver/boolector/src)
+#set(Boolector_LIBRARIES /home/aaa/fp-solver/boolector/build/lib/libboolector.so)
+set(MathSAT5_LIBRARIES /home/aaa/fp-solver/mathsat-5.6.11/lib/libmathsat.so)
+set(MathSAT5_INCLUDE_DIRS /home/aaa/fp-solver/mathsat-5.6.11/include)
+#set(Yices_INCLUDE_DIRS /home/aaa/fp-solver/yices2/install/include)
+#set(Yices_LIBRARIES /home/aaa/fp-solver/yices2/install/lib/libyices.so)
+set(CVC5_LIBRARIES /home/aaa/fp-solver/cvc5/install/lib/libcvc5.so)
+set(CVC5_INCLUDE_DIRS /home/aaa/fp-solver/cvc5/install/include)
 
 # This overrides the default flags for the different CMAKE_BUILD_TYPEs
 set(CMAKE_USER_MAKE_RULES_OVERRIDE_C
@@ -241,7 +280,7 @@ endif()
 ################################################################################
 # C++ version
 ################################################################################
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ################################################################################
@@ -275,7 +314,8 @@ if (NOT LLVM_ENABLE_EH)
   if (ENABLE_SOLVER_METASMT)
     message(WARNING "Not disabling exceptions because metaSMT uses them")
   else()
-    klee_component_add_cxx_flag("-fno-exceptions" REQUIRED)
+    #klee_component_add_cxx_flag("-fno-exceptions" REQUIRED)
+    klee_component_add_cxx_flag("-fexceptions" REQUIRED)
   endif()
 endif()
 
@@ -291,6 +331,18 @@ if (NOT LLVM_ENABLE_RTTI)
   else()
     klee_component_add_cxx_flag("-fno-rtti" REQUIRED)
   endif()
+endif()
+
+################################################################################
+# Add by zgf : Support for Dreal
+################################################################################
+find_package(DREAL REQUIRED)
+if (DREAL_FOUND)
+  #include_directories(${DREAL_INCLUDE_DIRS})
+  #link_directories(${DREAL_LIBRARY_DIRS})
+  #add_definitions(${DREAL_DEFINITIONS})
+else()
+  message(FATAL_ERROR "DREAL not found, please install" )
 endif()
 
 ################################################################################
@@ -518,11 +570,11 @@ endif()
 ################################################################################
 # KLEE uclibc support
 ################################################################################
-option(ENABLE_KLEE_UCLIBC "Enable support for klee-uclibc" OFF)
+option(ENABLE_KLEE_UCLIBC "Enable support for klee-uclibc" ON)
 if (ENABLE_KLEE_UCLIBC)
   message(STATUS "klee-uclibc support enabled")
   set(SUPPORT_KLEE_UCLIBC 1) # For config.h
-  set(KLEE_UCLIBC_PATH "" CACHE PATH "Path to klee-uclibc root directory")
+  #set(KLEE_UCLIBC_PATH "" CACHE PATH "Path to klee-uclibc root directory")
   if (NOT IS_DIRECTORY "${KLEE_UCLIBC_PATH}")
     message(FATAL_ERROR
       "KLEE_UCLIBC_PATH (\"${KLEE_UCLIBC_PATH}\") is not a valid directory.\n"
@@ -563,7 +615,7 @@ if (ENABLE_KLEE_LIBCXX)
   if (NOT EXISTS "${KLEE_LIBCXX_DIR}")
     message(FATAL_ERROR
       "KLEE_LIBCXX_DIR (\"${KLEE_LIBCXX_DIR}\") does not exist.\n"
-      "Try passing -DKLEE_LIBCXX_DIR=<path> to CMake where <path> is the path"
+      "Try passing -DKLEE_LIBCXX_DIR=<path> to CMake where <path> is the path "
       "to the directory containing the libc++ shared object file (as bitcode).")
   endif()
 
@@ -661,6 +713,11 @@ endforeach()
 unset(_flags)
 
 ################################################################################
+# add by zgf : support JFS / GOSAT
+################################################################################
+add_subdirectory(jfs)
+
+################################################################################
 # Generate `config.h`
 ################################################################################
 configure_file(${CMAKE_SOURCE_DIR}/include/klee/Config/config.h.cmin
@@ -725,7 +782,7 @@ add_subdirectory(tools)
 # Testing
 ################################################################################
 option(ENABLE_UNIT_TESTS "Enable unit tests" OFF)
-option(ENABLE_SYSTEM_TESTS "Enable system tests" ON)
+option(ENABLE_SYSTEM_TESTS "Enable system tests" OFF)
 
 if (ENABLE_UNIT_TESTS OR ENABLE_SYSTEM_TESTS)
   message(STATUS "Testing is enabled")
@@ -787,7 +844,7 @@ endif()
 ################################################################################
 # Documentation
 ################################################################################
-option(ENABLE_DOCS "Enable building documentation" ON)
+option(ENABLE_DOCS "Enable building documentation" OFF)
 if (ENABLE_DOCS)
   add_subdirectory(docs)
 endif()
@@ -812,3 +869,5 @@ add_custom_target(uninstall
   COMMENT "Uninstalling..."
   VERBATIM
 )
+
+

@@ -104,9 +104,15 @@ namespace klee {
     // Functions which are part of KLEE runtime
     std::set<const llvm::Function*> internalFunctions;
 
+    // add by zgf
+    std::set<std::string> excludeFuncSet;
+
   private:
     // Mark function with functionName as part of the KLEE runtime
     void addInternalFunction(const char* functionName);
+
+    // add by zgf to support float point function replace
+    void replaceFunctionIfPresent(const char *original,const char *replacement);
 
   public:
     KModule() = default;
@@ -123,7 +129,8 @@ namespace klee {
     /// @param forceSourceOutput true if assembly.ll should be created
     ///
     // FIXME: ihandler should not be here
-    void manifest(InterpreterHandler *ih, bool forceSourceOutput);
+    void manifest(InterpreterHandler *ih,
+                  bool forceSourceOutput);
 
     /// Link the provided modules together as one KLEE module.
     ///

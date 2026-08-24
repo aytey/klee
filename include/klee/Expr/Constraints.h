@@ -40,6 +40,14 @@ public:
     return constraints == b.constraints;
   }
 
+  // add by zgf : when forking the concre constraint,
+  // new state need to get the opposite constraint
+  void reverseLastConstraint();
+
+  // add by zgf : remove constraints collected in 'complex function',
+  // only left constraints which are collected before 'CF'
+  void leftNConstraints(unsigned leftSize);
+
 private:
   constraints_ty constraints;
 };
@@ -64,6 +72,9 @@ public:
   /// \param constraint
   void addConstraint(const ref<Expr> &constraint);
 
+  // add by zgf : inorder to recond accurancy constraint, don't use simpify
+  void addInitialConstraint(const ref<Expr> &constraint);
+
 private:
   /// Rewrite set of constraints using the visitor
   /// \param visitor constraint rewriter
@@ -72,7 +83,6 @@ private:
 
   /// Add constraint to the set of constraints
   void addConstraintInternal(const ref<Expr> &constraint);
-
   ConstraintSet &constraints;
 };
 
