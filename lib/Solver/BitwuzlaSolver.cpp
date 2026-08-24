@@ -87,12 +87,41 @@ void BitwuzlaSolver::setCoreSolverTimeout(time::Span timeout) {
 }
 
 std::string BitwuzlaSolverImpl::getConstraintLog(const Query &query) {
-  // Bitwuzla can print an SMT-LIB representation of a term, but assembling a
-  // whole benchmark is not something KLEE needs from this backend; the Z3 and
-  // STP backends remain available for query logging.
-  klee_warning_once(
-      0, "getConstraintLog() is not supported by the Bitwuzla backend");
-  return "";
+  // Build the same assertion set internalRunSolver() would, then let Bitwuzla
+  // print it. bitwuzla_print_formula() emits SMT-LIB v2 and renders floating
+  // point through the `fp` operator, so an FP query comes out faithfully.
+  BitwuzlaOptions *options = bitwuzla_options_new();
+  Bitwuzla *bzla = bitwuzla_new(builder->tm, options);
+
+  for (const auto &constraint : query.constraints)
+    bitwuzla_assert(bzla, builder->construct(constraint));
+
+  // KLEE queries ask about validity; the solver is asked satisfiability of the
+  // negation, and that is what is worth logging.
+  BitwuzlaTermHandle queryTerm = builder->construct(query.expr);
+  bitwuzla_assert(bzla, BitwuzlaTermHandle(bitwuzla_mk_term1(
+                            builder->tm, BITWUZLA_KIND_NOT, queryTerm)));
+
+  std::string result;
+  char *buffer = NULL;
+  size_t length = 0;
+  if (FILE *stream = open_memstream(&buffer, &length)) {
+    // Base 10 for bit-vector values; 16 silently downgrades floating-point
+    // components to binary, so there is nothing to gain from it here.
+    bitwuzla_print_formula(bzla, "smt2", stream, 10);
+    fclose(stream);
+    if (buffer) {
+      result.assign(buffer, length);
+      free(buffer);
+    }
+  } else {
+    klee_warning("Failed to open memory stream for Bitwuzla constraint log");
+  }
+
+  bitwuzla_delete(bzla);
+  bitwuzla_options_delete(options);
+  builder->clearConstructCache();
+  return result;
 }
 
 bool BitwuzlaSolverImpl::computeTruth(const Query &query, bool &isValid) {
