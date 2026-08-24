@@ -208,6 +208,14 @@ std::string STPSolverImpl::getConstraintLog(const Query &query) {
   assert(query.expr == ConstantExpr::alloc(0, Expr::Bool) &&
          "Unexpected expression in query!");
 
+  // Assert any side constraints generated while translating. This has to come
+  // after everything else has been constructed so that every side constraint
+  // the query needs exists. Currently these pin the x87 fp80 explicit
+  // significand integer bit -- see STPBuilder::castToFloat().
+  for (ExprHandle &sideConstraint : builder->sideConstraints)
+    vc_assertFormula(vc, sideConstraint);
+  builder->clearSideConstraints();
+
   char *buffer;
   unsigned long length;
   vc_printQueryStateToBuffer(vc, builder->getFalse(), &buffer, &length, false);
@@ -392,6 +400,14 @@ bool STPSolverImpl::computeInitialValues(
   ++stats::queryCounterexamples;
 
   ExprHandle stp_e = builder->construct(query.expr);
+
+  // Assert any side constraints generated while translating. This has to come
+  // after everything else has been constructed so that every side constraint
+  // the query needs exists. Currently these pin the x87 fp80 explicit
+  // significand integer bit -- see STPBuilder::castToFloat().
+  for (ExprHandle &sideConstraint : builder->sideConstraints)
+    vc_assertFormula(vc, sideConstraint);
+  builder->clearSideConstraints();
 
   if (DebugDumpSTPQueries) {
     char *buf;
