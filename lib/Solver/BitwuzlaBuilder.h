@@ -173,6 +173,18 @@ public:
   void clearSideConstraints() {
     sideConstraints.clear();
     floatToBitVectorVars.clear();
+    // Bitwuzla has no fp.to_ieee_bv, so castToBitVector() mints a *fresh
+    // variable* and ties it to the float with a side constraint. Any cached
+    // term that embeds one of those variables therefore becomes meaningless
+    // the moment the side constraints are dropped -- reusing it in a later
+    // query leaves the variable completely unconstrained, and the model comes
+    // back satisfying nothing. Update-node expressions are exactly that: a
+    // store of a float's bytes into an array. So they have to go too.
+    //
+    // The Z3 and STP builders do not need this: both have a real
+    // float-to-bitvector operation, so their casts are functions of the
+    // original term rather than new variables.
+    _arr_hash.clearUpdates();
   }
 };
 }

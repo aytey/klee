@@ -121,6 +121,9 @@ std::string BitwuzlaSolverImpl::getConstraintLog(const Query &query) {
   bitwuzla_delete(bzla);
   bitwuzla_options_delete(options);
   builder->clearConstructCache();
+  // Building the log generates side constraints exactly as a real query does;
+  // leaving them behind would assert them against the next one.
+  builder->clearSideConstraints();
   return result;
 }
 
