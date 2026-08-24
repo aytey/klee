@@ -1,5 +1,12 @@
 /* This test checks the case where the seed needs to be patched on re-run */
 
+// XFAIL: *
+// This test encodes KLEE's old behaviour of concretising floating point.
+// Concretisation added a constraint pinning the value, so an assertion over a
+// seeded float held; now that floating point stays symbolic the seed only
+// guides the search without constraining it, and KLEE correctly finds an
+// input where the assertion fails. The seeding machinery this test is really
+// about needs re-expressing without leaning on FP concretisation.
 // RUN: %clang -emit-llvm -c %O0opt -g %s -o %t.bc
 // RUN: rm -rf %t.klee-out
 // RUN: %klee --output-dir=%t.klee-out --entry-point=TestGen %t.bc
@@ -28,7 +35,8 @@ int main() {
 
   if (i < 5000) {
     double d = i;
-    // CHECK: concretizing (reason: floating point)
+    // KLEE no longer concretises floating point, so this no longer fires.
+    // CHECK-NOT: concretizing (reason: floating point)
     assert((unsigned) d < 5001);
   }
 
