@@ -22,6 +22,8 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #endif // LLVM_VERSION_MAJOR
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
@@ -37,6 +39,25 @@ class Type;
 } // namespace llvm
 
 namespace klee {
+
+/// A debug location for an instruction a pass has just created.
+///
+/// LLVM's verifier rejects a call in a function that has debug info unless the
+/// call carries a !dbg location, and KModule runs the verifier before
+/// execution. Instructions synthesised by a pass have no source line to point
+/// at, so fall back to line 0 in the enclosing function's scope, which is what
+/// LLVM's own inliner uses for the same situation.
+inline llvm::DebugLoc getInsertedCallDebugLoc(llvm::Instruction *at) {
+  if (llvm::DebugLoc dl = at->getDebugLoc())
+    return dl;
+  llvm::Function *f = at->getFunction();
+  if (!f)
+    return llvm::DebugLoc();
+  llvm::DISubprogram *sp = f->getSubprogram();
+  if (!sp)
+    return llvm::DebugLoc();
+  return llvm::DILocation::get(f->getContext(), /*line=*/0, /*column=*/0, sp);
+}
 
 /// RaiseAsmPass - This pass raises some common occurences of inline
 /// asm which are used by glibc into normal LLVM IR.

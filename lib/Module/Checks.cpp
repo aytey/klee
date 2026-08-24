@@ -37,26 +37,6 @@ DISABLE_WARNING_POP
 using namespace llvm;
 using namespace klee;
 
-namespace {
-/// A call inserted into a function that carries debug info must have a !dbg
-/// location or the verifier rejects the module. Optimised builds often leave
-/// the instruction being checked without one, so fall back to a line-0
-/// location in the function's own scope -- the usual idiom for code the
-/// compiler introduced rather than the user writing it.
-llvm::DebugLoc getInsertedCallDebugLoc(llvm::Instruction *at) {
-  if (llvm::DebugLoc dl = at->getDebugLoc())
-    return dl;
-  llvm::Function *f = at->getFunction();
-  if (!f)
-    return llvm::DebugLoc();
-  llvm::DISubprogram *sp = f->getSubprogram();
-  if (!sp)
-    return llvm::DebugLoc();
-  return llvm::DILocation::get(f->getContext(), /*line=*/0, /*column=*/0, sp);
-}
-} // namespace
-
-
 char DivCheckPass::ID;
 
 bool DivCheckPass::runOnModule(Module &M) {

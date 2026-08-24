@@ -419,10 +419,23 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
       case Intrinsic::stackrestore:
       case Intrinsic::stacksave:
       case Intrinsic::trunc:
-      case Intrinsic::var_annotation:
+      case Intrinsic::var_annotation: {
+        // LowerIntrinsicCall builds the replacement instructions without
+        // copying the debug location off the intrinsic it replaces, so
+        // lowering e.g. llvm.floor to a call to floor() in a module built with
+        // -g produces a call with no !dbg -- which the verifier KModule runs
+        // before execution rejects. Stamp the new instructions ourselves.
+        const DebugLoc dl = getInsertedCallDebugLoc(ii);
+        Instruction *prev = ii->getPrevNode();
+        Instruction *stop = (i == ie) ? nullptr : &*i;
         IL->LowerIntrinsicCall(ii);
+        for (Instruction *n = prev ? prev->getNextNode() : &b.front();
+             n && n != stop; n = n->getNextNode())
+          if (!n->getDebugLoc())
+            n->setDebugLoc(dl);
         dirty = true;
         break;
+      }
 
 #ifdef SUPPORT_KLEE_EH_CXX
       case Intrinsic::eh_typeid_for: {
