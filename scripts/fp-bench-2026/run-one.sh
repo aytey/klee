@@ -39,6 +39,12 @@ HARD=${FP_BENCH_HARD_TIMEOUT:-150}
 # so each of these must be a build with exactly one enabled. Empty value => use
 # whatever KLEE was linked against.
 STP_stp_LIB=${STP_LIB:-}
+# Since --stp-sat-solver gained CaDiCaL, a build no longer has to carry exactly
+# one SAT backend: KLEE names the one it wants. Two builds still, because
+# CryptoMiniSat installs its own older cadical/cadical.hpp whose -I precedes
+# STP's staged one, so lib/Sat/Cadical.cpp will not compile with both enabled.
+STP_CMS_LIB=${STP_CMS_LIB:-$ROOT/deps/install-stp-master-cms/lib64}
+STP_CAD_LIB=${STP_CAD_LIB:-$ROOT/deps/install-stp-master-cadical/lib64}
 STP_stp_minisat_LIB=${STP_MINISAT_LIB:-}
 STP_stp_cadical2_LIB=${STP_CADICAL2_LIB:-}
 STP_stp_cadical3_LIB=${STP_CADICAL3_LIB:-}
@@ -115,6 +121,44 @@ case $CFG in
                  EXTRA="--stp-bv-abstraction-width=24 --stp-bv-abstraction-value-divisor=8" ;;
   stp-new-abs33-rate) BACKEND=stp; LIB=$STP_stp_new_LIB; SONAME=libstp.so.2.4
                  EXTRA="--stp-bv-abstraction-width=33 --stp-bv-abstraction-value-divisor=8" ;;
+  # --- SAT backend, everything else at its default -------------------------
+  sat-minisat)   BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat" ;;
+  sat-simple)    BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=simpleminisat" ;;
+  sat-cmsat)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=cryptominisat" ;;
+  sat-cadical)   BACKEND=stp; LIB=$STP_CAD_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=cadical" ;;
+  # The control: MiniSat out of the other build. Same solver, same STP commit,
+  # so any gap here is the build and bounds what the rest can be read to.
+  sat-minisatB)  BACKEND=stp; LIB=$STP_CAD_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat" ;;
+
+  # --- abstraction x incremental, at MiniSat -------------------------------
+  # Each axis has been measured alone; what is missing is whether they
+  # interact. The incremental driver hands the SAT solver a formula the batch
+  # simplification never saw, and the abstraction changes what that formula is,
+  # so there is no reason to assume they compose.
+  ax-off-batch)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat" ;;
+  ax-off-inc)    BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-incremental-engage-at=1" ;;
+  ax-off-adapt)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+  ax-33-batch)   BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=33" ;;
+  ax-33-inc)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=33 --stp-incremental-engage-at=1" ;;
+  ax-33-adapt)   BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=33 --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+  ax-53-batch)   BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=53" ;;
+  ax-53-inc)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=53 --stp-incremental-engage-at=1" ;;
+  ax-53-adapt)   BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --stp-bv-abstraction-width=53 --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+
   stp-cadical2)  BACKEND=stp; LIB=$STP_stp_cadical2_LIB; SONAME=libstp.so.2.4 ;;
   stp-cadical3)  BACKEND=stp; LIB=$STP_stp_cadical3_LIB; SONAME=libstp.so.2.4 ;;
   stp-cmsat)     BACKEND=stp; LIB=$STP_stp_cmsat_LIB;    SONAME=libstp.so.2.4 ;;

@@ -126,6 +126,36 @@ llvm::cl::opt<int> STPCNFEffort(
                    "very high (default=-1, leave STP's own default alone)"),
     llvm::cl::cat(klee::SolvingCat));
 
+// STP replaces a wide bit-vector operation by free result bits and pins them
+// lazily, refining only where a candidate model contradicts the operands
+// underneath. Off in STP and off here, because what it is worth depends
+// entirely on the width floor: too high and it engages on nothing, too low and
+// it abstracts operations whose exact encoding was cheaper than the rounds
+// spent avoiding it.
+//
+// The klee-float branch measures this both ways and the answer turns on the
+// operand widths in the workload. On a corpus of hard binary32 queries --
+// abstracted multiplies 24 to 33 bits wide -- it is a large win. On fp-bench it
+// costs 24-27%, and the whole loss is ten benchmarks whose products are
+// binary64 and x87 significands, 53 and 64 bits. GSL is almost entirely
+// double, so this suite sits on the losing side of that split; measuring it is
+// the point.
+llvm::cl::opt<unsigned> STPBVAbstractionWidth(
+    "stp-bv-abstraction-width", llvm::cl::init(0),
+    llvm::cl::desc("Operand width at or above which STP abstracts bit-vector "
+                   "operations and refines them by CEGAR (default=0, off)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// What one blocking lemma rules out is one operand pair out of 2^(2W), so
+// STP's flat allowance means something quite different at 24 bits and at 64.
+// A nonzero divisor here makes the allowance width/divisor instead.
+llvm::cl::opt<unsigned> STPBVAbstractionValueDivisor(
+    "stp-bv-abstraction-value-divisor", llvm::cl::init(0),
+    llvm::cl::desc("Scale STP's blocking-lemma allowance with the operand "
+                   "width, as width/divisor (default=0, use STP's flat "
+                   "allowance)"),
+    llvm::cl::cat(klee::SolvingCat));
+
 llvm::cl::opt<bool> DebugSTPPhaseTiming(
     "debug-stp-phase-timing", llvm::cl::init(false),
     llvm::cl::desc("Report per-query build/assert and solve times for STP "
@@ -217,6 +247,16 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
                          STPAdaptIncremental
                              ? 0
                              : STPIncrementalEngageAt.getValue());
+
+  if (STPBVAbstractionWidth > 0) {
+    vc_setInterfaceFlags(vc, BV_ABSTRACTION_WIDTH,
+                         (int)STPBVAbstractionWidth.getValue());
+    vc_setInterfaceFlags(vc, BV_EQ_ABSTRACTION, 1);
+    vc_setInterfaceFlags(vc, BV_TERM_ABSTRACTION, 1);
+    if (STPBVAbstractionValueDivisor > 0)
+      vc_setInterfaceFlags(vc, BV_TERM_ABSTRACTION_VALUE_DIVISOR,
+                           (int)STPBVAbstractionValueDivisor.getValue());
+  }
 
   if (STPPieceRewriting)
     vc_setInterfaceFlags(vc, INCREMENTAL_PIECE_REWRITING, 1);
