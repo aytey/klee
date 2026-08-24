@@ -16,6 +16,7 @@ add_library(kleaverExpr
   AssignmentGenerator.cpp
   Constraints.cpp
   ExprBuilder.cpp
+  FindArrayAckermannizationVisitor.cpp
   Expr.cpp
   ExprEvaluator.cpp
   ExprPPrinter.cpp

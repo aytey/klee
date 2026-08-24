@@ -63,6 +63,8 @@ void custom_z3_error_handler(Z3_context ctx, Z3_error_code ec) {
 
 Z3ArrayExprHash::~Z3ArrayExprHash() {}
 
+void Z3ArrayExprHash::clearUpdates() { _update_node_hash.clear(); }
+
 void Z3ArrayExprHash::clear() {
   _update_node_hash.clear();
   _array_hash.clear();
@@ -95,6 +97,7 @@ Z3Builder::~Z3Builder() {
   // Clear caches so exprs/sorts gets freed before the destroying context
   // they aren associated with.
   clearConstructCache();
+  clearReplacements();
   _arr_hash.clear();
   constant_array_assertions.clear();
   Z3_del_context(ctx);
@@ -760,7 +763,35 @@ Z3ASTHandle Z3Builder::getRoundingModeSort(llvm::APFloat::roundingMode rm) {
   }
 }
 
+Z3ASTHandle Z3Builder::getFreshBitVectorVariable(unsigned bitWidth,
+                                                 const char *prefix) {
+  return Z3ASTHandle(Z3_mk_fresh_const(ctx, prefix, getBvSort(bitWidth)), ctx);
+}
+
+bool Z3Builder::addReplacementExpr(const ref<Expr> e, Z3ASTHandle replacement) {
+  std::pair<ExprHashMap<Z3ASTHandle>::iterator, bool> result =
+      replaceWithExpr.insert(std::make_pair(e, replacement));
+  return result.second;
+}
+
+void Z3Builder::clearReplacements() {
+  // The cached update expressions may refer to replacement variables, so they
+  // have to go too.
+  // FIXME: Try to find a way to avoid clearing everything.
+  _arr_hash.clearUpdates();
+  replaceWithExpr.clear();
+}
+
 Z3ASTHandle Z3Builder::construct(ref<Expr> e, int *width_out) {
+  // An ackermannised region is substituted wholesale, so check before doing
+  // any work on the expression itself.
+  ExprHashMap<Z3ASTHandle>::iterator replIt = replaceWithExpr.find(e);
+  if (replIt != replaceWithExpr.end()) {
+    if (width_out)
+      *width_out = e->getWidth();
+    return replIt->second;
+  }
+
   // TODO: We could potentially use Z3_simplify() here
   // to store simpler expressions.
   if (!UseConstructHashZ3 || isa<ConstantExpr>(e)) {

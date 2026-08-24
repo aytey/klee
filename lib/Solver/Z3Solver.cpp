@@ -22,6 +22,7 @@
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/ExprUtil.h"
+#include "klee/Expr/FindArrayAckermannizationVisitor.h"
 #include "klee/Solver/Solver.h"
 #include "klee/Solver/SolverImpl.h"
 #include "llvm/Support/CommandLine.h"
@@ -40,6 +41,13 @@ llvm::cl::opt<std::string> Z3LogInteractionFile(
 llvm::cl::opt<std::string> Z3QueryDumpFile(
     "debug-z3-dump-queries", llvm::cl::init(""),
     llvm::cl::desc("Dump Z3's representation of the query to the specified path"),
+    llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::opt<bool> Z3AckermannizeArrays(
+    "z3-array-ackermannize", llvm::cl::init(true),
+    llvm::cl::desc("Replace contiguous runs of reads from an array with a "
+                   "single bitvector variable before building Z3 queries "
+                   "(default=true)"),
     llvm::cl::cat(klee::SolvingCat));
 
 llvm::cl::opt<bool> Z3ValidateModels(
@@ -94,11 +102,22 @@ public:
                             const std::vector<const Array *> &objects,
                             std::vector<std::vector<unsigned char>> &values,
                             bool &hasSolution) override;
+  /// Find contiguous runs of array reads in the query and substitute a fresh
+  /// bitvector variable for each, so the solver never sees the array theory
+  /// for them. FP programs read a float or double as 4 or 8 adjacent bytes,
+  /// which is exactly the shape this helps with.
+  void ackermannizeArrays(
+      const Query &query, FindArrayAckermannizationVisitor &faav,
+      std::map<const ArrayAckermannizationInfo *, Z3ASTHandle> &replacements);
+
   SolverRunStatus
   handleSolverResponse(::Z3_solver theSolver, ::Z3_lbool satisfiable,
                        const std::vector<const Array *> *objects,
                        std::vector<std::vector<unsigned char>> *values,
-                       bool &hasSolution);
+                       bool &hasSolution,
+                       FindArrayAckermannizationVisitor &faav,
+                       std::map<const ArrayAckermannizationInfo *,
+                                Z3ASTHandle> &replacements);
   SolverRunStatus getOperationStatusCode() override;
 };
 
@@ -253,6 +272,14 @@ bool Z3SolverImpl::internalRunSolver(
     std::vector<std::vector<unsigned char> > *values, bool &hasSolution) {
 
   TimerStatIncrementer t(stats::queryTime);
+
+  // Ackermannise before anything is constructed, so that construct() sees the
+  // replacements.
+  FindArrayAckermannizationVisitor faav(/*recursive=*/false);
+  std::map<const ArrayAckermannizationInfo *, Z3ASTHandle> arrayReplacements;
+  if (Z3AckermannizeArrays)
+    ackermannizeArrays(query, faav, arrayReplacements);
+
   // NOTE: Z3 will switch to using a slower solver internally if push/pop are
   // used so for now it is likely that creating a new solver each time is the
   // right way to go until Z3 changes its behaviour.
@@ -319,7 +346,7 @@ bool Z3SolverImpl::internalRunSolver(
 
   ::Z3_lbool satisfiable = Z3_solver_check(builder->ctx, theSolver);
   runStatusCode = handleSolverResponse(theSolver, satisfiable, objects, values,
-                                       hasSolution);
+                                       hasSolution, faav, arrayReplacements);
 
   Z3_solver_dec_ref(builder->ctx, theSolver);
   // Clear the builder's cache to prevent memory usage exploding.
@@ -329,6 +356,8 @@ bool Z3SolverImpl::internalRunSolver(
   // ``builder->construct()``.
   builder->clearConstructCache();
   builder->clearSideConstraints();
+  if (Z3AckermannizeArrays)
+    builder->clearReplacements();
 
   if (runStatusCode == SolverImpl::SOLVER_RUN_STATUS_SUCCESS_SOLVABLE ||
       runStatusCode == SolverImpl::SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE) {
@@ -345,10 +374,40 @@ bool Z3SolverImpl::internalRunSolver(
   return false; // failed
 }
 
+void Z3SolverImpl::ackermannizeArrays(
+    const Query &query, FindArrayAckermannizationVisitor &faav,
+    std::map<const ArrayAckermannizationInfo *, Z3ASTHandle> &replacements) {
+  for (const auto &constraint : query.constraints)
+    faav.visit(constraint);
+  faav.visit(query.expr);
+
+  for (auto &entry : faav.ackermannizationInfo) {
+    for (auto &info : entry.second) {
+      assert(!info.toReplace.empty());
+      std::string name;
+      llvm::raw_string_ostream os(name);
+      os << info.getArray()->name << "_ack";
+
+      Z3ASTHandle replacementVar;
+      for (const ref<Expr> &toReplace : info.toReplace) {
+        if (Z3_ast(replacementVar) == NULL)
+          replacementVar = builder->getFreshBitVectorVariable(
+              toReplace->getWidth(), os.str().c_str());
+        bool success = builder->addReplacementExpr(toReplace, replacementVar);
+        assert(success && "Failed to add replacement variable");
+        (void)success;
+      }
+      replacements[&info] = replacementVar;
+    }
+  }
+}
+
 SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
     ::Z3_solver theSolver, ::Z3_lbool satisfiable,
     const std::vector<const Array *> *objects,
-    std::vector<std::vector<unsigned char> > *values, bool &hasSolution) {
+    std::vector<std::vector<unsigned char> > *values, bool &hasSolution,
+    FindArrayAckermannizationVisitor &faav,
+    std::map<const ArrayAckermannizationInfo *, Z3ASTHandle> &replacements) {
   switch (satisfiable) {
   case Z3_L_TRUE: {
     hasSolution = true;
@@ -368,11 +427,43 @@ SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
       const Array *array = *it;
       std::vector<unsigned char> data;
 
+      // If this array was ackermannised, its bytes have to be read back out
+      // of the replacement variables rather than out of the array.
+      const std::vector<ArrayAckermannizationInfo> *aais = NULL;
+      auto aaii = faav.ackermannizationInfo.find(array);
+      if (aaii != faav.ackermannizationInfo.end())
+        aais = &(aaii->second);
+
       data.reserve(array->size);
       for (unsigned offset = 0; offset < array->size; offset++) {
         // We can't use Z3ASTHandle here so have to do ref counting manually
         ::Z3_ast arrayElementExpr;
-        Z3ASTHandle initial_read = builder->getInitialRead(array, offset);
+        Z3ASTHandle initial_read = Z3ASTHandle();
+
+        if (aais && !aais->empty()) {
+          for (const ArrayAckermannizationInfo &info : *aais) {
+            if (!info.containsByte(offset))
+              continue;
+            Z3ASTHandle replacementVariable = replacements[&info];
+            assert((offset * 8) >= info.contiguousLSBitIndex);
+            unsigned bitOffset = (offset * 8) - info.contiguousLSBitIndex;
+            assert(bitOffset < info.getWidth());
+            initial_read = Z3ASTHandle(
+                Z3_mk_extract(builder->ctx, /*high=*/bitOffset + 7,
+                              /*low=*/bitOffset, replacementVariable),
+                builder->ctx);
+            break;
+          }
+          if (Z3_ast(initial_read) == NULL) {
+            // The array was ackermannised but this byte was not part of any
+            // replaced region, which means the query never read it. Its value
+            // is unconstrained, so anything will do.
+            data.push_back(0);
+            continue;
+          }
+        } else {
+          initial_read = builder->getInitialRead(array, offset);
+        }
 
         __attribute__((unused))
         bool successfulEval =

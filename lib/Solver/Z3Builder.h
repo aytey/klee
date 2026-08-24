@@ -99,11 +99,20 @@ public:
   Z3ArrayExprHash(){};
   virtual ~Z3ArrayExprHash();
   void clear();
+  /// Drop only the cached update-node expressions, keeping the array
+  /// expressions. Needed when replacement variables are cleared, since a
+  /// cached update may refer to one.
+  void clearUpdates();
 };
 
 class Z3Builder {
   friend class Z3SolverImpl;
   ExprHashMap<std::pair<Z3ASTHandle, unsigned> > constructed;
+
+  /// Expressions to substitute for during construction. Used by array
+  /// ackermannisation, which replaces a contiguous run of reads from an array
+  /// with a single fresh bitvector variable.
+  ExprHashMap<Z3ASTHandle> replaceWithExpr;
 
   // Constraints generated while translating into Z3's language, which the
   // client has to assert alongside the query itself.  Used for the x87 fp80
@@ -203,6 +212,15 @@ public:
   }
 
   void clearConstructCache() { constructed.clear(); }
+
+  /// Create a fresh bitvector variable of the given width.
+  Z3ASTHandle getFreshBitVectorVariable(unsigned bitWidth, const char *prefix);
+
+  /// Substitute \p replacement wherever \p e appears. Cleared by
+  /// clearReplacements(). Returns true if the replacement was recorded.
+  bool addReplacementExpr(const ref<Expr> e, Z3ASTHandle replacement);
+
+  void clearReplacements();
   void clearSideConstraints() { sideConstraints.clear(); }
 };
 }
