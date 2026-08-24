@@ -158,8 +158,53 @@ extern "C" {
 
   /* Get errno value of the current state */
   int klee_get_errno(void);
+
+  /* Floating point classification. These are used instead of libm's macros so
+   * that classifying a symbolic float builds a predicate rather than forking on
+   * the bit pattern. */
+#ifdef __cplusplus
+#define KLEE_BOOL_TYPE bool
+#else
+#define KLEE_BOOL_TYPE _Bool
+#endif
+  KLEE_BOOL_TYPE klee_is_nan_float(float f);
+  KLEE_BOOL_TYPE klee_is_nan_double(double d);
+  KLEE_BOOL_TYPE klee_is_infinite_float(float f);
+  KLEE_BOOL_TYPE klee_is_infinite_double(double d);
+  KLEE_BOOL_TYPE klee_is_normal_float(float f);
+  KLEE_BOOL_TYPE klee_is_normal_double(double d);
+  KLEE_BOOL_TYPE klee_is_subnormal_float(float f);
+  KLEE_BOOL_TYPE klee_is_subnormal_double(double d);
+#if defined(__x86_64__) || defined(__i386__)
+  KLEE_BOOL_TYPE klee_is_nan_long_double(long double d);
+  KLEE_BOOL_TYPE klee_is_infinite_long_double(long double d);
+  KLEE_BOOL_TYPE klee_is_normal_long_double(long double d);
+  KLEE_BOOL_TYPE klee_is_subnormal_long_double(long double f);
+#endif
+#undef KLEE_BOOL_TYPE
 #ifdef __cplusplus
 }
+#endif
+
+enum KleeRoundingMode {
+  KLEE_FP_RNE = 0, /* Round to nearest, ties to even. */
+  KLEE_FP_RNA,     /* Round to nearest, ties away from zero. */
+  KLEE_FP_RU,      /* Round toward +inf. */
+  KLEE_FP_RD,      /* Round toward -inf. */
+  KLEE_FP_RZ,      /* Round toward zero. */
+  KLEE_FP_UNKNOWN
+};
+
+void klee_set_rounding_mode(enum KleeRoundingMode rm);
+enum KleeRoundingMode klee_get_rounding_mode(void);
+
+float klee_sqrt_float(float f);
+double klee_sqrt_double(double d);
+float klee_abs_float(float f);
+double klee_abs_double(double d);
+#if defined(__x86_64__) || defined(__i386__)
+long double klee_sqrt_long_double(long double d);
+long double klee_abs_long_double(long double d);
 #endif
 
 #endif /* KLEE_H */

@@ -81,6 +81,14 @@ namespace klee {
     HANDLER(handleAssert);
     HANDLER(handleAssertFail);
     HANDLER(handleAssume);
+    HANDLER(handleIsNaN);
+    HANDLER(handleIsInfinite);
+    HANDLER(handleIsNormal);
+    HANDLER(handleIsSubnormal);
+    HANDLER(handleGetRoundingMode);
+    HANDLER(handleSetConcreteRoundingMode);
+    HANDLER(handleSqrt);
+    HANDLER(handleFAbs);
     HANDLER(handleCalloc);
     HANDLER(handleCheckMemoryAccess);
     HANDLER(handleDefineFixedObject);

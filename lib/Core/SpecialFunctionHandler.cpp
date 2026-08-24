@@ -25,6 +25,7 @@
 #include "klee/Support/Casting.h"
 #include "klee/Support/Debug.h"
 #include "klee/Support/ErrorHandling.h"
+#include "klee/klee.h"
 #include "klee/Support/OptionCategories.h"
 
 #include "klee/Support/CompilerWarning.h"
@@ -92,6 +93,36 @@ static constexpr std::array handlerInfo = {
   add("calloc", handleCalloc, true),
   add("free", handleFree, false),
   add("klee_assume", handleAssume, false),
+
+  // Floating point classification. Distinct names per width so the runtime can
+  // dispatch without relying on libm's type-generic macros, which fork.
+  add("klee_is_nan_float", handleIsNaN, true),
+  add("klee_is_nan_double", handleIsNaN, true),
+  add("klee_is_infinite_float", handleIsInfinite, true),
+  add("klee_is_infinite_double", handleIsInfinite, true),
+  add("klee_is_normal_float", handleIsNormal, true),
+  add("klee_is_normal_double", handleIsNormal, true),
+  add("klee_is_subnormal_float", handleIsSubnormal, true),
+  add("klee_is_subnormal_double", handleIsSubnormal, true),
+#if defined(__x86_64__) || defined(__i386__)
+  add("klee_is_nan_long_double", handleIsNaN, true),
+  add("klee_is_infinite_long_double", handleIsInfinite, true),
+  add("klee_is_normal_long_double", handleIsNormal, true),
+  add("klee_is_subnormal_long_double", handleIsSubnormal, true),
+#endif
+
+  add("klee_get_rounding_mode", handleGetRoundingMode, true),
+  add("klee_set_rounding_mode_internal", handleSetConcreteRoundingMode, false),
+
+  add("klee_sqrt_float", handleSqrt, true),
+  add("klee_sqrt_double", handleSqrt, true),
+  add("klee_abs_float", handleFAbs, true),
+  add("klee_abs_double", handleFAbs, true),
+#if defined(__x86_64__) || defined(__i386__)
+  add("klee_sqrt_long_double", handleSqrt, true),
+  add("klee_abs_long_double", handleFAbs, true),
+#endif
+
   add("klee_check_memory_access", handleCheckMemoryAccess, false),
   add("klee_get_valuef", handleGetValue, true),
   add("klee_get_valued", handleGetValue, true),
@@ -840,4 +871,101 @@ void SpecialFunctionHandler::handleMarkGlobal(ExecutionState &state,
     assert(!mo->isLocal);
     mo->isGlobal = true;
   }
+}
+
+/*** Floating point ***/
+
+#define FP_PRED_HANDLER(_name, _exprClass)                                     \
+  void SpecialFunctionHandler::handle##_name(                                  \
+      ExecutionState &state, KInstruction *target,                             \
+      std::vector<ref<Expr> > &arguments) {                                    \
+    assert(arguments.size() == 1 &&                                            \
+           "invalid number of arguments to " #_name);                          \
+    executor.bindLocal(target, state, _exprClass::create(arguments[0]));       \
+  }
+FP_PRED_HANDLER(IsNaN, IsNaNExpr)
+FP_PRED_HANDLER(IsInfinite, IsInfiniteExpr)
+FP_PRED_HANDLER(IsNormal, IsNormalExpr)
+FP_PRED_HANDLER(IsSubnormal, IsSubnormalExpr)
+#undef FP_PRED_HANDLER
+
+void SpecialFunctionHandler::handleSqrt(ExecutionState &state,
+                                        KInstruction *target,
+                                        std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to sqrt");
+  executor.bindLocal(target, state,
+                     FSqrtExpr::create(arguments[0], state.roundingMode));
+}
+
+void SpecialFunctionHandler::handleFAbs(ExecutionState &state,
+                                        KInstruction *target,
+                                        std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 && "invalid number of arguments to fabs");
+  executor.bindLocal(target, state, FAbsExpr::create(arguments[0]));
+}
+
+void SpecialFunctionHandler::handleGetRoundingMode(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.empty() && "invalid number of arguments to "
+                              "klee_get_rounding_mode");
+  unsigned returnValue = 0;
+  switch (state.roundingMode) {
+  case llvm::APFloat::rmNearestTiesToEven:
+    returnValue = KLEE_FP_RNE;
+    break;
+  case llvm::APFloat::rmNearestTiesToAway:
+    returnValue = KLEE_FP_RNA;
+    break;
+  case llvm::APFloat::rmTowardPositive:
+    returnValue = KLEE_FP_RU;
+    break;
+  case llvm::APFloat::rmTowardNegative:
+    returnValue = KLEE_FP_RD;
+    break;
+  case llvm::APFloat::rmTowardZero:
+    returnValue = KLEE_FP_RZ;
+    break;
+  default:
+    returnValue = KLEE_FP_UNKNOWN;
+  }
+  // FIXME: The width is fragile -- it depends on what the compiler picked for
+  // the width of enum KleeRoundingMode.
+  executor.bindLocal(target, state,
+                     ConstantExpr::create(returnValue, Expr::Int32));
+}
+
+void SpecialFunctionHandler::handleSetConcreteRoundingMode(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 1 &&
+         "invalid number of arguments to klee_set_rounding_mode_internal");
+  ConstantExpr *CE = dyn_cast<ConstantExpr>(arguments[0]);
+  if (!CE) {
+    executor.terminateStateOnUserError(
+        state, "klee_set_rounding_mode requires a concrete argument");
+    return;
+  }
+  llvm::APFloat::roundingMode newRoundingMode;
+  switch (CE->getZExtValue()) {
+  case KLEE_FP_RNE:
+    newRoundingMode = llvm::APFloat::rmNearestTiesToEven;
+    break;
+  case KLEE_FP_RNA:
+    newRoundingMode = llvm::APFloat::rmNearestTiesToAway;
+    break;
+  case KLEE_FP_RU:
+    newRoundingMode = llvm::APFloat::rmTowardPositive;
+    break;
+  case KLEE_FP_RD:
+    newRoundingMode = llvm::APFloat::rmTowardNegative;
+    break;
+  case KLEE_FP_RZ:
+    newRoundingMode = llvm::APFloat::rmTowardZero;
+    break;
+  default:
+    executor.terminateStateOnUserError(state, "Invalid rounding mode");
+    return;
+  }
+  state.roundingMode = newRoundingMode;
 }

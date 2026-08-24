@@ -1721,22 +1721,32 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       break;
     }
     case Intrinsic::fabs: {
-      ref<ConstantExpr> arg =
-          toConstant(state, arguments[0], "floating point");
+      ref<Expr> arg = arguments[0];
       if (!fpWidthToSemantics(arg->getWidth()))
         return terminateStateOnExecError(
             state, "Unsupported intrinsic llvm.fabs call");
+      // Stays symbolic: clang lowers isinf(), signbit() and friends through
+      // llvm.fabs, so concretising here would quietly collapse those paths.
+      bindLocal(ki, state, FAbsExpr::create(arg));
+      break;
+    }
 
-      llvm::APFloat Res(*fpWidthToSemantics(arg->getWidth()),
-                        arg->getAPValue());
-      Res = llvm::abs(Res);
-
-      bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    case Intrinsic::sqrt: {
+      ref<Expr> arg = arguments[0];
+      if (!fpWidthToSemantics(arg->getWidth()))
+        return terminateStateOnExecError(
+            state, "Unsupported intrinsic llvm.sqrt call");
+      bindLocal(ki, state, FSqrtExpr::create(arg, state.roundingMode));
       break;
     }
 
     case Intrinsic::fma:
     case Intrinsic::fmuladd: {
+      // NOTE: These still concretise their operands. A fused multiply-add
+      // rounds once, so it is *not* FAdd(FMul(a, b), c) and cannot be built
+      // from the Exprs we have; expressing it needs an FMA Expr kind and
+      // support in each solver builder. toConstant() warns when it fires.
+      //
       // Both fma and fmuladd support float, double and fp80.  Note, that fp80
       // is not mentioned in the documentation of fmuladd, nevertheless, it is
       // still supported.  For details see

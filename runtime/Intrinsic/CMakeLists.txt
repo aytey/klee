@@ -10,15 +10,20 @@
 set(LIB_PREFIX "RuntimeIntrinsic")
 set(SRC_FILES
         dso_handle.c
+        fabs.c
+        fenv.c
+        fpclassify.c
         klee_choose.c
         klee_div_zero_check.c
         klee_int.c
         klee_is_replay.c
         klee_overshift_check.c
         klee_range.c
+        klee_set_rounding_mode.c
+        sqrt.c
         )
 
 # Build it
 include("${CMAKE_SOURCE_DIR}/cmake/compile_bitcode_library.cmake")
 prefix_with_path("${SRC_FILES}" "${CMAKE_CURRENT_SOURCE_DIR}/" prefixed_files)
-add_bitcode_library_targets("${LIB_PREFIX}" "${prefixed_files}" "-std=gnu89" "")
+add_bitcode_library_targets("${LIB_PREFIX}" "${prefixed_files}" "-std=gnu11" "")
