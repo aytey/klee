@@ -2,11 +2,17 @@
 
 // XFAIL: *
 // This test encodes KLEE's old behaviour of concretising floating point.
-// Concretisation added a constraint pinning the value, so an assertion over a
-// seeded float held; now that floating point stays symbolic the seed only
-// guides the search without constraining it, and KLEE correctly finds an
-// input where the assertion fails. The seeding machinery this test is really
-// about needs re-expressing without leaning on FP concretisation.
+//
+// toConstant() did not merely pick a value, it added a constraint pinning it:
+// the baseline finishes seeding with one state, in which i == 12345678, so the
+// assertion below cannot fail. With floating point symbolic that constraint is
+// never added, i stays unconstrained, and KLEE finds i == 0 -- a genuine
+// counterexample to (unsigned)(double)i == 12345678.
+//
+// The seeding machinery itself is unaffected and still fully exercised here:
+// i is still seeded to 12345678 and j is still explored both ways. It is only
+// the assertion, which held because concretisation narrowed the state space,
+// that no longer means anything.
 // RUN: %clang -emit-llvm -c %O0opt -g %s -o %t.bc
 // RUN: rm -rf %t.klee-out
 // RUN: %klee --output-dir=%t.klee-out --entry-point=TestGen %t.bc

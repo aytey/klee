@@ -100,13 +100,27 @@ tests needing the `tabulate` Python package; `LargeReturnTypes`,
 environment reasons.
 
 Three upstream tests are marked `XFAIL`: `SeedConcretizeFP.c`,
-`SeedConcretizeExtendFP.c` and `SeedExtension.c` assert that KLEE concretises
-floating point, and lean on the constraint that concretisation adds to make an
-assertion over a seeded float hold. With floating point symbolic the seed guides
-the search without constraining it, so KLEE correctly finds an input where the
-assertion fails. They are marked rather than weakened so the change stays
-visible; the seeding behaviour they are really about wants re-expressing without
-that lever.
+`SeedConcretizeExtendFP.c` and `SeedExtension.c`.
+
+`toConstant()` did not merely pick a value for a float, it added a constraint
+pinning it. Measured on `SeedExtension.c`: the baseline finishes seeding with
+**one** state, in which `i == 12345678`, and reports `silently concretizing
+(reason: floating point) ... to value 12345678`. The assertion
+`(unsigned)(double)i == 12345678` therefore cannot fail. With floating point
+symbolic that constraint is never added, seeding finishes with **two** states,
+and KLEE finds `i == 0` — a genuine counterexample.
+
+It is worth being precise about what did *not* change, because the obvious
+reading is wrong: this is not seeding losing its grip. Seeding is unaffected and
+still fully exercised — `i` is still seeded to 12345678 and `j` is still
+explored both ways, exactly as in the baseline. Nor is it a bad `SIToFP`/`FPToUI`
+round trip: with `i` genuinely constrained to 12345678 the assertion holds in one
+path on all three backends. What changed is only that concretisation used to
+narrow the state space as a side effect, and these assertions held because of
+that.
+
+They are marked rather than weakened so the change stays visible. Only the
+assertion needs re-expressing; the seeding coverage is already intact.
 
 ### Cross-checking the backends
 
