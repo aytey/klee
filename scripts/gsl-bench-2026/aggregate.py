@@ -11,6 +11,7 @@ like-for-like comparison and per-query cost is the honest rate.
 Set GSL_BENCH_OUT to point at a runs directory other than the default.
 """
 import collections
+import math
 import os
 import sqlite3
 import statistics
@@ -184,6 +185,43 @@ def main():
                  len(set(q.values())) == 1 else "different",
                  "/".join(str(instr[c]) for c in cfgs),
                  "/".join(str(q[c]) for c in cfgs)))
+
+    # With more than a handful of configurations, demanding that *every* one
+    # be unbounded and timeout-free on a driver throws away most of the data.
+    # Pairwise against a baseline keeps the like-for-like property -- the two
+    # being compared did the same work -- while using far more drivers.
+    if len(cfgs) > 3:
+        base = os.environ.get("BASELINE", cfgs[0])
+        if base in cfgs:
+            print("\n=== each configuration against %s, on the drivers where "
+                  "neither was bounded or timed out ===" % base)
+            print("%-26s %6s %10s %10s %8s %8s %9s"
+                  % ("config", "n", "solverT", "baseT", "wins", "losses",
+                     "geomean"))
+            for c in cfgs:
+                if c == base:
+                    continue
+                names = [n for n in complete
+                         if not (rows[n][c]["bounded"] or rows[n][c]["timeouts"]
+                                 or rows[n][base]["bounded"]
+                                 or rows[n][base]["timeouts"])]
+                if not names:
+                    continue
+                tc = sum(rows[n][c].get("solver", 0.0) for n in names)
+                tb = sum(rows[n][base].get("solver", 0.0) for n in names)
+                wins = sum(1 for n in names
+                           if rows[n][c].get("solver", 0.0)
+                           < rows[n][base].get("solver", 0.0))
+                losses = sum(1 for n in names
+                             if rows[n][c].get("solver", 0.0)
+                             > rows[n][base].get("solver", 0.0))
+                logs = [math.log(rows[n][c]["solver"] / rows[n][base]["solver"])
+                        for n in names
+                        if rows[n][c].get("solver", 0) > 0
+                        and rows[n][base].get("solver", 0) > 0]
+                geo = math.exp(sum(logs) / len(logs)) if logs else float("nan")
+                print("%-26s %6d %10.1f %10.1f %8d %8d %9.3f"
+                      % (c, len(names), tc, tb, wins, losses, geo))
 
     # Where the configurations actually disagree.
     print("\n=== drivers where target-function line coverage differs ===")

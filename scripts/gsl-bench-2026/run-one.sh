@@ -30,7 +30,15 @@ MAX_REPLAY=${MAX_REPLAY:-0}           # 0 = replay every test
 # then costs the full REPLAY_TIMEOUT. gsl_sf_mathieu_Mc_e under Bitwuzla is
 # 1081 tests at 5s each. MAX_REPLAY caps that; coverage saturates long before.
 
+# $2 is both the --solver-backend and the label the results are filed under.
+# For sweeps that vary solver *options* rather than the backend, set SOLVER to
+# the real backend and pass a distinguishing label as $2, with the options in
+# EXTRA_ARGS; STP_LIB_DIR swaps which libstp.so is loaded.
 target=$1 backend=$2 search=$3
+SOLVER=${SOLVER:-$backend}
+EXTRA_ARGS=${EXTRA_ARGS:-}
+STP_LIB_DIR=${STP_LIB_DIR:-}
+SKIP_REPLAY=${SKIP_REPLAY:-0}
 group=${target%%/*}
 name=${target##*/}
 
@@ -41,13 +49,15 @@ mkdir -p "$(dirname "$dir")"
 rm -rf "$dir"
 
 start=$(date +%s.%N)
+LD_LIBRARY_PATH="${STP_LIB_DIR:+$STP_LIB_DIR:}${LD_LIBRARY_PATH:-}" \
 timeout -s KILL "$HARD" "$KLEE" \
   --output-dir="$dir" \
-  --solver-backend="$backend" \
+  --solver-backend="$SOLVER" \
   --search="$search" \
   --max-time="${BUDGET}s" \
   --max-solver-time="${MAX_SOLVER_TIME}s" \
   --link-llvm-lib="$UCLIBC/lib/libm.a" \
+  $EXTRA_ARGS \
   "$W/obj/$group/$name.bc" > "$log" 2>&1
 rc=$?
 end=$(date +%s.%N)
@@ -60,7 +70,7 @@ nerr=$(find "$dir" -maxdepth 1 -name '*.err' 2>/dev/null | wc -l)
 # writes its own profile, so this is safe to do while other drivers run.
 prof="$dir/prof"
 cov="0,0,0,0,0,0,0,0"
-if [ "$ntests" -gt 0 ]; then
+if [ "$ntests" -gt 0 ] && [ "$SKIP_REPLAY" = 0 ]; then
   mkdir -p "$prof"
   # Redirected as a group: a replay that dies on a signal makes the shell
   # announce it, and GSL aborting on a domain error is a normal outcome here.

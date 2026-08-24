@@ -19,11 +19,13 @@
 #include "klee/Solver/SolverImpl.h"
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Support/OptionCategories.h"
+#include "klee/System/Time.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Errno.h"
 
 #include <array>
+#include <cinttypes>
 #include <csignal>
 #include <memory>
 #include <sys/ipc.h>
@@ -43,9 +45,9 @@ llvm::cl::opt<bool> IgnoreSTPFailures(
     llvm::cl::desc("Ignore any STP solver failures (default=false)"),
     llvm::cl::cat(klee::SolvingCat));
 
-enum SAT { MINISAT, SIMPLEMINISAT, CRYPTOMINISAT, RISS };
-const std::array<std::string, 4> SATNames{"MiniSat", "simplifying MiniSat",
-                                          "CryptoMiniSat", "RISS"};
+enum SAT { MINISAT, SIMPLEMINISAT, CRYPTOMINISAT, RISS, CADICAL };
+const std::array<std::string, 5> SATNames{"MiniSat", "simplifying MiniSat",
+                                          "CryptoMiniSat", "RISS", "CaDiCaL"};
 
 llvm::cl::opt<SAT> SATSolver(
     "stp-sat-solver",
@@ -57,8 +59,78 @@ llvm::cl::opt<SAT> SATSolver(
                                 SATNames[SAT::SIMPLEMINISAT]),
                      clEnumValN(SAT::CRYPTOMINISAT, "cryptominisat",
                                 SATNames[SAT::CRYPTOMINISAT]),
-                     clEnumValN(SAT::RISS, "riss", SATNames[SAT::RISS])),
+                     clEnumValN(SAT::RISS, "riss", SATNames[SAT::RISS]),
+                     clEnumValN(SAT::CADICAL, "cadical",
+                                SATNames[SAT::CADICAL])),
     llvm::cl::init(CRYPTOMINISAT), llvm::cl::cat(klee::SolvingCat));
+
+// STP's incremental driver keeps one solver across a session, pushing and
+// popping levels, instead of building each query from scratch. Which of the
+// two wins is not a property of the solver but of the session, so these exist
+// to be swept rather than set once. Ported from the klee-float branch, where
+// the same options are measured on fp-bench.
+//
+// Zero never engages the driver, N engages it on the Nth query, and a negative
+// value leaves STP's own policy alone. Under the adaptive policy below this is
+// the point at which measuring starts, not a decision.
+llvm::cl::opt<int> STPIncrementalEngageAt(
+    "stp-incremental-engage-at", llvm::cl::init(0),
+    llvm::cl::desc("Query ordinal at which STP's incremental driver takes "
+                   "over: 0 never (default), N on the Nth query, -1 to leave "
+                   "STP's own policy alone"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// A fixed ordinal has to guess, and no property of a session available up
+// front predicts which mode it wants. So spend the first
+// --stp-incremental-engage-at queries on the batch pipeline, remember what
+// they cost, then engage the driver and keep comparing; abandon it for good if
+// it is clearly worse. The comparison is between means over different queries,
+// which is crude, but it only has to be right about the sign of a several-fold
+// difference.
+llvm::cl::opt<bool> STPAdaptIncremental(
+    "stp-adapt-incremental", llvm::cl::init(false),
+    llvm::cl::desc("Choose between STP's batch and incremental modes by "
+                   "measuring both, rather than by a fixed query ordinal "
+                   "(default=off)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::opt<double> STPAdaptRegret(
+    "stp-adapt-regret", llvm::cl::init(2.0),
+    llvm::cl::desc("How much slower per query the incremental driver may be "
+                   "before it is abandoned (default=2.0)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// The per-level incremental route encodes each level as it arrives and never
+// simplifies across the stack, so the SAT solver is handed a formula nobody
+// has been over. These two are STP's routes back to the parts of the batch
+// pipeline's simplification that survive being kept.
+llvm::cl::opt<bool> STPPieceRewriting(
+    "stp-incremental-piece-rewriting", llvm::cl::init(false),
+    llvm::cl::desc("Have STP run strength reduction and sub-sum extraction "
+                   "on each piece its incremental driver prepares "
+                   "(default=off)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::opt<bool> STPScopedPreprocessing(
+    "stp-incremental-scoped-preprocessing", llvm::cl::init(false),
+    llvm::cl::desc("Have STP preprocess the whole active stack on every "
+                   "incremental check (default=off)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// A trade, not a quality dial: a wide-significand sqrt builds an enormous
+// circuit the SAT solver disposes of immediately and wants low effort, while a
+// query whose search is the expensive part wants the opposite.
+llvm::cl::opt<int> STPCNFEffort(
+    "stp-cnf-effort", llvm::cl::init(-1),
+    llvm::cl::desc("Effort STP spends minimising the CNF: 0 very low .. 4 "
+                   "very high (default=-1, leave STP's own default alone)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::opt<bool> DebugSTPPhaseTiming(
+    "debug-stp-phase-timing", llvm::cl::init(false),
+    llvm::cl::desc("Report per-query build/assert and solve times for STP "
+                   "(default=off)"),
+    llvm::cl::cat(klee::SolvingCat));
 } // namespace
 
 #define vc_bvBoolExtract IAMTHESPAWNOFSATAN
@@ -96,6 +168,16 @@ private:
   bool useForkedSTP;
   SolverRunStatus runStatusCode;
 
+  // Adaptive incremental policy state; see STPAdaptIncremental.
+  size_t queriesRun = 0;
+  double batchSeconds = 0.0, incrementalSeconds = 0.0;
+  size_t batchQueries = 0, incrementalQueries = 0;
+  bool incrementalEngaged = false;   // what STP was last told
+  bool modeSettled = false;          // stop probing: the decision is made
+
+  void selectMode();
+  void recordQueryCost(double seconds);
+
 public:
   explicit STPSolverImpl(bool useForkedSTP, bool optimizeDivides = true);
   ~STPSolverImpl() override;
@@ -127,6 +209,24 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
   // we restore the old behaviour.
   vc_setInterfaceFlags(vc, EXPRDELETE, 0);
 
+  // Negative leaves STP's own policy alone. Under the adaptive policy
+  // selectMode() drives this per query instead, starting from the batch
+  // pipeline.
+  if (STPIncrementalEngageAt >= 0)
+    vc_setInterfaceFlags(vc, INCREMENTAL_AUTO_ENGAGE_AT,
+                         STPAdaptIncremental
+                             ? 0
+                             : STPIncrementalEngageAt.getValue());
+
+  if (STPPieceRewriting)
+    vc_setInterfaceFlags(vc, INCREMENTAL_PIECE_REWRITING, 1);
+
+  if (STPScopedPreprocessing)
+    vc_setInterfaceFlags(vc, INCREMENTAL_SCOPED_PREPROCESSING, 1);
+
+  if (STPCNFEffort >= 0)
+    vc_setInterfaceFlags(vc, CNF_GENERATION_EFFORT, STPCNFEffort.getValue());
+
   // set SAT solver
   bool SATSolverAvailable = false;
   bool specifiedOnCommandLine = SATSolver.getNumOccurrences() > 0;
@@ -141,6 +241,10 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
   }
   case SAT::CRYPTOMINISAT: {
     SATSolverAvailable = vc_useCryptominisat(vc);
+    break;
+  }
+  case SAT::CADICAL: {
+    SATSolverAvailable = vc_useCadical(vc);
     break;
   }
   case SAT::RISS: {
@@ -162,6 +266,8 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
     SATName = SATNames[SAT::CRYPTOMINISAT];
   else if (vc_isUsingRiss(vc))
     SATName = SATNames[SAT::RISS];
+  else if (vc_isUsingCadical(vc))
+    SATName = SATNames[SAT::CADICAL];
 
   if (!specifiedOnCommandLine || SATSolverAvailable) {
     klee_message("SAT solver: %s", SATName.c_str());
@@ -385,6 +491,72 @@ runAndGetCexForked(::VC vc, STPBuilder *builder, ::VCExpr q,
   }
 }
 
+// Point STP at the mode this query should run in.
+void STPSolverImpl::selectMode() {
+  if (!STPAdaptIncremental)
+    return;   // fixed policy: set once in the constructor and left alone
+
+  bool wantIncremental;
+  if (modeSettled)
+    wantIncremental = incrementalEngaged;
+  else if (STPIncrementalEngageAt <= 0)
+    wantIncremental = false;   // never engage, so nothing to measure
+  else
+    wantIncremental = queriesRun >= (size_t)STPIncrementalEngageAt;
+
+  if (wantIncremental != incrementalEngaged || queriesRun == 0) {
+    // 1 engages from the next query, 0 prevents automatic engagement. The
+    // flag is read per query, so this is a switch and not a one-off.
+    vc_setInterfaceFlags(vc, INCREMENTAL_AUTO_ENGAGE_AT,
+                         wantIncremental ? 1 : 0);
+    incrementalEngaged = wantIncremental;
+  }
+}
+
+// Fold this query's cost into whichever mode ran it, and decide whether to
+// keep going. The driver is abandoned as soon as it is clearly losing; there
+// is deliberately no matching "keep it for good", because settling on the
+// driver after a short probe locks in whatever the first few queries happened
+// to cost. Staying unsettled costs nothing -- the means keep accumulating and
+// the test below can still fire much later.
+void STPSolverImpl::recordQueryCost(double seconds) {
+  queriesRun++;
+  if (!STPAdaptIncremental || modeSettled)
+    return;
+
+  if (incrementalEngaged) {
+    incrementalSeconds += seconds;
+    incrementalQueries++;
+  } else {
+    batchSeconds += seconds;
+    batchQueries++;
+  }
+
+  // A baseline of one or two queries is not a baseline: KLEE's opening
+  // queries are often trivial, and a mean taken over them would condemn the
+  // driver for being slower than nothing.
+  if (batchQueries < 4 || incrementalQueries == 0)
+    return;
+
+  const double batchMean = batchSeconds / (double)batchQueries;
+  const double incMean = incrementalSeconds / (double)incrementalQueries;
+
+  // Nothing to tell apart while both are noise. Comparing means of
+  // sub-millisecond queries would settle the mode on scheduling jitter.
+  if (batchMean < 1e-3 && incMean < 1e-3)
+    return;
+
+  if (incrementalQueries >= 4 && incMean > STPAdaptRegret * batchMean) {
+    modeSettled = true;
+    incrementalEngaged = false;
+    vc_setInterfaceFlags(vc, INCREMENTAL_AUTO_ENGAGE_AT, 0);
+    if (DebugSTPPhaseTiming)
+      klee_warning("STP: abandoning the incremental driver after %zu queries "
+                   "(%.1fms/query against %.1fms batch)",
+                   incrementalQueries, incMean * 1000.0, batchMean * 1000.0);
+  }
+}
+
 bool STPSolverImpl::computeInitialValues(
     const Query &query, const std::vector<const Array *> &objects,
     std::vector<std::vector<unsigned char>> &values, bool &hasSolution) {
@@ -399,6 +571,8 @@ bool STPSolverImpl::computeInitialValues(
   ++stats::solverQueries;
   ++stats::queryCounterexamples;
 
+  selectMode();
+  const time::Point buildStart = time::getWallTime();
   ExprHandle stp_e = builder->construct(query.expr);
 
   // Assert any side constraints generated while translating. This has to come
@@ -416,6 +590,8 @@ bool STPSolverImpl::computeInitialValues(
     klee_warning("STP query:\n%.*s\n", (unsigned)len, buf);
     free(buf);
   }
+
+  const time::Point solveStart = time::getWallTime();
 
   bool success;
   if (useForkedSTP) {
@@ -435,6 +611,20 @@ bool STPSolverImpl::computeInitialValues(
     else
       ++stats::queriesValid;
   }
+
+  const time::Point solveEnd = time::getWallTime();
+  if (DebugSTPPhaseTiming)
+    klee_warning("STP query: build+assert %" PRIu64 "ms, solve+cex %" PRIu64
+                 "ms%s",
+                 (solveStart - buildStart).toMicroseconds() / 1000,
+                 (solveEnd - solveStart).toMicroseconds() / 1000,
+                 // Only the adaptive policy knows which mode ran the query;
+                 // under a fixed ordinal STP decides for itself and does not
+                 // say, so do not claim to know.
+                 !STPAdaptIncremental
+                     ? " [stp policy]"
+                     : (incrementalEngaged ? " [incremental]" : " [batch]"));
+  recordQueryCost((solveEnd - solveStart).toMicroseconds() / 1e6);
 
   vc_pop(vc);
 
