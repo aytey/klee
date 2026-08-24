@@ -154,6 +154,44 @@ that.
 They are marked rather than weakened so the change stays visible. Only the
 assertion needs re-expressing; the seeding coverage is already intact.
 
+## fp-bench
+
+`scripts/fp-bench-2026/` builds and runs the ASE 2017 benchmark suite against
+this KLEE. Unlike klee-float's copy it builds the benchmarks with the *same*
+LLVM the KLEE under test uses: LLVM 3.4 benchmark bitcode will not link against
+an LLVM 16 KLEE (conflicting `Debug Info Version` module flags) and, forced past
+that, fails the module verifier on the data layout. klee-uclibc likewise has to
+be built against the same LLVM — `klee_uclibc_v1.4`, which is what 3.2 pins.
+
+```sh
+scripts/fp-bench-2026/fetch-and-build.sh   # 138 benchmarks, 86 in the study set
+scripts/fp-bench-2026/run-all.sh           # z3, stp, bitwuzla
+```
+
+86 benchmarks x 3 backends, 60s exploration budget, 150s hard kill, 8-way
+parallel, **no crashes**:
+
+| config | solverT | wall | queries | ms/query | instr | budget-killed |
+| --- | --- | --- | --- | --- | --- | --- |
+| bitwuzla | 1061.9 | 1537.9 | 7376 | 144.0 | 1,989,297 | 3 |
+| stp | 1115.7 | 1747.4 | 8168 | 136.6 | 2,039,641 | 4 |
+| z3 | 2439.8 | 3966.4 | 6091 | 400.6 | 1,780,956 | 13 |
+
+Bug-finding against each benchmark's specification: Bitwuzla 32 true positives
+/ 2 missed, STP 31 / 3, Z3 26 / 8, with 11 further errors reported by every
+backend and therefore attributable to the environment rather than any solver.
+
+The same caveats as klee-float's document apply, and for the same reason: under
+a fixed budget a faster solver does not finish sooner, it does more work, so
+the totals are not like-for-like. Read `ms/query`, and read it knowing that the
+budget-bounded benchmarks distort even that.
+
+For orientation, klee-float on LLVM 3.4 records 31 true positives / 3 missed
+and 153–418 ms/query across its six configurations. The ordering (STP and
+Bitwuzla close, Z3 roughly 3x the per-query cost) and the bug-finding parity
+both reproduce here; the absolute numbers are not comparable, since the
+benchmarks, the libc and KLEE itself are all built differently.
+
 ### Cross-checking the backends
 
 ```sh
