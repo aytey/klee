@@ -44,11 +44,37 @@ llvm::cl::opt<std::string> Z3QueryDumpFile(
     llvm::cl::cat(klee::SolvingCat));
 
 llvm::cl::opt<bool> Z3AckermannizeArrays(
-    "z3-array-ackermannize", llvm::cl::init(true),
+    "z3-array-ackermannize", llvm::cl::init(false),
     llvm::cl::desc("Replace contiguous runs of reads from an array with a "
-                   "single bitvector variable before building Z3 queries "
-                   "(default=true)"),
+                   "single bitvector variable before building Z3 queries. "
+                   "Large speedups on solver-bound floating-point queries, but "
+                   "currently UNSOUND -- see the comment in Z3Solver.cpp "
+                   "(default=false)"),
     llvm::cl::cat(klee::SolvingCat));
+
+// WARNING: --z3-array-ackermannize is off by default because it can produce
+// assignments that do not satisfy the query.
+//
+// Reproducer, against the fp-bench suite built by scripts/fp-bench-2026:
+//
+//   klee --solver-backend=z3 --z3-array-ackermannize=true --libc=uclibc \
+//        aachen/real/blas/blas_klee_correct.x86_64.bc
+//
+// trips IndependentSolver's assertCreatedPointEvaluatesToTrue. It needs the
+// independent solver *and* one of the caching solvers to show up: any of
+// --use-independent-solver=false, --use-cache=false or --use-cex-cache=false
+// makes it go away, as does turning ackermannisation off.
+//
+// The shape of it is that an ackermannised query does not mention the array at
+// all, so the assignment computed for it says nothing about bytes outside the
+// replaced regions -- yet that assignment is cached and later reused for a
+// query where those bytes do matter. Reading the uncovered bytes out of the
+// model rather than filling them with zero (as klee-float does) is more
+// principled but does not fix it, so the real fault is elsewhere; it has not
+// been isolated.
+//
+// klee-float ships this on by default with the same model-reconstruction code,
+// so the fault may be latent there too rather than introduced by this port.
 
 llvm::cl::opt<bool> Z3ValidateModels(
     "debug-z3-validate-models", llvm::cl::init(false),
@@ -455,11 +481,13 @@ SolverImpl::SolverRunStatus Z3SolverImpl::handleSolverResponse(
             break;
           }
           if (Z3_ast(initial_read) == NULL) {
-            // The array was ackermannised but this byte was not part of any
-            // replaced region, which means the query never read it. Its value
-            // is unconstrained, so anything will do.
-            data.push_back(0);
-            continue;
+            // The array was ackermannised but this byte fell outside every
+            // replaced region. Read it out of the array as usual rather than
+            // inventing a value: the assignment outlives the query it was
+            // computed for (the caching solvers keep it), so a byte this query
+            // happened not to constrain may well be constrained by the next
+            // one to be handed this assignment.
+            initial_read = builder->getInitialRead(array, offset);
           }
         } else {
           initial_read = builder->getInitialRead(array, offset);

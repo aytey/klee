@@ -90,8 +90,15 @@ Measured on Imperial fp-bench synthetic benchmarks rebuilt with clang 16,
 | `sorted_search_d6` | capped | capped | 1.0x | 81.0M vs 83.5M instrs |
 | `sum_commut_d6` | capped | capped | — | no signal at this size |
 
-Worth 20x and more where the query is solver-bound, and nothing where it is
-not — `sorted_search` is instruction-bound and gets through about 3% fewer
+> **Off by default: currently unsound.** Running fp-bench turned up assignments
+> that do not satisfy the query — `blas_klee_correct` trips
+> `IndependentSolver`'s `assertCreatedPointEvaluatesToTrue`. It needs the
+> independent solver *and* one of the caching solvers to appear. See the comment
+> in `Z3Solver.cpp`; klee-float ships the same code on by default, so the fault
+> may be latent there rather than introduced here.
+
+The measurements below are what it is worth once that is fixed. Worth 20x and
+more where the query is solver-bound, and nothing where it is not — `sorted_search` is instruction-bound and gets through about 3% fewer
 instructions in the same wall clock with it on. Hence the flag.
 
 ## What is not carried across
