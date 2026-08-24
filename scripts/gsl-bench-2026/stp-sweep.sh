@@ -68,7 +68,8 @@ CONFIGS=(
 )
 
 mkdir -p "$OUT"
-awk -v s="$STRIDE" 'NR % s == 1' "$W/drivers.txt" > "$OUT/drivers.txt"
+# (NR-1) % s, not NR % s: the latter selects nothing at all when s is 1.
+awk -v s="$STRIDE" '(NR - 1) % s == 0' "$W/drivers.txt" > "$OUT/drivers.txt"
 : > "$OUT/results.psv"
 echo "$(wc -l < "$OUT/drivers.txt") drivers x ${#CONFIGS[@]} configurations"
 
@@ -97,7 +98,7 @@ run_job() {
 }
 export -f run_job
 
-xargs -a "$OUT/jobs.txt" -P "$PAR" -L1 bash -c 'run_job "$@"' _
+xargs -r -a "$OUT/jobs.txt" -P "$PAR" -L1 bash -c 'run_job "$@"' _
 
 echo "done: $(wc -l < "$OUT/results.psv") runs"
 "$HERE/aggregate.py"
