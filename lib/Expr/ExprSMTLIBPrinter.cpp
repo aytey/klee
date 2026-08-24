@@ -8,6 +8,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "klee/Expr/ExprSMTLIBPrinter.h"
+
+#include "klee/Support/ErrorHandling.h"
 #include "klee/Support/Casting.h"
 
 #include "llvm/Support/CommandLine.h"
@@ -467,6 +469,35 @@ const char *ExprSMTLIBPrinter::getSMTLIBKeyword(const ref<Expr> &e) {
     return "bvsgt";
   case Expr::Sge:
     return "bvsge";
+
+  case Expr::FPExt:
+  case Expr::FPTrunc:
+  case Expr::FPToUI:
+  case Expr::FPToSI:
+  case Expr::UIToFP:
+  case Expr::SIToFP:
+  case Expr::FAdd:
+  case Expr::FSub:
+  case Expr::FMul:
+  case Expr::FDiv:
+  case Expr::FSqrt:
+  case Expr::FAbs:
+  case Expr::FOEq:
+  case Expr::FOLt:
+  case Expr::FOLe:
+  case Expr::FOGt:
+  case Expr::FOGe:
+  case Expr::IsNaN:
+  case Expr::IsInfinite:
+  case Expr::IsNormal:
+  case Expr::IsSubnormal:
+    // Rendering these faithfully means emitting the FloatingPoint theory and,
+    // for Expr::Fl80, the x87 re-layout the solver builders do in
+    // castToFloat(). Rather than emit SMT-LIB that does not mean what the
+    // query means, say so. Use --debug-z3-dump-queries to get SMT-LIB for a
+    // floating-point query; Z3 prints its own, including fp80.
+    klee_error("Printing floating-point expressions as SMT-LIBv2 is not "
+               "supported; use --debug-z3-dump-queries instead");
 
   default:
     llvm_unreachable("Conversion from Expr to SMTLIB keyword failed");
