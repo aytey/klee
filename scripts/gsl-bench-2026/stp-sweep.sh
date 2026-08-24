@@ -22,6 +22,14 @@
 # Coverage is not measured here; the replay step is skipped. This is about
 # solver cost, and it is read the way fp-bench reads it -- see aggregate.py.
 #
+# The configurations are interleaved per driver rather than run as blocks. Run
+# as blocks, the first configuration measured is whatever the machine was still
+# finishing when the sweep started, and it becomes a bad baseline for
+# everything after it: the first attempt at this sweep had the two MiniSat
+# controls -- same solver, same STP commit, different block -- 28% apart, and
+# eleven of twelve configurations beating the block that ran first. Interleaved,
+# every configuration sees the same machine.
+#
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -64,19 +72,32 @@ awk -v s="$STRIDE" 'NR % s == 1' "$W/drivers.txt" > "$OUT/drivers.txt"
 : > "$OUT/results.psv"
 echo "$(wc -l < "$OUT/drivers.txt") drivers x ${#CONFIGS[@]} configurations"
 
-export GSL_BENCH_ROOT=$W GSL_BENCH_OUT=$OUT SOLVER=stp SKIP_REPLAY=1
-
+# label -> libstp, extra args. Written out so the dispatcher below can look a
+# job up without the table having to survive an export.
+: > "$OUT/configs.tsv"
+: > "$OUT/jobs.txt"
 for cfg in "${CONFIGS[@]}"; do
   label=${cfg%%|*}; rest=${cfg#*|}
-  lib=${rest%%|*}; args=${rest#*|}
-  echo "== $label"
-  : > "$OUT/jobs-$label.txt"
-  while read -r d; do
-    printf '%s %s %s\n' "$d" "$label" "$SEARCH" >> "$OUT/jobs-$label.txt"
-  done < "$OUT/drivers.txt"
-  STP_LIB_DIR=$lib EXTRA_ARGS=$args \
-    xargs -a "$OUT/jobs-$label.txt" -P "$PAR" -L1 "$HERE/run-one.sh"
+  printf '%s\t%s\t%s\n' "$label" "${rest%%|*}" "${rest#*|}" >> "$OUT/configs.tsv"
 done
+while read -r d; do
+  for cfg in "${CONFIGS[@]}"; do
+    printf '%s %s %s\n' "$d" "${cfg%%|*}" "$SEARCH" >> "$OUT/jobs.txt"
+  done
+done < "$OUT/drivers.txt"
+
+export GSL_BENCH_ROOT=$W GSL_BENCH_OUT=$OUT SOLVER=stp SKIP_REPLAY=1
+export OUT HERE
+
+run_job() {
+  local target=$1 label=$2 search=$3 line
+  line=$(awk -F'\t' -v l="$label" '$1 == l {print $2 "\t" $3; exit}' "$OUT/configs.tsv")
+  STP_LIB_DIR=${line%%$'\t'*} EXTRA_ARGS=${line#*$'\t'} \
+    "$HERE/run-one.sh" "$target" "$label" "$search"
+}
+export -f run_job
+
+xargs -a "$OUT/jobs.txt" -P "$PAR" -L1 bash -c 'run_job "$@"' _
 
 echo "done: $(wc -l < "$OUT/results.psv") runs"
 "$HERE/aggregate.py"
