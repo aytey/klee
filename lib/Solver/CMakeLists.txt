@@ -25,6 +25,8 @@ add_library(kleaverSolver
   SolverCmdLine.cpp
   SolverImpl.cpp
   SolverStats.cpp
+  BitwuzlaBuilder.cpp
+  BitwuzlaSolver.cpp
   STPBuilder.cpp
   STPSolver.cpp
   ValidatingSolver.cpp

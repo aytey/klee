@@ -10,6 +10,9 @@
 /* Using STP Solver backend */
 #cmakedefine ENABLE_STP @ENABLE_STP@
 
+/* Using Bitwuzla Solver backend */
+#cmakedefine ENABLE_BITWUZLA @ENABLE_BITWUZLA@
+
 /* Using Z3 Solver backend */
 #cmakedefine ENABLE_Z3 @ENABLE_Z3@
 

@@ -65,6 +65,7 @@ enum CoreSolverType {
   METASMT_SOLVER,
   DUMMY_SOLVER,
   Z3_SOLVER,
+  BITWUZLA_SOLVER,
   NO_SOLVER
 };
 

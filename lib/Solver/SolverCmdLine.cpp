@@ -174,18 +174,26 @@ MetaSMTBackend("metasmt-backend",
 #define STP_IS_DEFAULT_STR " (default)"
 #define METASMT_IS_DEFAULT_STR ""
 #define Z3_IS_DEFAULT_STR ""
+#define BITWUZLA_IS_DEFAULT_STR ""
 #define DEFAULT_CORE_SOLVER STP_SOLVER
 #elif ENABLE_Z3
 #define STP_IS_DEFAULT_STR ""
 #define METASMT_IS_DEFAULT_STR ""
 #define Z3_IS_DEFAULT_STR " (default)"
+#define BITWUZLA_IS_DEFAULT_STR ""
 #define DEFAULT_CORE_SOLVER Z3_SOLVER
 #elif ENABLE_METASMT
 #define STP_IS_DEFAULT_STR ""
 #define METASMT_IS_DEFAULT_STR " (default)"
 #define Z3_IS_DEFAULT_STR ""
+#define BITWUZLA_IS_DEFAULT_STR ""
 #define DEFAULT_CORE_SOLVER METASMT_SOLVER
+#elif ENABLE_BITWUZLA
+#define STP_IS_DEFAULT_STR ""
+#define METASMT_IS_DEFAULT_STR ""
 #define Z3_IS_DEFAULT_STR ""
+#define BITWUZLA_IS_DEFAULT_STR " (default)"
+#define DEFAULT_CORE_SOLVER BITWUZLA_SOLVER
 #else
 #error "Unsupported solver configuration"
 #endif
@@ -196,7 +204,9 @@ cl::opt<CoreSolverType> CoreSolverToUse(
                clEnumValN(METASMT_SOLVER, "metasmt",
                           "metaSMT" METASMT_IS_DEFAULT_STR),
                clEnumValN(DUMMY_SOLVER, "dummy", "Dummy solver"),
-               clEnumValN(Z3_SOLVER, "z3", "Z3" Z3_IS_DEFAULT_STR)),
+               clEnumValN(Z3_SOLVER, "z3", "Z3" Z3_IS_DEFAULT_STR),
+               clEnumValN(BITWUZLA_SOLVER, "bitwuzla",
+                          "Bitwuzla" BITWUZLA_IS_DEFAULT_STR)),
     cl::init(DEFAULT_CORE_SOLVER), cl::cat(SolvingCat));
 
 cl::opt<CoreSolverType> DebugCrossCheckCoreSolverWith(
@@ -207,10 +217,12 @@ cl::opt<CoreSolverType> DebugCrossCheckCoreSolverWith(
                clEnumValN(METASMT_SOLVER, "metasmt", "metaSMT"),
                clEnumValN(DUMMY_SOLVER, "dummy", "Dummy solver"),
                clEnumValN(Z3_SOLVER, "z3", "Z3"),
+               clEnumValN(BITWUZLA_SOLVER, "bitwuzla", "Bitwuzla"),
                clEnumValN(NO_SOLVER, "none", "Do not crosscheck (default)")),
     cl::init(NO_SOLVER), cl::cat(SolvingCat));
 } // namespace klee
 
+#undef BITWUZLA_IS_DEFAULT_STR
 #undef STP_IS_DEFAULT_STR
 #undef METASMT_IS_DEFAULT_STR
 #undef Z3_IS_DEFAULT_STR

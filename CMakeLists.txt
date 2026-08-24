@@ -204,14 +204,18 @@ include(${CMAKE_SOURCE_DIR}/cmake/find_stp.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/find_z3.cmake)
 # metaSMT
 include(${CMAKE_SOURCE_DIR}/cmake/find_metasmt.cmake)
+# Bitwuzla
+include(${CMAKE_SOURCE_DIR}/cmake/find_bitwuzla.cmake)
 
-if ((NOT ${ENABLE_Z3}) AND (NOT ${ENABLE_STP}) AND (NOT ${ENABLE_METASMT}))
+if ((NOT ${ENABLE_Z3}) AND (NOT ${ENABLE_STP}) AND (NOT ${ENABLE_METASMT})
+    AND (NOT ${ENABLE_BITWUZLA}))
   message(FATAL_ERROR "No solver was specified. At least one solver is required."
     "You should enable a solver by passing one of more the following options"
     " to cmake:\n"
     "\"-DENABLE_SOLVER_STP=ON\"\n"
     "\"-DENABLE_SOLVER_Z3=ON\"\n"
-    "\"-DENABLE_SOLVER_METASMT=ON\"")
+    "\"-DENABLE_SOLVER_METASMT=ON\"\n"
+    "\"-DENABLE_SOLVER_BITWUZLA=ON\"")
 endif()
 
 ###############################################################################

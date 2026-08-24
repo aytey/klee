@@ -9,6 +9,9 @@
 
 #include "STPSolver.h"
 #include "Z3Solver.h"
+#ifdef ENABLE_BITWUZLA
+#include "BitwuzlaSolver.h"
+#endif
 #include "MetaSMTSolver.h"
 
 #include "klee/Solver/SolverCmdLine.h"
@@ -49,6 +52,14 @@ std::unique_ptr<Solver> createCoreSolver(CoreSolverType cst) {
     return std::make_unique<Z3Solver>();
 #else
     klee_message("Not compiled with Z3 support");
+    return NULL;
+#endif
+  case BITWUZLA_SOLVER:
+#ifdef ENABLE_BITWUZLA
+    klee_message("Using Bitwuzla solver backend");
+    return std::make_unique<BitwuzlaSolver>();
+#else
+    klee_message("Not compiled with Bitwuzla support");
     return NULL;
 #endif
   case NO_SOLVER:
