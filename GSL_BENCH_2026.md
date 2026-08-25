@@ -336,6 +336,35 @@ The terminator costs 0.7%, inside the noise floor, and buys back the bug. So
 the answer moves back to MiniSat: 1.38x faster than a forked solver where
 CryptoMiniSat is 1.16x, with the same 34 found and none missed.
 
+### Against the other backends
+
+64 benchmarks, no configuration budget-bounded, the three STP rows doing an
+identical 1,145,8xx instructions and Bitwuzla within 0.03% of them:
+
+| config | solverT | ms/query | bugs found | missed |
+| --- | --- | --- | --- | --- |
+| adaptive, MiniSat + terminator | **190.74** | **229.8** | **34** | **0** |
+| adaptive, CryptoMiniSat | 195.37 | 234.8 | **34** | **0** |
+| batch, MiniSat, forked (what 3.2 ships) | 207.71 | 257.1 | **34** | **0** |
+| Bitwuzla | 230.39 | 278.9 | 33 | 1 |
+| Z3 | 933.37 | 1323.9 | 33 | 1 |
+
+Per benchmark, against Bitwuzla, on the benchmarks where neither was bounded:
+
+| config | n | wins | losses | geomean |
+| --- | --- | --- | --- | --- |
+| adaptive, MiniSat + terminator | 73 | **39** | 29 | **0.957** |
+| adaptive, CryptoMiniSat | 73 | 35 | 33 | 1.006 |
+| batch, forked (what 3.2 ships) | 73 | 22 | 45 | 1.772 |
+| Z3 | 64 | 10 | 48 | 6.775 |
+
+The shipped configuration loses to Bitwuzla and the tuned one beats it. Read
+the per-benchmark column rather than the totals: the same configuration came
+out 8% ahead of Bitwuzla on totals in one sweep and 21% in another, on sets of
+62 and 64 benchmarks, while the win rate stayed 32-31 and 39-29. The direction
+is stable, the magnitude is not -- these totals are decided by a handful of
+benchmarks in the tail.
+
 ### Bit-vector abstraction
 
 Off. At a 33- and 53-bit width floor it helps the batch pipeline on a few
