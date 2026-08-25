@@ -1,0 +1,8 @@
+# A quick read: the tuned configuration against what 3.2 ships and Bitwuzla.
+# label <TAB> backend <TAB> libstp dir (or -) <TAB> extra klee args
+#
+# stp-tuned needs an STP built against a MiniSat carrying the terminator hook,
+# or its --max-solver-time is only enforced between calls into the SAT solver.
+stp-tuned	stp	$STP_TERM	--stp-sat-solver=minisat --stp-incremental-engage-at=8 --stp-adapt-incremental --use-forked-solver=false
+stp-shipped	stp	$STP_TERM	--stp-sat-solver=minisat
+bitwuzla	bitwuzla	-	

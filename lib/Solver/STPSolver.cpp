@@ -35,6 +35,12 @@
 
 namespace {
 
+// Note on what this cannot dump: KLEE's STPBuilder reaches float-to-IEEE-bits
+// through STP's API, and that node has no SMT-LIB spelling -- STP answers it
+// with FatalError, which this file's error handler turns into abort(). It is
+// not a niche case: 45 of atan2's 94 queries use it, because taking a double
+// apart is what an elementary function does. Dumping a driver that touches it
+// will stop at the first such query.
 llvm::cl::opt<bool> DebugDumpSTPQueries(
     "debug-dump-stp-queries", llvm::cl::init(false),
     llvm::cl::desc("Dump every STP query to stderr (default=false)"),
@@ -626,8 +632,19 @@ bool STPSolverImpl::computeInitialValues(
 
   vc_push(vc);
 
-  for (const auto &constraint : query.constraints)
-    vc_assertFormula(vc, builder->construct(constraint));
+  // Only populated when dumping: vc_query(vc, e) asks whether e follows from
+  // what has been asserted, so the standalone problem equivalent to this call
+  // is the conjunction of those assertions with the negation of e. STP has no
+  // "print the assertion stack as SMT-LIB2" entry point, so the conjunction
+  // has to be rebuilt here from the handles as they are asserted.
+  std::vector<ExprHandle> asserted;
+
+  for (const auto &constraint : query.constraints) {
+    ExprHandle h = builder->construct(constraint);
+    vc_assertFormula(vc, h);
+    if (DebugDumpSTPQueries)
+      asserted.push_back(h);
+  }
 
   ++stats::solverQueries;
   ++stats::queryCounterexamples;
@@ -640,15 +657,28 @@ bool STPSolverImpl::computeInitialValues(
   // after everything else has been constructed so that every side constraint
   // the query needs exists. Currently these pin the x87 fp80 explicit
   // significand integer bit -- see STPBuilder::castToFloat().
-  for (ExprHandle &sideConstraint : builder->sideConstraints)
+  for (ExprHandle &sideConstraint : builder->sideConstraints) {
     vc_assertFormula(vc, sideConstraint);
+    if (DebugDumpSTPQueries)
+      asserted.push_back(sideConstraint);
+  }
   builder->clearSideConstraints();
 
   if (DebugDumpSTPQueries) {
-    char *buf;
-    unsigned long len;
-    vc_printQueryStateToBuffer(vc, stp_e, &buf, &len, false);
-    klee_warning("STP query:\n%.*s\n", (unsigned)len, buf);
+    // vc_printSMTLIB2, not vc_printQueryStateToBuffer. The latter prints the
+    // presentation language, which has no floating-point syntax at all: STP
+    // answers a floating-point node with FatalError ("the presentation
+    // language has no floating-point", PLPrinter.cpp), KLEE's STP error
+    // handler turns that into abort(), and the flag took KLEE down eleven
+    // queries into the first driver it was pointed at. SMT-LIB2 is the export
+    // that knows every sort STP has, and what it emits is self-contained --
+    // set-logic, declarations and all -- so a dumped query can be replayed
+    // against any solver.
+    ExprHandle whole = vc_notExpr(vc, stp_e);
+    for (ExprHandle &a : asserted)
+      whole = vc_andExpr(vc, whole, a);
+    char *buf = vc_printSMTLIB2(vc, whole);
+    klee_warning("STP query:\n%s\n", buf);
     free(buf);
   }
 
