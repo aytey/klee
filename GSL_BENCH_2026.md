@@ -199,6 +199,42 @@ because one query it could not finish cost the entire run. `STPSolver` now
 bounds an in-process query with STP's `vc_query_with_timeout`, which is what the
 `// XXX I want to be able to timeout here, safely` in `runAndGetCex` wanted.
 
+### What asking for a bound costs, per backend
+
+Unbounded, STP is the fastest backend on this suite by a wide margin. Bounded,
+it is the slowest of the three. On the 63 drivers clean in both runs:
+
+| config | unbounded ms/query | bounded ms/query | cost of the bound |
+| --- | --- | --- | --- |
+| Bitwuzla | 11.5 | **9.1** | 0.80x |
+| Z3 | 464.6 | 390.7 | 0.84x |
+| STP, batch | 12.3 | 15.6 | 1.27x |
+| STP, adaptive | 8.8 | 14.4 | 1.64x |
+| STP, incremental | **5.6** | 14.0 | 2.49x |
+
+Bitwuzla and Z3 bound a query for free. STP pays for it, and pays most where it
+was fastest -- which is the whole of the difference between the two orderings.
+
+It is not the clock. Holding the work fixed at 44 queries on
+`gsl_cdf_laplace_Q`, and varying only the budget:
+
+| mode | no bound | 30s | 3000s |
+| --- | --- | --- | --- |
+| batch | 12.452s | 12.691s | 12.661s |
+| incremental | **5.239s** | **22.242s** | 20.765s |
+
+A budget of 30 seconds and a budget of 3000 costs the same, so nothing is being
+spent checking a deadline. For the batch pipeline the bound costs about 2% -- a
+fixed few milliseconds per query, which only shows up on drivers whose queries
+are cheap. For the incremental driver it costs four-fold, and takes the driver
+from 2.4x faster than batch to 1.8x slower. Requesting a bound does not slow the
+driver down; it defeats what the driver is for.
+
+So the ordering above is not a statement about how strong these solvers are. It
+says that STP's per-query bound and STP's incremental driver do not compose, and
+that until they do, the configuration in which STP is twice Bitwuzla's speed is
+one that loses a third of the coverage.
+
 ## Choosing STP's configuration
 
 Done on fp-bench rather than here: 86 benchmarks against 431 drivers, and it is
