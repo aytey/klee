@@ -157,9 +157,24 @@ every configuration executed an identical 218,039 instructions:
 | STP, CryptoMiniSat, incremental | 21.9 | 16.5 |
 | Z3 | 600.6 | 453.3 |
 
-Bitwuzla is the cheapest per query here and STP covers slightly more, which is
-the same shape fp-bench shows: STP issues more queries in the budget than
-Bitwuzla does and gets further with them.
+Bitwuzla is the cheapest per query here, by about 1.5x on this set, and it
+stays ahead on the whole suite: over all 431 drivers it issues 60,412 queries
+to STP's 57,800 and executes 124.7M instructions to STP's 109.9M. So STP's
+one-point coverage edge is not bought with throughput -- Bitwuzla does more
+work in the same budget.
+
+Where it comes from instead is a scatter. The two differ on 64 of the 431
+drivers, STP ahead on 42 and Bitwuzla on 22, with large swings either way:
+`gsl_sf_ellint_RD_e` is 81.7 points to STP, `gsl_deriv_central` 55.0 points to
+Bitwuzla. A one-point mean over 431 drivers assembled from a handful of
+double-digit disagreements is not a claim that one backend explores better; it
+is a claim that they explore differently.
+
+Note also how much narrower the whole-set per-query gap is than the
+like-for-like one: 368.7 against 388.8 ms/query, 5%, where the 65 comparable
+drivers show 10.8 against 16.2, 50%. That is the budget-bounded runs pinning
+both backends near the budget, which is why the restricted set is the one to
+read.
 
 ### What bounding a query is worth
 
