@@ -30,7 +30,11 @@ std::unique_ptr<Solver> createCoreSolver(CoreSolverType cst) {
   switch (cst) {
   case STP_SOLVER:
 #ifdef ENABLE_STP
-    klee_message("Using STP solver backend");
+    // Worth saying out loud: it is the one solver option here that KLEE used
+    // to change behind the user's back, only STP reads it, and it decides
+    // whether STP sees a session or a series of unrelated queries.
+    klee_message("Using STP solver backend (%s)",
+                 UseForkedCoreSolver ? "forked per query" : "in-process");
     return std::make_unique<STPSolver>(UseForkedCoreSolver, CoreSolverOptimizeDivides);
 #else
     klee_message("Not compiled with STP support");

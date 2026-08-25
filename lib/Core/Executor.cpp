@@ -497,7 +497,20 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       }));
 
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
-  if (coreSolverTimeout) UseForkedCoreSolver = true;
+  // Asking for a per-query timeout used to mean asking for a forked solver,
+  // because the fork was the only way STP's queries could be bounded -- and
+  // this turned an explicit --use-forked-solver=false into its opposite,
+  // silently. STPSolver now bounds an in-process query with STP's own
+  // vc_query_with_timeout, and Z3 and Bitwuzla never forked at all, so the
+  // only thing left to do is not override what the user asked for.
+  //
+  // It is not a cosmetic difference. Forking gives each query a fresh child,
+  // so STP's incremental driver -- which exists to carry work across the
+  // queries of a session -- cannot engage at all: with a timeout set, this
+  // line took the driver from 4.2s of solving to 19.2s on the same 44
+  // queries, and the cost looked like the price of the timeout.
+  if (coreSolverTimeout && UseForkedCoreSolver.getNumOccurrences() == 0)
+    UseForkedCoreSolver = true;
   std::unique_ptr<Solver> coreSolver = klee::createCoreSolver(CoreSolverToUse);
   if (!coreSolver) {
     klee_error("Failed to create core solver\n");
