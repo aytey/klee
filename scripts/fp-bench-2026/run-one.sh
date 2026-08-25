@@ -135,6 +135,21 @@ case $CFG in
   sat-minisatB)  BACKEND=stp; LIB=$STP_CAD_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=minisat" ;;
 
+  # --- the same three modes, with queries bounded --------------------------
+  # The unbounded figures above are what the incremental driver is worth when
+  # nothing stops a query it cannot finish. STPSolver can now bound an
+  # in-process query with STP's vc_query_with_timeout, so this asks what the
+  # driver is worth under the bound KLEE would actually run with.
+  bd-batch)      BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s" ;;
+  bd-inc)        BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --stp-incremental-engage-at=1" ;;
+  bd-adapt)      BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+  # What 3.2 shipped: batch, bounded by spending a process on every query.
+  bd-forked)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --use-forked-solver=true" ;;
+
   # --- abstraction x incremental, at MiniSat -------------------------------
   # Each axis has been measured alone; what is missing is whether they
   # interact. The incremental driver hands the SAT solver a formula the batch

@@ -123,102 +123,138 @@ affected drivers.
 
 ## Results
 
-> **The three-backend tables below are being re-run and should not be used.**
-> They were measured with `--use-forked-solver` at its default, which is *on*.
-> `CoreSolver.cpp` passes that flag only to `STPSolver` -- Z3 and Bitwuzla
-> always run in-process -- so STP forked a process per query and the other two
-> did not. That is not a like-for-like comparison, and it handicaps STP: the
-> klee-float branch measures 9.3s of STP solver time with forking against 7.3s
-> without. `scripts/fp-bench-2026/run-one.sh` passes `--use-forked-solver=false`
-> for exactly this reason and this harness should have done the same from the
-> start. The STP-versus-STP sweep is unaffected in kind, but is also being
-> re-run, because STP's incremental driver cannot accumulate state across
-> queries when each query is solved in a child process that then exits.
+431 drivers x 6 configurations, 60s exploration budget, 30s solver timeout,
+150s hard kill, 20-way parallel. STP is upstream master `47cd4baa`; every
+backend runs in-process (`--use-forked-solver=false`) and every backend honours
+`--max-solver-time`.
 
-431 drivers x 3 backends x {dfs, bfs}, 60s exploration budget, 30s solver
-timeout, 20-way parallel. All 2586 runs completed.
+### Coverage of the target GSL function
+
+| config | line% | branch% | at 100% | zero tests | hard kills |
+| --- | --- | --- | --- | --- | --- |
+| STP, MiniSat, batch | **89.57** | 61.96 | 249 | 6 | 22 |
+| STP, MiniSat, adaptive | 89.32 | 61.73 | **250** | 6 | 23 |
+| STP, MiniSat, incremental | 89.06 | 61.73 | 248 | 8 | 22 |
+| STP, CryptoMiniSat, incremental | 88.97 | 61.80 | 248 | 8 | 20 |
+| Bitwuzla | 88.53 | 61.49 | 246 | 6 | 12 |
+| Z3 | 86.89 | 59.68 | 235 | 8 | 0 |
+
+All four STP configurations land within 0.6% of each other. Once queries are
+bounded the solving mode barely shows up in the outcome at all, which is worth
+stating plainly because the per-query costs below differ by much more than that.
 
 ### Solver cost
 
-Measured the same way fp-bench is (`scripts/fp-bench-2026/aggregate.py`), and
-for the same reason: under a fixed budget a faster solver does not finish
-sooner, it does more work, so a total of solver time is not a like-for-like
-comparison. On this suite the distortion is much worse than on fp-bench,
-because 348 of 431 drivers are budget-bounded for at least one backend --
-GSL's special functions are simply harder than fp-bench's kernels.
+65 drivers where nothing was budget-bounded and nothing timed out, on which
+every configuration executed an identical 218,039 instructions:
 
-| set (dfs) | drivers | bitwuzla | stp | z3 |
+| config | solverT | ms/query |
+| --- | --- | --- |
+| Bitwuzla | 14.3 | **10.8** |
+| STP, MiniSat, incremental | 19.3 | 14.6 |
+| STP, MiniSat, adaptive | 19.8 | 14.9 |
+| STP, MiniSat, batch | 21.6 | 16.2 |
+| STP, CryptoMiniSat, incremental | 21.9 | 16.5 |
+| Z3 | 600.6 | 453.3 |
+
+Bitwuzla is the cheapest per query here and STP covers slightly more, which is
+the same shape fp-bench shows: STP issues more queries in the budget than
+Bitwuzla does and gets further with them.
+
+### What bounding a query is worth
+
+The single largest effect measured on this suite is not a solver or a mode. It
+is whether a query KLEE cannot finish is stopped.
+
+3.2 bounds an STP query by forking a process and killing it, so
+`--use-forked-solver=false` -- required for a like-for-like comparison, since
+Z3 and Bitwuzla never fork -- left STP with no per-query bound at all. Run that
+way, over the same 431 drivers:
+
+| | hard kills | zero tests | line% |
+| --- | --- | --- | --- |
+| STP, incremental, unbounded | 200 | 110 | 59.7 |
+| STP, batch, unbounded | 156 | 82 | 67.6 |
+| STP, incremental, bounded | 22 | 8 | 89.1 |
+| STP, batch, bounded | 22 | 6 | 89.6 |
+
+The fastest configuration measured -- incremental was 2.2x batch per query on
+the drivers where nothing was cut off -- produced the worst coverage of the six,
+because one query it could not finish cost the entire run. `STPSolver` now
+bounds an in-process query with STP's `vc_query_with_timeout`, which is what the
+`// XXX I want to be able to timeout here, safely` in `runAndGetCex` wanted.
+
+## Choosing STP's configuration
+
+Done on fp-bench rather than here: 86 benchmarks against 431 drivers, and it is
+the suite the branch's other STP measurements are on. `stp-sweep.sh` and
+`configs/` run the same sweeps against GSL for confirmation.
+
+### SAT backend
+
+46 benchmarks, no configuration budget-bounded, all doing an identical 858,857
+instructions:
+
+| STP SAT backend | solverT | ms/query |
+| --- | --- | --- |
+| **MiniSat** | **32.69** | **65.5** |
+| CryptoMiniSat 5.14 | 34.34 | 68.8 |
+| CaDiCaL 3.0.1 | 39.68 | 79.7 |
+| simplifying MiniSat | 46.94 | 94.8 |
+
+CaDiCaL is 21% worse than MiniSat, which is worth knowing because it is the
+modern default and what Bitwuzla uses internally.
+
+Two controls, because an earlier attempt at this sweep ran its configurations as
+blocks and had two that differed in nothing land 28% apart: MiniSat out of the
+second STP build scores 33.43 against 32.69, and a deliberate duplicate of the
+MiniSat configuration scores 33.53. So the noise floor is about 3% and nothing
+below ~5% here means anything.
+
+Only CryptoMiniSat and CaDiCaL can abandon a SAT search already in progress;
+with MiniSat `--max-solver-time` is honoured only between calls into the solver.
+That did not turn out to matter -- the bounded query costs the same under both
+(3-4x an unbounded one on matched query counts, so the cost is in STP's timeout
+mechanism, not in interruptibility).
+
+### Incremental driver
+
+**Measure this under the bound you will actually run with.** Unbounded, STP's
+incremental driver looks like a 3x win over batch mode (11.10s against 33.53s
+over 46 benchmarks). Bounded, on 66 benchmarks all doing an identical 1,178,709
+instructions, it is a 1.5x *loss*:
+
+| config | solverT | ms/query | bugs found | missed |
 | --- | --- | --- | --- | --- |
-| whole set, ms/query | 431 | 347.9 | 378.8 | 406.2 |
-| never budget-bounded, ms/query | 83 | 226.3 | 248.0 | 673.7 |
-| **never bounded, no query timeouts, ms/query** | **64** | **9.3** | **15.3** | **392.9** |
+| adaptive (`-stp-adapt-incremental`, engage at 8) | **128.01** | **167.3** | 34 | 0 |
+| batch, in-process bound | 136.48 | 178.4 | 34 | 0 |
+| batch, bounded by forking (what 3.2 ships) | 136.60 | 178.6 | 34 | 0 |
+| incremental from query 1 | 209.47 | 276.3 | 34 | 0 |
+| incremental from query 1, unbounded | 164.60 | 216.0 | 31 | 3 |
 
-The last row is the only one where the backends provably did the same work:
-those 64 drivers executed **216,476 instructions under every backend** and
-issued 1304/1311/1304 queries. The whole-set figure puts the three within 17%
-of each other; on identical work Z3 costs 42x Bitwuzla and 26x STP.
+Two things fall out of that table. The in-process bound costs exactly what
+forking costs (136.48 against 136.60, 0.1% apart) and saves a process per query,
+so it is a free change. And engaging the driver unconditionally is worse than
+not engaging it -- it is the *adaptive* policy, which measures both modes and
+abandons the driver when it is losing, that is worth having, and it is worth
+about 7%.
 
-A query timeout has to be excluded as well as the budget, which is what makes
-this suite different from fp-bench. A timeout kills the state, so it diverges
-the search exactly as the budget does; fp-bench's benchmarks rarely trip one,
-GSL's routinely do (dfs: 258 / 252 / 377 across the suite).
+### Bit-vector abstraction
 
-bfs reproduces it, on a set arrived at independently:
+Off. At a 33- and 53-bit width floor it helps the batch pipeline on a few
+benchmarks and loses on most (18 wins against 43 losses per benchmark, even
+though the total improves), it makes the incremental driver slower, and
+combined with the driver it is fragile: 27 and 21 hard kills over the whole set
+against 5 with it off, and true positives falling from 32 to 27.
 
-| set (bfs) | drivers | bitwuzla | stp | z3 |
-| --- | --- | --- | --- | --- |
-| whole set, ms/query | 431 | 293.0 | 294.5 | 588.6 |
-| never budget-bounded, ms/query | 89 | 313.4 | 318.0 | 878.3 |
-| **never bounded, no query timeouts, ms/query** | **65** | **7.9** | **15.2** | **372.8** |
+### Where that leaves the configuration
 
-Again 218,039 instructions under all three.
+```
+--solver-backend=stp --stp-sat-solver=minisat
+--stp-incremental-engage-at=8 --stp-adapt-incremental
+--use-forked-solver=false --max-solver-time=<budget>
+```
 
-### The ordering is not the whole story
-
-Per driver on the identical-work set, the totals and the head-to-heads say
-different things:
-
-| pair (dfs) | A wins | B wins | median A/B | geomean A/B |
-| --- | --- | --- | --- | --- |
-| bitwuzla vs stp | 57 | 5 | 0.456 | 0.435 |
-| bitwuzla vs z3 | 47 | 16 | 0.228 | 0.152 |
-| stp vs z3 | 32 | 31 | 0.833 | 0.351 |
-
-Bitwuzla beats STP on 57 of 64 drivers, so its 2x total is a broad win. **STP
-versus Z3 is 32-31** — a coin flip per driver — yet STP's total is 25x smaller.
-Z3's cost is a tail: 46% of its solver time is in 10% of the drivers, and its
-worst cases are 25-50s where the others are under a second
-(`gsl_sf_bessel_i2_scaled_e`: 1.12s / 0.68s / 51.66s over the same 27 queries).
-Read as "which backend is quickest on a typical GSL query", Z3 is unremarkable
-rather than bad; read as "which backend will not stall", it is much worse than
-either.
-
-That tail is also what the coverage numbers are made of. Where Z3 loses
-coverage it is usually not slower everywhere, it is a state killed by one
-query it could not decide -- on `gsl_root_test_delta` it times out at
-`newton.c:86` before the target function is reached at all, and scores 0%,
-while STP gets past it and scores 90%.
-
-### Coverage of the target function
-
-The benchmark's own metric, for completeness (dfs, mean over 431 drivers):
-
-| config | line% | branch% | drivers at 100% | tests | query timeouts |
-| --- | --- | --- | --- | --- | --- |
-| stp | 89.72 | 62.08 | 250 | 24,780 | 252 |
-| bitwuzla | 88.60 | 61.55 | 245 | 25,997 | 258 |
-| z3 | 86.97 | 59.74 | 234 | 18,937 | 377 |
-
-135 of 431 drivers cover a different fraction of the target function depending
-on the backend.
-
-### Not measured here
-
-The per-*query* distribution, which is what would separate "Z3 is uniformly
-slower" from "Z3 stalls on a particular query shape". KLEE can dump a query log
-(`--use-query-log=solver:kquery`) and `kleaver --print-query-time` will time
-each query in one, but the kquery **parser** has no cases for the FP kinds and
-`ExprPPrinter` does not emit the rounding mode that `FAdd` and friends carry --
-so an FP query prints but does not read back. Making FP round-trip through
-kquery would turn kleaver into a proper solver benchmark for this; it is the
-natural next step and nothing here depends on it.
+Worth roughly 7% of solver time against what 3.2 ships, and one fewer process
+per query. The large wins were elsewhere: linking a current STP, and bounding
+the query at all.

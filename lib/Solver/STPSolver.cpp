@@ -418,8 +418,13 @@ runAndGetCex(::VC vc, STPBuilder *builder, ::VCExpr q,
   // CaDiCaL can abandon a search already in progress. With MiniSat the budget
   // is honoured only between calls into the SAT solver, so one long call still
   // overruns it.
-  const int seconds = timeout ? static_cast<int>(timeout.toSeconds()) : -1;
-  const int result = vc_query_with_timeout(vc, q, -1, seconds);
+  // Only take the bounded path when there is a bound to enforce: asking for it
+  // is not free, and with no --max-solver-time this has to stay exactly the
+  // query KLEE used to issue.
+  const int result =
+      timeout ? vc_query_with_timeout(vc, q, -1,
+                                      static_cast<int>(timeout.toSeconds()))
+              : vc_query(vc, q);
 
   if (result == 2)
     return SolverImpl::SOLVER_RUN_STATUS_FAILURE;
