@@ -1,20 +1,14 @@
-# The configuration fp-bench chose, against what it replaces and the other two
-# backends. label <TAB> backend <TAB> libstp dir (or -) <TAB> extra klee args
+# The configuration question, with a per-query timeout that finally works
+# without forking (STPSolver now uses STP's vc_query_with_timeout).
 #
-# fp-bench, 46 benchmarks where no configuration was budget-bounded and all did
-# an identical 858,857 instructions:
+# label <TAB> backend <TAB> libstp dir (or -) <TAB> extra klee args
 #
-#   STP, MiniSat, incremental from query 1   11.10s   22.5 ms/query
-#   STP, MiniSat, adaptive                   15.60s   31.3
-#   STP, MiniSat, batch (what 3.2 shipped)   33.53s   67.2
-#   Bitwuzla                                 28.80s   58.7
-#   Z3                                      252.43s  517.3
-#
-# Abstraction is left off: at 33 and 53 bits it helps the batch pipeline on a
-# few benchmarks but loses on most of them, and it makes the incremental driver
-# slower and much more likely to be killed (27 and 21 hard kills over the whole
-# set against 5).
+# Only CryptoMiniSat and CaDiCaL can abandon a SAT search already in progress;
+# with MiniSat the budget is honoured only between calls into the solver. So
+# minisat is 5% cheaper per query on fp-bench but cannot be interrupted, which
+# is why both are here.
 stp-inc	stp	$STP_CMS	--stp-sat-solver=minisat --stp-incremental-engage-at=1
+stp-inc-cms	stp	$STP_CMS	--stp-sat-solver=cryptominisat --stp-incremental-engage-at=1
 stp-adapt	stp	$STP_CMS	--stp-sat-solver=minisat --stp-incremental-engage-at=8 --stp-adapt-incremental
 stp-batch	stp	$STP_CMS	--stp-sat-solver=minisat
 bitwuzla	bitwuzla	-	

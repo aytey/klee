@@ -21,12 +21,16 @@ OUT=${GSL_BENCH_OUT:-$W/runs}
 KLEE=${KLEE:-$KLEE_BUILD/bin/klee}
 BUDGET=${BUDGET:-60}                 # KLEE exploration budget, seconds
 HARD=${HARD:-$((BUDGET * 5 / 2))}    # SIGKILL if it overruns that badly
-# No --max-solver-time. CoreSolver.cpp passes --use-forked-solver only to
-# STPSolver, and STP's per-query timeout is implemented by that fork -- so with
-# forking off (below) a solver timeout would bind Z3 and Bitwuzla and not STP.
-# The outer HARD kill bounds the run instead, identically for every backend,
-# which is what scripts/fp-bench-2026/run-one.sh does. The APSEC harness set
-# --max-solver-time=30, but it was not comparing backends to each other.
+# --max-solver-time is back, and is now symmetric: STP used to implement its
+# per-query timeout with the fork that --use-forked-solver=false turns off, so
+# a solver timeout bound Z3 and Bitwuzla and not STP. STPSolver now bounds the
+# in-process query with STP's own vc_query_with_timeout, so all three honour it.
+#
+# It matters more than it looks. Without it, one query STP cannot finish runs
+# until the outer kill and the whole run is lost: over 431 GSL drivers, STP with
+# its incremental driver was hard-killed 200 times against batch's 156, and
+# covered 8 points less of the target functions despite being the faster solver.
+MAX_SOLVER_TIME=${MAX_SOLVER_TIME:-30}
 MAX_MEMORY=${MAX_MEMORY:-4000}
 REPLAY_TIMEOUT=${REPLAY_TIMEOUT:-5}   # per test, as in the APSEC harness
 MAX_REPLAY=${MAX_REPLAY:-0}           # 0 = replay every test
@@ -61,6 +65,7 @@ timeout -s KILL "$HARD" "$KLEE" \
   --solver-backend="$SOLVER" \
   --search="$search" \
   --max-time="${BUDGET}s" \
+  --max-solver-time="${MAX_SOLVER_TIME}s" \
   --max-memory="$MAX_MEMORY" \
   `# only STP honours this, so leaving it on has STP fork a process per query` \
   `# while Z3 and Bitwuzla run in-process -- not a like-for-like comparison` \

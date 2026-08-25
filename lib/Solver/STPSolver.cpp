@@ -408,9 +408,25 @@ static SolverImpl::SolverRunStatus
 runAndGetCex(::VC vc, STPBuilder *builder, ::VCExpr q,
              const std::vector<const Array *> &objects,
              std::vector<std::vector<unsigned char>> &values,
-             bool &hasSolution) {
-  // XXX I want to be able to timeout here, safely
-  hasSolution = !vc_query(vc, q);
+             bool &hasSolution, time::Span timeout) {
+  // The forked path spends a process to bound a query. STP can do it itself,
+  // which is what the comment that used to sit here wanted: -1 is "no limit"
+  // for either budget, and only the conflict budget is left unbounded because
+  // what --max-solver-time asks for is wall clock.
+  //
+  // Worth knowing which SAT backend is underneath: only CryptoMiniSat and
+  // CaDiCaL can abandon a search already in progress. With MiniSat the budget
+  // is honoured only between calls into the SAT solver, so one long call still
+  // overruns it.
+  const int seconds = timeout ? static_cast<int>(timeout.toSeconds()) : -1;
+  const int result = vc_query_with_timeout(vc, q, -1, seconds);
+
+  if (result == 2)
+    return SolverImpl::SOLVER_RUN_STATUS_FAILURE;
+  if (result == 3)
+    return SolverImpl::SOLVER_RUN_STATUS_TIMEOUT;
+
+  hasSolution = !result;
 
   if (!hasSolution)
     return SolverImpl::SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE;
@@ -640,9 +656,10 @@ bool STPSolverImpl::computeInitialValues(
     success = ((SOLVER_RUN_STATUS_SUCCESS_SOLVABLE == runStatusCode) ||
                (SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE == runStatusCode));
   } else {
-    runStatusCode =
-        runAndGetCex(vc, builder.get(), stp_e, objects, values, hasSolution);
-    success = true;
+    runStatusCode = runAndGetCex(vc, builder.get(), stp_e, objects, values,
+                                 hasSolution, timeout);
+    success = ((SOLVER_RUN_STATUS_SUCCESS_SOLVABLE == runStatusCode) ||
+               (SOLVER_RUN_STATUS_SUCCESS_UNSOLVABLE == runStatusCode));
   }
 
   if (success) {
