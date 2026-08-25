@@ -1,15 +1,10 @@
-# The configuration question, with a per-query timeout that finally works
-# without forking (STPSolver now uses STP's vc_query_with_timeout).
-#
+# The tuned STP configuration against Bitwuzla, Z3, and what 3.2 ships.
 # label <TAB> backend <TAB> libstp dir (or -) <TAB> extra klee args
 #
-# Only CryptoMiniSat and CaDiCaL can abandon a SAT search already in progress;
-# with MiniSat the budget is honoured only between calls into the solver. So
-# minisat is 5% cheaper per query on fp-bench but cannot be interrupted, which
-# is why both are here.
-stp-inc	stp	$STP_CMS	--stp-sat-solver=minisat --stp-incremental-engage-at=1
-stp-inc-cms	stp	$STP_CMS	--stp-sat-solver=cryptominisat --stp-incremental-engage-at=1
-stp-adapt	stp	$STP_CMS	--stp-sat-solver=minisat --stp-incremental-engage-at=8 --stp-adapt-incremental
-stp-batch	stp	$STP_CMS	--stp-sat-solver=minisat
+# Every configuration is bounded at 30s per query and runs in-process, except
+# stp-shipped, which is what KLEE 3.2 does today: batch, bounded by forking.
+stp-adapt-cms	stp	$STP_CMS	--stp-sat-solver=cryptominisat --stp-incremental-engage-at=8 --stp-adapt-incremental --use-forked-solver=false
+stp-adapt-minisat	stp	$STP_CMS	--stp-sat-solver=minisat --stp-incremental-engage-at=8 --stp-adapt-incremental --use-forked-solver=false
+stp-shipped	stp	$STP_CMS	--stp-sat-solver=minisat
 bitwuzla	bitwuzla	-	
 z3	z3	-	

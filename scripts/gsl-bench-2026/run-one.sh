@@ -21,7 +21,11 @@ OUT=${GSL_BENCH_OUT:-$W/runs}
 KLEE=${KLEE:-$KLEE_BUILD/bin/klee}
 BUDGET=${BUDGET:-60}                 # KLEE exploration budget, seconds
 HARD=${HARD:-$((BUDGET * 5 / 2))}    # SIGKILL if it overruns that badly
-# --max-solver-time is back, and is now symmetric: STP used to implement its
+# Forking is decided per configuration now (see configs/), not here: it is only
+# STP that reads --use-forked-solver, and whether it forks is one of the things
+# being compared rather than a constant of the harness.
+#
+# --max-solver-time is symmetric: STP used to implement its
 # per-query timeout with the fork that --use-forked-solver=false turns off, so
 # a solver timeout bound Z3 and Bitwuzla and not STP. STPSolver now bounds the
 # in-process query with STP's own vc_query_with_timeout, so all three honour it.
@@ -67,9 +71,6 @@ timeout -s KILL "$HARD" "$KLEE" \
   --max-time="${BUDGET}s" \
   --max-solver-time="${MAX_SOLVER_TIME}s" \
   --max-memory="$MAX_MEMORY" \
-  `# only STP honours this, so leaving it on has STP fork a process per query` \
-  `# while Z3 and Bitwuzla run in-process -- not a like-for-like comparison` \
-  --use-forked-solver=false \
   --link-llvm-lib="$UCLIBC/lib/libm.a" \
   $EXTRA_ARGS \
   "$W/obj/$group/$name.bc" > "$log" 2>&1

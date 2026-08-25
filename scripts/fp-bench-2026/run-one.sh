@@ -156,6 +156,15 @@ case $CFG in
   bd-adapt-cms)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=cryptominisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
 
+  # The other two backends under the same bound. Neither reads
+  # --use-forked-solver -- they have always run in-process and bounded their
+  # own queries -- but they have to be measured in the same sweep as the STP
+  # configurations, not against numbers from another one.
+  bd-bitwuzla)   BACKEND=bitwuzla; LIB=""
+                 EXTRA="--max-solver-time=30s" ;;
+  bd-z3)         BACKEND=z3; LIB=""
+                 EXTRA="--max-solver-time=30s" ;;
+
   # What 3.2 shipped: batch, bounded by spending a process on every query.
   bd-forked)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --use-forked-solver=true" ;;
