@@ -146,6 +146,16 @@ case $CFG in
                  EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --stp-incremental-engage-at=1" ;;
   bd-adapt)      BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+  # The same, on an interruptible SAT backend. STP can only abandon a search
+  # already in progress under CryptoMiniSat or CaDiCaL; under MiniSat the
+  # budget is checked between calls into the solver, so a single long call
+  # overruns it. A fork has no such problem -- it is killed wherever it is --
+  # so this is where in-process bounding would be expected to lose ground.
+  bd-batch-cms)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=cryptominisat --max-solver-time=30s" ;;
+  bd-adapt-cms)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=cryptominisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+
   # What 3.2 shipped: batch, bounded by spending a process on every query.
   bd-forked)     BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --use-forked-solver=true" ;;

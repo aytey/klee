@@ -268,27 +268,54 @@ That did not turn out to matter -- the bounded query costs the same under both
 (3-4x an unbounded one on matched query counts, so the cost is in STP's timeout
 mechanism, not in interruptibility).
 
-### Incremental driver
+### Incremental driver, and how the query is bounded
 
-**Measure this under the bound you will actually run with.** Unbounded, STP's
-incremental driver looks like a 3x win over batch mode (11.10s against 33.53s
-over 46 benchmarks). Bounded, on 66 benchmarks all doing an identical 1,178,709
-instructions, it is a 1.5x *loss*:
+These turned out to be one question, and getting it wrong was worth more than
+every other axis on this page put together.
+
+KLEE bounded an STP query by forking a process and killing it, and
+`Executor`'s constructor turned a `--max-solver-time` into a forced
+`--use-forked-solver=true` -- overriding an explicit `false` silently. A fork
+gives every query a fresh child, so STP's incremental driver, whose whole
+purpose is to carry work across the queries of a session, could not engage at
+all whenever a timeout was set. Measured from inside STP, `applySolveBudgets`
+was reached 44 times in an unbounded run of one GSL driver and **zero** times in
+the bounded one.
+
+The effect looked exactly like STP charging for the timeout, and it is not.
+With the override gone and `STPSolver` bounding an in-process query through
+`vc_query_with_timeout`, a budget is free -- as it always was for Z3 and
+Bitwuzla, neither of which reads the fork flag:
+
+| one GSL driver, 44 queries either way | no budget | 30s budget |
+| --- | --- | --- |
+| batch | 11.624s | 11.588s |
+| incremental | 4.608s | 4.668s |
+
+68 fp-bench benchmarks, work identical to within 0.02%:
 
 | config | solverT | ms/query | bugs found | missed |
 | --- | --- | --- | --- | --- |
-| adaptive (`-stp-adapt-incremental`, engage at 8) | **128.01** | **167.3** | 34 | 0 |
-| batch, in-process bound | 136.48 | 178.4 | 34 | 0 |
-| batch, bounded by forking (what 3.2 ships) | 136.60 | 178.6 | 34 | 0 |
-| incremental from query 1 | 209.47 | 276.3 | 34 | 0 |
-| incremental from query 1, unbounded | 164.60 | 216.0 | 31 | 3 |
+| adaptive, MiniSat, in-process | **150.05** | **80.9** | 32 | 2 |
+| adaptive, CryptoMiniSat, in-process | 185.10 | 99.7 | **34** | **0** |
+| batch, CryptoMiniSat, in-process | 226.13 | 122.0 | 33 | 1 |
+| batch, MiniSat, forked (what 3.2 ships) | 207.43 | 111.8 | **34** | **0** |
 
-Two things fall out of that table. The in-process bound costs exactly what
-forking costs (136.48 against 136.60, 0.1% apart) and saves a process per query,
-so it is a free change. And engaging the driver unconditionally is worse than
-not engaging it -- it is the *adaptive* policy, which measures both modes and
-abandons the driver when it is losing, that is worth having, and it is worth
-about 7%.
+Two things to read off it.
+
+**The adaptive policy is what wins, not the driver.** Always engaging the
+driver is no better than batch on this suite even now, and batch on
+CryptoMiniSat is *worse* than what ships. Which mode a session wants is a
+property of the session, which is the premise the adaptive policy was built on.
+
+**And the SAT backend is now load-bearing for a second reason.** Only
+CryptoMiniSat and CaDiCaL can abandon a SAT search already in progress; under
+MiniSat a budget is only checked between calls into the solver, so one long
+call overruns it. A fork has no such problem -- it is killed wherever it is. So
+in-process bounding on MiniSat loses two true positives against the forked
+baseline, consistently and with a mechanism, while on CryptoMiniSat it finds
+all 34. MiniSat is 5% cheaper per query; interruptibility is worth more than
+5%.
 
 ### Bit-vector abstraction
 
@@ -301,75 +328,27 @@ against 5 with it off, and true positives falling from 32 to 27.
 ### Where that leaves the configuration
 
 ```
---solver-backend=stp --stp-sat-solver=minisat
+--solver-backend=stp --stp-sat-solver=cryptominisat
 --stp-incremental-engage-at=8 --stp-adapt-incremental
 --use-forked-solver=false --max-solver-time=<budget>
 ```
 
-Worth roughly 7% of solver time against what 3.2 ships, and one fewer process
-per query. The large wins were elsewhere: linking a current STP, and bounding
-the query at all.
+12% faster than what 3.2 ships, finding the same 34 bugs and missing none, and
+spending no process per query. MiniSat with the same policy is faster still --
+38% -- but it cannot be interrupted mid-search and gives up two of those bugs
+for it, which is the wrong trade for a tool whose job is finding them.
 
-## What would make STP win outright
+## Still open
 
-STP is already the faster solver on this workload. Unbounded it answers a GSL
-query in 5.6ms against Bitwuzla's 11.5, and it covers marginally more of the
-target functions. Everything below is about not giving that back.
+**The abstraction, at the widths this workload actually uses.** Where the
+budget goes on both suites is a minority of hard benchmarks, and that is
+precisely where the bit-vector abstraction is measured as a loss -- because the
+products that dominate them are binary64 and x87 significands, 53 and 64 bits
+wide. `6be15384` on the klee-float branch localised it: equality abstraction
+alone changes nothing, and it is BVMULT/BVDIV/BVMOD refinement specifically
+that fails to converge at those widths. Nothing in the per-query work above
+touches those benchmarks.
 
-### 1. Make a query budget compose with the incremental driver
-
-The single largest lever, worth more than every other axis measured put
-together. Arming a per-query time budget removes the driver's benefit and, at
-full engagement, inverts it -- in proportion to how many queries the driver
-handles. Holding the work fixed at 44 queries on `gsl_cdf_laplace_Q`:
-
-| `-stp-incremental-engage-at` | driver handles | unbounded | 30s budget | penalty |
-| --- | --- | --- | --- | --- |
-| 1 | 43 of 44 | **4.575s** | **20.979s** | **4.6x** |
-| 10 | 34 | 8.894s | 11.924s | 1.34x |
-| 25 | 19 | 10.255s | 12.296s | 1.20x |
-| 40 | 4 | 13.114s | 12.070s | 0.92x |
-| off | 0 | 11.575s | 12.098s | 1.05x |
-
-Read the unbounded column downwards and the driver is doing exactly what it is
-for: 11.6s of solving becomes 4.6s as it takes over more of the session. Read
-the bounded column and that gain is gone.
-
-Three things it is not:
-
-* **Not the deadline.** A budget of 30 seconds and one of 3000 cost the same,
-  so nothing is being spent checking a clock.
-* **Not the SAT backend's interruption machinery.** MiniSat (which cannot
-  abandon a running search, so the deadline is only checked between calls) and
-  CryptoMiniSat (which can) pay the same.
-* **Not model construction.** `modelConstructionRequired` derives from what the
-  caller asked for; a budget is not one of its inputs.
-
-`applySolveBudgets` is called per check-sat from `IncrementalSolver.cpp` and
-`IncrementalExactStack.cpp`, and per query from `STP.cpp`. Whatever arming a
-budget does to the driver's per-check state is where the 4.6x lives.
-
-If this were free, STP bounded would be STP unbounded -- around 5.6ms a query
-against Bitwuzla's 9.1 -- and the ordering on this suite reverses.
-
-### 2. Make it free in batch mode too
-
-Smaller and broader: a fixed few milliseconds per query, invisible where a query
-costs 288ms and worth +63% where it costs 16. Over GSL's like-for-like set it is
-the difference between 12.3 and 15.6 ms/query. Bitwuzla and Z3 both bound a
-query for nothing (0.80x and 0.84x, inside the noise), so it is achievable.
-
-### 3. The abstraction is a second engine, currently idling
-
-Where the budget actually goes on both suites is a minority of hard benchmarks,
-and that is precisely where the bit-vector abstraction is measured as a loss --
-because the products that dominate them are binary64 and x87 significands, 53
-and 64 bits wide. `6be15384` on the klee-float branch already localised it:
-equality abstraction alone changes nothing, and it is BVMULT/BVDIV/BVMOD
-refinement specifically that fails to converge at those widths. Nothing in the
-per-query cost above touches those benchmarks; this is the lever that would.
-
-### 4. Do not lose on the SAT backend
-
-MiniSat. CaDiCaL costs 21% and CryptoMiniSat 5% on fp-bench, and the two
-controls put the noise floor at about 3%.
+**Whether MiniSat can be made interruptible.** It is the cheapest backend per
+query by 5% and the only reason not to use it is that a budget cannot stop it
+mid-search. That is a property of how STP calls it, not of the SAT problem.
