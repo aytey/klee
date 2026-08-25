@@ -308,14 +308,33 @@ driver is no better than batch on this suite even now, and batch on
 CryptoMiniSat is *worse* than what ships. Which mode a session wants is a
 property of the session, which is the premise the adaptive policy was built on.
 
-**And the SAT backend is now load-bearing for a second reason.** Only
-CryptoMiniSat and CaDiCaL can abandon a SAT search already in progress; under
-MiniSat a budget is only checked between calls into the solver, so one long
-call overruns it. A fork has no such problem -- it is killed wherever it is. So
-in-process bounding on MiniSat loses two true positives against the forked
-baseline, consistently and with a mechanism, while on CryptoMiniSat it finds
-all 34. MiniSat is 5% cheaper per query; interruptibility is worth more than
-5%.
+**And the SAT backend was load-bearing for a second reason, until it was not.**
+Only CryptoMiniSat and CaDiCaL could abandon a SAT search already in progress;
+under MiniSat a budget was only checked between calls into the solver, so one
+long call overran it. A fork has no such problem -- it is killed wherever it
+is -- so in-process bounding on MiniSat gave up a true positive against the
+forked baseline, consistently and with a mechanism.
+
+That is fixed rather than worked around. MiniSat now carries a terminator hook
+(`stp/minisat` `caa97eb`) polled wherever its conflict and propagation budgets
+already are, and `MinisatCore` connects one that reads the deadline `SATSolver`
+keeps (`stp` `11137fc4`). No clock goes into MiniSat: its only one is CPU time
+and the deadline here is wall clock, which part company exactly when the
+machine is loaded. On a one-second budget, a search that ran to completion in
+55 seconds now stops in one.
+
+69 benchmarks, identical 1,568,101 instructions:
+
+| config | solverT | ms/query | bugs found | missed |
+| --- | --- | --- | --- | --- |
+| adaptive, MiniSat + terminator | **171.85** | **87.5** | **34** | **0** |
+| adaptive, MiniSat, no terminator | 170.66 | 86.8 | 33 | 1 |
+| adaptive, CryptoMiniSat | 205.45 | 104.4 | **34** | **0** |
+| batch, MiniSat, forked (what 3.2 ships) | 237.66 | 120.9 | **34** | **0** |
+
+The terminator costs 0.7%, inside the noise floor, and buys back the bug. So
+the answer moves back to MiniSat: 1.38x faster than a forked solver where
+CryptoMiniSat is 1.16x, with the same 34 found and none missed.
 
 ### Bit-vector abstraction
 
@@ -328,15 +347,15 @@ against 5 with it off, and true positives falling from 32 to 27.
 ### Where that leaves the configuration
 
 ```
---solver-backend=stp --stp-sat-solver=cryptominisat
+--solver-backend=stp --stp-sat-solver=minisat
 --stp-incremental-engage-at=8 --stp-adapt-incremental
 --use-forked-solver=false --max-solver-time=<budget>
 ```
 
-12% faster than what 3.2 ships, finding the same 34 bugs and missing none, and
-spending no process per query. MiniSat with the same policy is faster still --
-38% -- but it cannot be interrupted mid-search and gives up two of those bugs
-for it, which is the wrong trade for a tool whose job is finding them.
+38% faster than what 3.2 ships, finding the same 34 bugs and missing none, and
+spending no process per query. It needs an STP built against a MiniSat carrying
+the terminator hook; without one, use `--stp-sat-solver=cryptominisat`, which
+is 16% faster than the shipped configuration and equally sound.
 
 ## Still open
 
@@ -349,6 +368,3 @@ alone changes nothing, and it is BVMULT/BVDIV/BVMOD refinement specifically
 that fails to converge at those widths. Nothing in the per-query work above
 touches those benchmarks.
 
-**Whether MiniSat can be made interruptible.** It is the cheapest backend per
-query by 5% and the only reason not to use it is that a budget cannot stop it
-mid-search. That is a property of how STP calls it, not of the SAT problem.

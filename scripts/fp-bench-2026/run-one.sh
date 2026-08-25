@@ -45,6 +45,9 @@ STP_stp_LIB=${STP_LIB:-}
 # STP's staged one, so lib/Sat/Cadical.cpp will not compile with both enabled.
 STP_CMS_LIB=${STP_CMS_LIB:-$ROOT/deps/install-stp-master-cms/lib64}
 STP_CAD_LIB=${STP_CAD_LIB:-$ROOT/deps/install-stp-master-cadical/lib64}
+# STP against a MiniSat carrying a terminator hook, so that a deadline can stop
+# a search already in progress rather than only being noticed between calls.
+STP_TERM_LIB=${STP_TERM_LIB:-$ROOT/deps/install-stp-term/lib64}
 STP_stp_minisat_LIB=${STP_MINISAT_LIB:-}
 STP_stp_cadical2_LIB=${STP_CADICAL2_LIB:-}
 STP_stp_cadical3_LIB=${STP_CADICAL3_LIB:-}
@@ -155,6 +158,13 @@ case $CFG in
                  EXTRA="--stp-sat-solver=cryptominisat --max-solver-time=30s" ;;
   bd-adapt-cms)  BACKEND=stp; LIB=$STP_CMS_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
                  EXTRA="--stp-sat-solver=cryptominisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+
+  # MiniSat, interruptible. The question is whether the two true positives that
+  # in-process MiniSat gives up against the forked baseline come back.
+  bd-adapt-term) BACKEND=stp; LIB=$STP_TERM_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s --stp-incremental-engage-at=8 --stp-adapt-incremental" ;;
+  bd-batch-term) BACKEND=stp; LIB=$STP_TERM_LIB/libstp.so.2.4; SONAME=libstp.so.2.4
+                 EXTRA="--stp-sat-solver=minisat --max-solver-time=30s" ;;
 
   # The other two backends under the same bound. Neither reads
   # --use-forked-solver -- they have always run in-process and bounded their
