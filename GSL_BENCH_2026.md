@@ -309,3 +309,67 @@ against 5 with it off, and true positives falling from 32 to 27.
 Worth roughly 7% of solver time against what 3.2 ships, and one fewer process
 per query. The large wins were elsewhere: linking a current STP, and bounding
 the query at all.
+
+## What would make STP win outright
+
+STP is already the faster solver on this workload. Unbounded it answers a GSL
+query in 5.6ms against Bitwuzla's 11.5, and it covers marginally more of the
+target functions. Everything below is about not giving that back.
+
+### 1. Make a query budget compose with the incremental driver
+
+The single largest lever, worth more than every other axis measured put
+together. Arming a per-query time budget removes the driver's benefit and, at
+full engagement, inverts it -- in proportion to how many queries the driver
+handles. Holding the work fixed at 44 queries on `gsl_cdf_laplace_Q`:
+
+| `-stp-incremental-engage-at` | driver handles | unbounded | 30s budget | penalty |
+| --- | --- | --- | --- | --- |
+| 1 | 43 of 44 | **4.575s** | **20.979s** | **4.6x** |
+| 10 | 34 | 8.894s | 11.924s | 1.34x |
+| 25 | 19 | 10.255s | 12.296s | 1.20x |
+| 40 | 4 | 13.114s | 12.070s | 0.92x |
+| off | 0 | 11.575s | 12.098s | 1.05x |
+
+Read the unbounded column downwards and the driver is doing exactly what it is
+for: 11.6s of solving becomes 4.6s as it takes over more of the session. Read
+the bounded column and that gain is gone.
+
+Three things it is not:
+
+* **Not the deadline.** A budget of 30 seconds and one of 3000 cost the same,
+  so nothing is being spent checking a clock.
+* **Not the SAT backend's interruption machinery.** MiniSat (which cannot
+  abandon a running search, so the deadline is only checked between calls) and
+  CryptoMiniSat (which can) pay the same.
+* **Not model construction.** `modelConstructionRequired` derives from what the
+  caller asked for; a budget is not one of its inputs.
+
+`applySolveBudgets` is called per check-sat from `IncrementalSolver.cpp` and
+`IncrementalExactStack.cpp`, and per query from `STP.cpp`. Whatever arming a
+budget does to the driver's per-check state is where the 4.6x lives.
+
+If this were free, STP bounded would be STP unbounded -- around 5.6ms a query
+against Bitwuzla's 9.1 -- and the ordering on this suite reverses.
+
+### 2. Make it free in batch mode too
+
+Smaller and broader: a fixed few milliseconds per query, invisible where a query
+costs 288ms and worth +63% where it costs 16. Over GSL's like-for-like set it is
+the difference between 12.3 and 15.6 ms/query. Bitwuzla and Z3 both bound a
+query for nothing (0.80x and 0.84x, inside the noise), so it is achievable.
+
+### 3. The abstraction is a second engine, currently idling
+
+Where the budget actually goes on both suites is a minority of hard benchmarks,
+and that is precisely where the bit-vector abstraction is measured as a loss --
+because the products that dominate them are binary64 and x87 significands, 53
+and 64 bits wide. `6be15384` on the klee-float branch already localised it:
+equality abstraction alone changes nothing, and it is BVMULT/BVDIV/BVMOD
+refinement specifically that fails to converge at those widths. Nothing in the
+per-query cost above touches those benchmarks; this is the lever that would.
+
+### 4. Do not lose on the SAT backend
+
+MiniSat. CaDiCaL costs 21% and CryptoMiniSat 5% on fp-bench, and the two
+controls put the noise floor at about 3%.
