@@ -39,6 +39,28 @@ llvm::cl::opt<bool> BitwuzlaIncremental(
                    "around each, rather than building a new one per query "
                    "(default=false, which is what KLEE has always done)"));
 
+// Bitwuzla's own settings, none of which KLEE could reach before. Each is
+// defaulted to a sentinel meaning "leave Bitwuzla's own default alone", so
+// nothing here changes unless it is asked for -- the same shape as the STP
+// backend's options.
+llvm::cl::opt<std::string> BitwuzlaSatSolver(
+    "bitwuzla-sat-solver", llvm::cl::init(""),
+    llvm::cl::desc("Bitwuzla's backend SAT solver: cadical, kissat or cms "
+                   "(default=empty, leave Bitwuzla's own default alone). Only "
+                   "those compiled into libbitwuzla can be selected."));
+
+llvm::cl::opt<int> BitwuzlaRewriteLevel(
+    "bitwuzla-rewrite-level", llvm::cl::init(-1),
+    llvm::cl::desc("Bitwuzla's rewrite level: 0 none, 1 cheap term rewrites, "
+                   "2 full plus preprocessing (default=-1, leave Bitwuzla's "
+                   "own default alone)"));
+
+llvm::cl::opt<int> BitwuzlaAbstractionBvSize(
+    "bitwuzla-abstraction-bv-size", llvm::cl::init(-1),
+    llvm::cl::desc("Bit-width at or above which Bitwuzla abstracts a "
+                   "bit-vector term (default=-1, leave Bitwuzla's own default "
+                   "alone, which is 33)"));
+
 llvm::cl::opt<std::string> BitwuzlaQueryDumpFile(
     "debug-bitwuzla-dump-queries", llvm::cl::init(""),
     llvm::cl::desc("Dump Bitwuzla's SMT-LIBv2 representation of each query to "
@@ -75,6 +97,7 @@ private:
   }
 
   Bitwuzla *sessionFor();
+  void applyOptions(BitwuzlaOptions *options);
 
   bool internalRunSolver(const Query &,
                          const std::vector<const Array *> *objects,
@@ -118,12 +141,40 @@ BitwuzlaSolverImpl::~BitwuzlaSolverImpl() {
 // The session, built on first use so that a run which never queries pays
 // nothing for it. Options are set once here; see terminated() for why the
 // timeout is not among them.
+// Everything both paths configure, in one place so a session and a per-query
+// instance cannot drift apart.
+void BitwuzlaSolverImpl::applyOptions(BitwuzlaOptions *options) {
+  // KLEE needs counter-examples, not just satisfiability.
+  bitwuzla_set_option(options, BITWUZLA_OPT_PRODUCE_MODELS, 1);
+
+  // Bitwuzla's own bit-vector abstraction, on by default in Bitwuzla and
+  // therefore on in every measurement here so far. Turning it off is how to
+  // ask what it is actually worth on this workload rather than on Bitwuzla's
+  // own; the same question STP's --stp-bv-abstraction-width asks from the
+  // other side.
+  if (!BitwuzlaAbstraction)
+    bitwuzla_set_option(options, BITWUZLA_OPT_ABSTRACTION, 0);
+  if (BitwuzlaAbstractionBvSize >= 0)
+    bitwuzla_set_option(options, BITWUZLA_OPT_ABSTRACTION_BV_SIZE,
+                        static_cast<uint64_t>(BitwuzlaAbstractionBvSize));
+  if (BitwuzlaRewriteLevel >= 0)
+    bitwuzla_set_option(options, BITWUZLA_OPT_REWRITE_LEVEL,
+                        static_cast<uint64_t>(BitwuzlaRewriteLevel));
+  if (!BitwuzlaSatSolver.empty()) {
+    // A SAT solver Bitwuzla was not built with is a configuration error it
+    // reports by aborting, which is a poor way to learn of a typo; say what
+    // was asked for first.
+    klee_message("Asking Bitwuzla for SAT solver '%s'",
+                 BitwuzlaSatSolver.c_str());
+    bitwuzla_set_option_mode(options, BITWUZLA_OPT_SAT_SOLVER,
+                             BitwuzlaSatSolver.c_str());
+  }
+}
+
 Bitwuzla *BitwuzlaSolverImpl::sessionFor() {
   if (!sessionSolver) {
     sessionOptions = bitwuzla_options_new();
-    bitwuzla_set_option(sessionOptions, BITWUZLA_OPT_PRODUCE_MODELS, 1);
-    if (!BitwuzlaAbstraction)
-      bitwuzla_set_option(sessionOptions, BITWUZLA_OPT_ABSTRACTION, 0);
+    applyOptions(sessionOptions);
     sessionSolver = bitwuzla_new(builder->tm, sessionOptions);
     bitwuzla_set_termination_callback(sessionSolver, &terminated, this);
   }
@@ -251,16 +302,7 @@ bool BitwuzlaSolverImpl::internalRunSolver(
     bitwuzla_push(bzla, 1);
   } else {
     options = bitwuzla_options_new();
-    // KLEE needs counter-examples, not just satisfiability.
-    bitwuzla_set_option(options, BITWUZLA_OPT_PRODUCE_MODELS, 1);
-
-    // Bitwuzla's own bit-vector abstraction, on by default in Bitwuzla and
-    // therefore on in every measurement here so far. Turning it off is how to
-    // ask what it is actually worth on this workload rather than on
-    // Bitwuzla's own; the same question STP's --stp-bv-abstraction-width asks
-    // from the other side.
-    if (!BitwuzlaAbstraction)
-      bitwuzla_set_option(options, BITWUZLA_OPT_ABSTRACTION, 0);
+    applyOptions(options);
     if (timeoutInMilliSeconds) {
       // Per-query wall clock limit, in milliseconds.
       bitwuzla_set_option(options, BITWUZLA_OPT_TIME_LIMIT_PER,
