@@ -132,6 +132,20 @@ llvm::cl::opt<int> STPCNFEffort(
                    "very high (default=-1, leave STP's own default alone)"),
     llvm::cl::cat(klee::SolvingCat));
 
+// Where AUTO stops minimising the CNF. STP defaults it high -- high enough
+// that it only overrides the effort where the circuit is so large that
+// generating its CNF costs more than solving it -- because where the crossover
+// falls is a property of the workload rather than a constant. KLEE's workload
+// is thousands of small queries with a tail of enormous ones, which is not the
+// distribution STP's default was measured against, so it is worth being able
+// to move it from here rather than by rebuilding STP.
+llvm::cl::opt<int> STPCNFAutoThreshold(
+    "stp-cnf-auto-threshold", llvm::cl::init(-1),
+    llvm::cl::desc("AIG AND-node count at or above which STP's auto CNF effort "
+                   "drops to very low; 0 makes it very low everywhere "
+                   "(default=-1, leave STP's own default alone)"),
+    llvm::cl::cat(klee::SolvingCat));
+
 // STP replaces a wide bit-vector operation by free result bits and pins them
 // lazily, refining only where a candidate model contradicts the operands
 // underneath. Off in STP and off here, because what it is worth depends
@@ -272,6 +286,9 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
 
   if (STPCNFEffort >= 0)
     vc_setInterfaceFlags(vc, CNF_GENERATION_EFFORT, STPCNFEffort.getValue());
+  if (STPCNFAutoThreshold >= 0)
+    vc_setInterfaceFlags(vc, CNF_AUTO_THRESHOLD,
+                         STPCNFAutoThreshold.getValue());
 
   // set SAT solver
   bool SATSolverAvailable = false;
