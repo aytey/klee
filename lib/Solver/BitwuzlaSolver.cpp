@@ -19,6 +19,7 @@
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/ExprUtil.h"
 #include "klee/Support/ErrorHandling.h"
+#include "klee/System/Time.h"
 
 #include "llvm/Support/CommandLine.h"
 
@@ -31,6 +32,12 @@ llvm::cl::opt<bool> BitwuzlaAbstraction(
     "bitwuzla-abstraction", llvm::cl::init(true),
     llvm::cl::desc("Use Bitwuzla's bit-vector abstraction (default=on, which "
                    "is Bitwuzla's own default)"));
+
+llvm::cl::opt<bool> BitwuzlaIncremental(
+    "bitwuzla-incremental", llvm::cl::init(false),
+    llvm::cl::desc("Keep one Bitwuzla instance across queries and push/pop "
+                   "around each, rather than building a new one per query "
+                   "(default=false, which is what KLEE has always done)"));
 
 llvm::cl::opt<std::string> BitwuzlaQueryDumpFile(
     "debug-bitwuzla-dump-queries", llvm::cl::init(""),
@@ -45,6 +52,29 @@ private:
   BitwuzlaBuilder *builder;
   time::Span timeout;
   SolverRunStatus runStatusCode;
+
+  // Only used when --bitwuzla-incremental is on: the instance that outlives a
+  // query, and the deadline the termination callback reads.
+  Bitwuzla *sessionSolver;
+  BitwuzlaOptions *sessionOptions;
+  time::Point deadline;
+  bool deadlineActive;
+
+  // Bitwuzla freezes its options when the instance is built, so a reused
+  // instance cannot carry BITWUZLA_OPT_TIME_LIMIT_PER: KLEE moves the timeout
+  // between coreSolverTimeout, a multiple of it while seeding, and zero, and
+  // the per-query limit would be whatever it happened to be at construction.
+  // The termination callback is the way to enforce a limit that changes,
+  // which is the same reason STP needs a MiniSat that can be stopped
+  // mid-search rather than a limit checked between calls.
+  static int32_t terminated(void *state) {
+    BitwuzlaSolverImpl *self = static_cast<BitwuzlaSolverImpl *>(state);
+    if (!self->deadlineActive)
+      return 0;
+    return time::getWallTime() >= self->deadline ? 1 : 0;
+  }
+
+  Bitwuzla *sessionFor();
 
   bool internalRunSolver(const Query &,
                          const std::vector<const Array *> *objects,
@@ -69,11 +99,36 @@ public:
 
 BitwuzlaSolverImpl::BitwuzlaSolverImpl()
     : builder(new BitwuzlaBuilder(/*autoClearConstructCache=*/false)),
-      timeout(time::Span()), runStatusCode(SOLVER_RUN_STATUS_FAILURE) {
+      timeout(time::Span()), runStatusCode(SOLVER_RUN_STATUS_FAILURE),
+      sessionSolver(NULL), sessionOptions(NULL), deadlineActive(false) {
   assert(builder && "unable to create BitwuzlaBuilder");
+  klee_message("Using Bitwuzla solver backend (%s)",
+               BitwuzlaIncremental ? "one session, push/pop per query"
+                                   : "a new instance per query");
 }
 
-BitwuzlaSolverImpl::~BitwuzlaSolverImpl() { delete builder; }
+BitwuzlaSolverImpl::~BitwuzlaSolverImpl() {
+  if (sessionSolver)
+    bitwuzla_delete(sessionSolver);
+  if (sessionOptions)
+    bitwuzla_options_delete(sessionOptions);
+  delete builder;
+}
+
+// The session, built on first use so that a run which never queries pays
+// nothing for it. Options are set once here; see terminated() for why the
+// timeout is not among them.
+Bitwuzla *BitwuzlaSolverImpl::sessionFor() {
+  if (!sessionSolver) {
+    sessionOptions = bitwuzla_options_new();
+    bitwuzla_set_option(sessionOptions, BITWUZLA_OPT_PRODUCE_MODELS, 1);
+    if (!BitwuzlaAbstraction)
+      bitwuzla_set_option(sessionOptions, BITWUZLA_OPT_ABSTRACTION, 0);
+    sessionSolver = bitwuzla_new(builder->tm, sessionOptions);
+    bitwuzla_set_termination_callback(sessionSolver, &terminated, this);
+  }
+  return sessionSolver;
+}
 
 BitwuzlaSolver::BitwuzlaSolver()
     : Solver(std::make_unique<BitwuzlaSolverImpl>()) {}
@@ -180,25 +235,39 @@ bool BitwuzlaSolverImpl::internalRunSolver(
   if (objects)
     ++stats::queryCounterexamples;
 
-  BitwuzlaOptions *options = bitwuzla_options_new();
-  // KLEE needs counter-examples, not just satisfiability.
-  bitwuzla_set_option(options, BITWUZLA_OPT_PRODUCE_MODELS, 1);
-
-  // Bitwuzla's own bit-vector abstraction, on by default in Bitwuzla and
-  // therefore on in every measurement here so far. Turning it off is how to
-  // ask what it is actually worth on this workload rather than on
-  // Bitwuzla's own; the same question STP's --stp-bv-abstraction-width asks
-  // from the other side.
-  if (!BitwuzlaAbstraction)
-    bitwuzla_set_option(options, BITWUZLA_OPT_ABSTRACTION, 0);
   auto timeoutInMilliSeconds =
       static_cast<uint64_t>(timeout.toMicroseconds() / 1000);
-  if (timeoutInMilliSeconds) {
-    // Per-query wall clock limit, in milliseconds.
-    bitwuzla_set_option(options, BITWUZLA_OPT_TIME_LIMIT_PER,
-                        timeoutInMilliSeconds);
+
+  BitwuzlaOptions *options = NULL;
+  Bitwuzla *bzla = NULL;
+  if (BitwuzlaIncremental) {
+    // One session across queries, with this query's assertions confined to a
+    // scope. What survives the pop is what makes this worth doing: everything
+    // the SAT solver learned, and the preprocessing already done.
+    bzla = sessionFor();
+    deadlineActive = timeoutInMilliSeconds != 0;
+    if (deadlineActive)
+      deadline = time::getWallTime() + timeout;
+    bitwuzla_push(bzla, 1);
+  } else {
+    options = bitwuzla_options_new();
+    // KLEE needs counter-examples, not just satisfiability.
+    bitwuzla_set_option(options, BITWUZLA_OPT_PRODUCE_MODELS, 1);
+
+    // Bitwuzla's own bit-vector abstraction, on by default in Bitwuzla and
+    // therefore on in every measurement here so far. Turning it off is how to
+    // ask what it is actually worth on this workload rather than on
+    // Bitwuzla's own; the same question STP's --stp-bv-abstraction-width asks
+    // from the other side.
+    if (!BitwuzlaAbstraction)
+      bitwuzla_set_option(options, BITWUZLA_OPT_ABSTRACTION, 0);
+    if (timeoutInMilliSeconds) {
+      // Per-query wall clock limit, in milliseconds.
+      bitwuzla_set_option(options, BITWUZLA_OPT_TIME_LIMIT_PER,
+                          timeoutInMilliSeconds);
+    }
+    bzla = bitwuzla_new(builder->tm, options);
   }
-  Bitwuzla *bzla = bitwuzla_new(builder->tm, options);
 
   for (const auto &constraint : query.constraints)
     bitwuzla_assert(bzla, builder->construct(constraint));
@@ -269,8 +338,15 @@ bool BitwuzlaSolverImpl::internalRunSolver(
     break;
   }
 
-  bitwuzla_delete(bzla);
-  bitwuzla_options_delete(options);
+  // The model is read above, while the assertions are still in scope; a pop
+  // invalidates it.
+  if (BitwuzlaIncremental) {
+    bitwuzla_pop(bzla, 1);
+    deadlineActive = false;
+  } else {
+    bitwuzla_delete(bzla);
+    bitwuzla_options_delete(options);
+  }
 
   // Terms are shared across a whole Query rather than a single construct()
   // call, so the cache is cleared here rather than by the builder.
