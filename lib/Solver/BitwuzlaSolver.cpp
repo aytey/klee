@@ -333,9 +333,12 @@ bool BitwuzlaSolverImpl::internalRunSolver(
     // fp.to_ieee_bv -- so the result is portable to other solvers.
     FILE *f = fopen(BitwuzlaQueryDumpFile.c_str(), "a");
     if (f) {
-      fprintf(f, "; start Bitwuzla query\n(set-logic QF_ABVFP)\n");
+      // bitwuzla_print_formula() emits its own (set-logic) and (check-sat),
+      // so neither is written here: a second (check-sat) would make anything
+      // replaying the dump solve each query twice and time it as one.
+      fprintf(f, "; start Bitwuzla query\n");
       bitwuzla_print_formula(bzla, "smt2", f, 10);
-      fprintf(f, "(check-sat)\n(exit)\n; end Bitwuzla query\n\n");
+      fprintf(f, "(exit)\n; end Bitwuzla query\n\n");
       fclose(f);
     }
   }
