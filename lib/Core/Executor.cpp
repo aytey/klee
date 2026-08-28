@@ -1490,6 +1490,8 @@ static inline const llvm::fltSemantics *fpWidthToSemantics(unsigned width) {
     return &llvm::APFloat::IEEEdouble();
   case Expr::Fl80:
     return &llvm::APFloat::x87DoubleExtended();
+  case Expr::Int128:
+    return &llvm::APFloat::IEEEquad();
   default:
     return 0;
   }
