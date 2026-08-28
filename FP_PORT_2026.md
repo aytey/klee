@@ -10,6 +10,11 @@ the translation.
 
 ## Building
 
+The binary16 tests need a clang with `_Float16` on x86, which
+is not every clang in the range below: 15 is the lowest verified here, and
+they are guarded on it. `-fexcess-precision=16`, which the excess precision
+test mentions but does not require, is clang 16 and later.
+
 Needs LLVM 13–16. **Not 17 or later**: for those versions
 `lib/Module/CMakeLists.txt` selects `Instrument.cpp`/`Optimize.cpp`, which are
 `assert(0)` stubs upstream — the new pass manager port was never written. That
@@ -49,7 +54,73 @@ them to the solver's float sort where an FP operation needs one
 helper that can be handed either sort coerces its operands, which is why the
 integer paths in all three builders are peppered with `castToBitVector`.
 
-Two places where the obvious thing is wrong:
+**Which formats.** binary16, binary32, binary64, x87 fp80 and binary128. The
+Executor's `fpWidthToSemantics()` is the only gate: `widthToFloatSemantics()`,
+`ConstantExpr::GetNaN()` and all three solver builders were written width
+generically and already carried every case, so binary16 and binary128 each
+cost two lines there and nothing else. klee-float shipped without them because
+nothing it was measured on used them, not because anything resisted.
+
+**binary16 is not always the format the solver sees.** Without AVX512-FP16,
+clang at `-O0` emits `_Float16` arithmetic as an fpext to binary32, the
+operation there, and an fptrunc back, so the query carries `fp.add` on
+`(_ FloatingPoint 8 24)` wrapped in rounding conversions. From `-O1`
+InstCombine folds that away and the query carries `(_ FloatingPoint 5 11)`
+with no conversions at all. Storage is 16 bits either way; only the operations
+move.
+
+That last sentence holds for a statement with one operation in it, and not
+otherwise. Clang follows C's excess precision rules while emulating, which
+avoid intermediate truncations *within* a statement, so `(a + b) * c` rounds
+once at the end where the same computation split across two statements rounds
+twice. The compound form's inner result is never fptrunc'd, so InstCombine has
+nothing to match and the binary32 intermediate survives at every optimisation
+level. Both are correct — they are different computations, and the compiled
+program really does perform the one the IR describes — but only the second is
+binary16 throughout. Clang 16 and later will round per operation if asked,
+with `-fexcess-precision=16`. `test/Floats/fp16_excess_precision.c` pins the
+default.
+
+Both are correct, and it is worth saying why rather than assuming. Double
+rounding through a wider format is benign when that format has at least 2p+2
+bits, which for binary16 means 24 — and binary32 has exactly 24. Asked of a
+solver over the whole domain, *is `round16(op32(ext x, ext y))` ever different
+from `op16(x, y)`*, every operation and every rounding mode comes back unsat;
+the same question for binary64 through x87's 64-bit format comes back sat,
+which is the classic double-rounding bug and the reason the bound is not
+decoration. `test/Floats/fp16_promotion_equivalence.c` puts that question to
+KLEE. The binary16 tests are built at `-O2` so that binary16 is what the
+solver actually sees, and each checks the IR it produced rather than trusting
+the optimiser — built at `-O0` they fail rather than passing while exercising
+binary32.
+
+**`__fp16` is not `_Float16`.** On x86-64 the first is a storage format — not
+even usable as a parameter or a return type — whose arithmetic promotes to
+binary32 and stays there until something assigns the result back. Its excess
+precision is observable and KLEE finds the path where it is. Nothing here
+tells the two apart and nothing needs to: both produce only `half` values plus
+fpext/fptrunc, so supporting `_Float16` supports `__fp16` as a consequence,
+and taking the bitcode at its word is right for both.
+
+**Square root has no host primitive at either end.** `evalSqrt()` computes
+natively — `sqrtf`, `sqrt`, `sqrtl` — under the requested rounding mode, and
+there is no such call for binary16 or binary128: `sqrtq` lives in libquadmath,
+which is a GCC runtime and not something to make KLEE depend on, and no libm
+on this platform defines `sqrtf16` at all. Both widths therefore take a soft
+path that computes the correctly rounded result from an integer square root
+with guard and sticky bits, honouring every rounding mode and never touching
+the host's floating point environment. Checked against MPFR at binary128 over
+165,628 comparisons in four rounding modes, across random bit patterns,
+subnormals, powers of two, perfect squares and the format boundaries: no
+mismatches.
+
+`sqrtq`, `fabsq`, `sqrtf16` and `fabsf16` are replaced by KLEE's own, because
+clang lowers none of them to an `llvm.` intrinsic the way it lowers `sqrt` and
+`fabs`. At binary128 that is worth 381 instructions against 37 on one symbolic
+argument. At binary16 it is not an optimisation at all: without it the call is
+unresolved.
+
+Three places where the obvious thing is wrong:
 
 **NaN.** IEEE-754 has many binary encodings for NaN, and KLEE's constant folding
 and the solver must agree on which one comes back in a model, or KLEE will
@@ -66,6 +137,25 @@ a side constraint pinning that bit to what the value implies; `castToBitVector()
 puts it back. The side constraints are asserted once the whole query is built.
 Without them a model comes back with a bit pattern that is not a valid
 `long double`.
+
+**The rounding mode is state, and a library call could lose it.** KLEE models
+`fegetround` and `fesetround`, which read and write the rounding mode the
+state carries, and left the rest of `<fenv.h>` as external calls. That
+combination is not neutral, because of the shape every libquadmath and glibc
+transcendental is written around:
+
+```c
+feholdexcept(&saved); fesetround(FE_TONEAREST); ...; feupdateenv(&saved);
+```
+
+The `fesetround` is modelled and takes effect. The `feupdateenv` is not, so it
+never comes back: one call into `expq` and the state rounds to nearest for the
+rest of the run, whatever the program had asked for, and silently, since
+`fegetround` agrees with the value left behind. The four environment calls are
+now modelled and carry the rounding mode across. Exception flags are still not
+modelled — KLEE has none to clear or raise — so `feholdexcept` does not clear
+them, `feupdateenv` does not re-raise them, and `fetestexcept` and its
+neighbours remain external.
 
 `long double` also drove a non-FP change: allocas and globals now reserve
 `getTypeAllocSize()` rather than `getTypeStoreSize()`, because on x86_64 a
@@ -123,9 +213,15 @@ it preserves a NaN's payload and sign) and needs nothing from the solver.
 
 ## Tests
 
-`test/Floats` — all 67 from klee-float — passes on all three backends.
+`test/Floats` — all 67 from klee-float — passes on all three backends. The
+thirteen added since, for binary16, binary128 and the floating point
+environment, bring the directory to **82**; those thirteen pass on STP and
+Bitwuzla. Z3 has not been shown either way on them: it is roughly 40x
+Bitwuzla's per-query cost on this workload and did not finish inside the
+budget they were given.
 
-Full suite against LLVM 16 with Z3, STP and Bitwuzla: **497 tests, 9 failures**,
+Full suite against LLVM 16 with Z3, STP and Bitwuzla, before those twelve
+were added: **497 tests, 9 failures**,
 all nine of which also fail on 3.2 before this series. Six are `klee-stats`
 tests needing the `tabulate` Python package; `LargeReturnTypes`,
 `SeedConcretizeMalloc` and `SeedConcretizeExternalCall` fail for unrelated

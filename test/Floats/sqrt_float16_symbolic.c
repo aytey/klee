@@ -6,7 +6,7 @@
 // RUN: %klee --output-dir=%t.klee-out -internal-sqrt=true --exit-on-error %t1.bc > %t-output.txt 2>&1
 // RUN: FileCheck --implicit-check-not="silently concretizing" \
 // RUN:           -input-file=%t-output.txt %s
-// REQUIRES: x86_64
+// REQUIRES: x86_64, geq-llvm-15.0
 //
 // Clang lowers __builtin_sqrtf16 to a call to sqrtf16 rather than to
 // llvm.sqrt, and neither glibc nor klee-uclibc defines one -- unlike every

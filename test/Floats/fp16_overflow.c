@@ -5,7 +5,7 @@
 // RUN: rm -rf %t.klee-out
 // RUN: %klee --output-dir=%t.klee-out %t1.bc > %t-output.txt 2>&1
 // RUN: FileCheck -input-file=%t-output.txt %s
-// REQUIRES: x86_64
+// REQUIRES: x86_64, geq-llvm-15.0
 //
 // KLEE reasons about _Float16 at binary16, not at some wider format it was
 // promoted through. binary16's largest finite value is 65504, so doubling

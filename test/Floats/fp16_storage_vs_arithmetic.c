@@ -5,7 +5,7 @@
 // RUN: rm -rf %t.klee-out
 // RUN: %klee --output-dir=%t.klee-out %t1.bc > %t-output.txt 2>&1
 // RUN: FileCheck -input-file=%t-output.txt %s
-// REQUIRES: x86_64
+// REQUIRES: x86_64, geq-llvm-15.0
 //
 // __fp16 is not binary16 arithmetic, and KLEE should not pretend it is.
 //
