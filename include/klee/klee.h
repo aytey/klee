@@ -206,6 +206,12 @@ double klee_abs_double(double d);
 long double klee_sqrt_long_double(long double d);
 long double klee_abs_long_double(long double d);
 #endif
+#ifdef __FLT16_MANT_DIG__
+/* binary16. Neither glibc nor klee-uclibc ships _Float16 math, so unlike the
+   other widths there is no library version of these to fall back on. */
+_Float16 klee_sqrt_float16(_Float16 d);
+_Float16 klee_abs_float16(_Float16 d);
+#endif
 #ifdef __SIZEOF_FLOAT128__
 /* binary128. Guarded on __SIZEOF_FLOAT128__ rather than on the architecture
    because __float128 is a compiler feature, not a target one: both GCC and

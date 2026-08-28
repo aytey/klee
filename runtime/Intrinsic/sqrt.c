@@ -31,3 +31,12 @@ __float128 klee_internal_sqrtq(__float128 f) {
   return klee_sqrt_float128(f);
 }
 #endif
+
+#ifdef __FLT16_MANT_DIG__
+/* Clang lowers __builtin_sqrtf16 to a call to sqrtf16 rather than to
+   llvm.sqrt, and no libm on this platform defines one, so without this the
+   call is simply unresolved. */
+_Float16 klee_internal_sqrtf16(_Float16 f) {
+  return klee_sqrt_float16(f);
+}
+#endif

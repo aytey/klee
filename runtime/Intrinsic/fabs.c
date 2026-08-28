@@ -27,3 +27,9 @@ __float128 klee_internal_fabsq(__float128 f) {
   return klee_abs_float128(f);
 }
 #endif
+
+#ifdef __FLT16_MANT_DIG__
+_Float16 klee_internal_fabsf16(_Float16 f) {
+  return klee_abs_float16(f);
+}
+#endif

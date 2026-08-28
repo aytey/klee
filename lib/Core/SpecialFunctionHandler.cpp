@@ -127,6 +127,8 @@ static constexpr std::array handlerInfo = {
   // that calls them is built by LLVMCC rather than by the host compiler, so
   // the two need not agree on which types exist: a guard here would silently
   // unregister a handler the runtime still calls.
+  add("klee_sqrt_float16", handleSqrt, true),
+  add("klee_abs_float16", handleFAbs, true),
   add("klee_sqrt_float128", handleSqrt, true),
   add("klee_abs_float128", handleFAbs, true),
 

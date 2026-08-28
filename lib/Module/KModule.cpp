@@ -232,12 +232,17 @@ static void replaceFloatingPointFunctions(llvm::Module *module) {
     // call to it rather than an llvm.sqrt intrinsic, so without this the
     // software implementation is executed rather than asked of the solver.
     replaceFunctionIfPresent(module, "sqrtq", "klee_internal_sqrtq");
+    // Same for binary16, and here there is no library version at all to fall
+    // back on: neither glibc nor klee-uclibc defines sqrtf16, so without this
+    // the call clang emits for __builtin_sqrtf16 is simply unresolved.
+    replaceFunctionIfPresent(module, "sqrtf16", "klee_internal_sqrtf16");
   }
   if (UseKleeInternalFabs) {
     replaceFunctionIfPresent(module, "fabs", "klee_internal_fabs");
     replaceFunctionIfPresent(module, "fabsf", "klee_internal_fabsf");
     replaceFunctionIfPresent(module, "fabsl", "klee_internal_fabsl");
     replaceFunctionIfPresent(module, "fabsq", "klee_internal_fabsq");
+    replaceFunctionIfPresent(module, "fabsf16", "klee_internal_fabsf16");
   }
   replaceFunctionIfPresent(module, "fegetround", "klee_internal_fegetround");
   replaceFunctionIfPresent(module, "fesetround", "klee_internal_fesetround");
