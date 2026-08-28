@@ -241,6 +241,15 @@ static void replaceFloatingPointFunctions(llvm::Module *module) {
   }
   replaceFunctionIfPresent(module, "fegetround", "klee_internal_fegetround");
   replaceFunctionIfPresent(module, "fesetround", "klee_internal_fesetround");
+  // The environment calls carry the rounding mode too. Without these,
+  // libquadmath's and glibc's feholdexcept/fesetround/feupdateenv idiom
+  // leaves the state rounding to nearest for the rest of the run -- see the
+  // comment in runtime/Intrinsic/fenv.c.
+  replaceFunctionIfPresent(module, "fegetenv", "klee_internal_fegetenv");
+  replaceFunctionIfPresent(module, "fesetenv", "klee_internal_fesetenv");
+  replaceFunctionIfPresent(module, "feholdexcept",
+                           "klee_internal_feholdexcept");
+  replaceFunctionIfPresent(module, "feupdateenv", "klee_internal_feupdateenv");
 }
 
 void KModule::addInternalFunction(const char* functionName){

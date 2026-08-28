@@ -77,3 +77,74 @@ int klee_internal_fesetround(int rm) {
   }
   return 0;
 }
+
+/* KLEE models the rounding mode -- it is an operand of every rounding
+ * floating point expression -- but not the exception flags, which nothing in
+ * the Executor tracks. What the environment calls below save and restore is
+ * therefore the rounding mode alone.
+ *
+ * Leaving them out entirely is not neutral. libquadmath's transcendentals,
+ * and glibc's, are all written around
+ *
+ *     feholdexcept(&saved); fesetround(FE_TONEAREST); ...; feupdateenv(&saved);
+ *
+ * and with fesetround modelled but feupdateenv not, the fesetround takes
+ * effect on the state and is never undone: every operation after such a call
+ * rounds to nearest whatever the program had asked for. Modelling the pair
+ * keeps the rounding mode a property of the state rather than something a
+ * library call can silently leave behind.
+ *
+ * What is still not modelled is the exception half: feholdexcept does not
+ * clear flags, feupdateenv does not re-raise them, and fetestexcept and
+ * friends are still external calls. KLEE has no flags to clear or raise.
+ */
+
+#define KLEE_FENV_MAGIC 0x4b4c4545u /* "KLEE" */
+
+struct klee_fenv_repr {
+  unsigned magic;
+  int rounding_mode; /* an FE_* value, as fegetround reports it */
+};
+
+/* glibc and musl both spell the default environment as (const fenv_t *) -1,
+ * which is a sentinel rather than something to dereference. */
+#define KLEE_FE_DFL_ENV ((void *)-1)
+
+static int klee_fenv_save(void *env) {
+  struct klee_fenv_repr *repr = (struct klee_fenv_repr *)env;
+  repr->magic = KLEE_FENV_MAGIC;
+  repr->rounding_mode = klee_internal_fegetround();
+  return 0;
+}
+
+static int klee_fenv_restore(const void *env) {
+  const struct klee_fenv_repr *repr;
+  if (env == KLEE_FE_DFL_ENV)
+    return klee_internal_fesetround(FE_TONEAREST);
+  repr = (const struct klee_fenv_repr *)env;
+  if (repr->magic != KLEE_FENV_MAGIC) {
+    /* Restoring an environment that was never saved is undefined behaviour,
+     * and silently carrying on would leave the rounding mode wrong -- which
+     * is the failure this whole block exists to remove. */
+    klee_report_error(__FILE__, __LINE__,
+                      "floating point environment restored but never saved",
+                      "fenv.err");
+    return -1;
+  }
+  return klee_internal_fesetround(repr->rounding_mode);
+}
+
+int klee_internal_fegetenv(void *env) { return klee_fenv_save(env); }
+
+int klee_internal_fesetenv(const void *env) { return klee_fenv_restore(env); }
+
+int klee_internal_feholdexcept(void *env) {
+  /* Also clears the exception flags and enters non-stop mode; neither is
+   * something KLEE has. */
+  return klee_fenv_save(env);
+}
+
+int klee_internal_feupdateenv(const void *env) {
+  /* Also re-raises whatever was raised in the meantime; see above. */
+  return klee_fenv_restore(env);
+}
