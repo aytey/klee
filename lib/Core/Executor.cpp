@@ -1484,6 +1484,8 @@ void Executor::stepInstruction(ExecutionState &state) {
 
 static inline const llvm::fltSemantics *fpWidthToSemantics(unsigned width) {
   switch (width) {
+  case Expr::Int16:
+    return &llvm::APFloat::IEEEhalf();
   case Expr::Int32:
     return &llvm::APFloat::IEEEsingle();
   case Expr::Int64:
