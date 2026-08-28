@@ -122,10 +122,13 @@ static constexpr std::array handlerInfo = {
   add("klee_sqrt_long_double", handleSqrt, true),
   add("klee_abs_long_double", handleFAbs, true),
 #endif
-#ifdef __SIZEOF_FLOAT128__
+  // Not guarded on the type being available to whatever compiler is building
+  // KLEE. These are names bound to width-generic handlers, and the runtime
+  // that calls them is built by LLVMCC rather than by the host compiler, so
+  // the two need not agree on which types exist: a guard here would silently
+  // unregister a handler the runtime still calls.
   add("klee_sqrt_float128", handleSqrt, true),
   add("klee_abs_float128", handleFAbs, true),
-#endif
 
   add("klee_check_memory_access", handleCheckMemoryAccess, false),
   add("klee_get_valuef", handleGetValue, true),
