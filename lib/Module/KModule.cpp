@@ -228,11 +228,16 @@ static void replaceFloatingPointFunctions(llvm::Module *module) {
     replaceFunctionIfPresent(module, "sqrt", "klee_internal_sqrt");
     replaceFunctionIfPresent(module, "sqrtf", "klee_internal_sqrtf");
     replaceFunctionIfPresent(module, "sqrtl", "klee_internal_sqrtl");
+    // libquadmath's binary128 entry point. Unlike sqrt/sqrtf, clang emits a
+    // call to it rather than an llvm.sqrt intrinsic, so without this the
+    // software implementation is executed rather than asked of the solver.
+    replaceFunctionIfPresent(module, "sqrtq", "klee_internal_sqrtq");
   }
   if (UseKleeInternalFabs) {
     replaceFunctionIfPresent(module, "fabs", "klee_internal_fabs");
     replaceFunctionIfPresent(module, "fabsf", "klee_internal_fabsf");
     replaceFunctionIfPresent(module, "fabsl", "klee_internal_fabsl");
+    replaceFunctionIfPresent(module, "fabsq", "klee_internal_fabsq");
   }
   replaceFunctionIfPresent(module, "fegetround", "klee_internal_fegetround");
   replaceFunctionIfPresent(module, "fesetround", "klee_internal_fesetround");

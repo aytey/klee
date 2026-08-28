@@ -206,5 +206,12 @@ double klee_abs_double(double d);
 long double klee_sqrt_long_double(long double d);
 long double klee_abs_long_double(long double d);
 #endif
+#ifdef __SIZEOF_FLOAT128__
+/* binary128. Guarded on __SIZEOF_FLOAT128__ rather than on the architecture
+   because __float128 is a compiler feature, not a target one: both GCC and
+   clang define this exactly where the type exists. */
+__float128 klee_sqrt_float128(__float128 d);
+__float128 klee_abs_float128(__float128 d);
+#endif
 
 #endif /* KLEE_H */

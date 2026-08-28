@@ -21,3 +21,9 @@ long double klee_internal_fabsl(long double f) {
   return klee_abs_long_double(f);
 }
 #endif
+
+#ifdef __SIZEOF_FLOAT128__
+__float128 klee_internal_fabsq(__float128 f) {
+  return klee_abs_float128(f);
+}
+#endif
