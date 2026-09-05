@@ -311,7 +311,12 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
     break;
   }
   case SAT::RISS: {
-    SATSolverAvailable = vc_useRiss(vc);
+    // STP withdrew Riss from its C interface (vc_useRiss and vc_isUsingRiss
+    // are both gone), so there is nothing left to select. The enumerator
+    // stays so that a command line or a sweep table naming `riss` still
+    // parses; it now declines like any other unavailable backend, which is
+    // what the fallback message below is for.
+    SATSolverAvailable = false;
     break;
   }
   default:
@@ -327,8 +332,6 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
     SATName = SATNames[SAT::SIMPLEMINISAT];
   else if (vc_isUsingCryptominisat(vc))
     SATName = SATNames[SAT::CRYPTOMINISAT];
-  else if (vc_isUsingRiss(vc))
-    SATName = SATNames[SAT::RISS];
   else if (vc_isUsingCadical(vc))
     SATName = SATNames[SAT::CADICAL];
 
