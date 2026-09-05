@@ -63,6 +63,8 @@ namespace klee {
   public:
     STPArrayExprHash() {};
     virtual ~STPArrayExprHash();
+    // Drop the cached update-node expressions (the arrays themselves stay).
+    void clearUpdates();
   };
 
 class STPBuilder {
@@ -74,7 +76,13 @@ class STPBuilder {
   /// one float twice must give one variable: two would let a model assign
   /// them different bit patterns for the same value. The Bitwuzla builder
   /// caches this for the same reason.
-  std::map< ::VCExpr, ExprHandle > floatToBitVectorVars;
+  // Keyed by the float's node, and holding a handle to that node as well as
+  // to the bits variable: STP frees a node once its last handle goes, and a
+  // freed node's address can be reused by another float in the same query,
+  // which would then be handed the dead float's variable -- an equality KLEE
+  // never stated. Holding the handle keeps the address taken for as long
+  // as the entry exists.
+  std::map< ::VCExpr, std::pair<ExprHandle, ExprHandle> > floatToBitVectorVars;
 
   /// optimizeDivides - Rewrite division and reminders by constants
   /// into multiplies and shifts. STP should probably handle this for
@@ -160,10 +168,7 @@ public:
   // freed node's address a different float's variable (a spurious equality,
   // which is what tripped CexCachingSolver's must-have-assignment check on
   // 24 drivers of the 2026-09-03 capture). The Bitwuzla builder clears both.
-  void clearSideConstraints() {
-    sideConstraints.clear();
-    floatToBitVectorVars.clear();
-  }
+  void clearSideConstraints();
 
   STPBuilder(::VC _vc, bool _optimizeDivides=true);
   ~STPBuilder();

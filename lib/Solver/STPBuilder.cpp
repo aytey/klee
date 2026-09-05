@@ -81,6 +81,32 @@ namespace {
 ///
 
 
+void STPArrayExprHash::clearUpdates() {
+  for (UpdateNodeHashConstIter it = _update_node_hash.begin();
+       it != _update_node_hash.end(); ++it)
+    if (it->second)
+      ::vc_DeleteExpr(it->second);
+  _update_node_hash.clear();
+}
+
+// The bits variables are minted per query and defined by a side constraint
+// asserted only in that query, so everything that refers to one has to go
+// with the constraints: the map from float to variable (kept, a hash-consed
+// float would get its old variable back with no definition, and a freed
+// node's address a different float's), and the cached update-node
+// expressions, which embed the variable wherever a float's bytes were
+// stored into an array -- rebuilt from cache in a later query they carry
+// the bare variable and no binding at all. The Bitwuzla builder, whose cast
+// has always been a fresh variable, does both; without the portable
+// spelling STP's cast is a function of the float and the update cache can
+// stay.
+void STPBuilder::clearSideConstraints() {
+  sideConstraints.clear();
+  floatToBitVectorVars.clear();
+  if (PortableFloatBits)
+    _arr_hash.clearUpdates();
+}
+
 STPArrayExprHash::~STPArrayExprHash() {
   for (ArrayHashIter it = _array_hash.begin(); it != _array_hash.end(); ++it) {
     ::VCExpr array_expr = it->second;
@@ -713,10 +739,10 @@ ExprHandle STPBuilder::castToBitVector(ExprHandle e) {
       // One variable per float term, not per cast: see
       // floatToBitVectorVars. This mirrors what the Bitwuzla builder does,
       // which reaches for the same encoding for the same reason.
-      std::map< ::VCExpr, ExprHandle >::iterator it =
+      std::map< ::VCExpr, std::pair<ExprHandle, ExprHandle> >::iterator it =
           floatToBitVectorVars.find((::VCExpr)e);
       if (it != floatToBitVectorVars.end())
-        return it->second;
+        return it->second.second;
 
       int expBits = 0, sigBits = 0;
       getFloatFormatFromBitWidth(floatWidth, expBits, sigBits);
@@ -730,7 +756,8 @@ ExprHandle STPBuilder::castToBitVector(ExprHandle e) {
       // for every value except NaN (see the flag's comment).
       sideConstraints.push_back(vc_eqExpr(
           vc, e, vc_fpToFPFromIEEEBV(vc, expBits, sigBits, bits)));
-      floatToBitVectorVars.insert(std::make_pair((::VCExpr)e, bits));
+      floatToBitVectorVars.insert(
+          std::make_pair((::VCExpr)e, std::make_pair(e, bits)));
       return bits;
     }
     return vc_fpToIEEEBV(vc, e);
