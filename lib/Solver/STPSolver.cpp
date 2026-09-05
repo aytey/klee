@@ -181,6 +181,59 @@ llvm::cl::opt<bool> DebugSTPPhaseTiming(
     llvm::cl::desc("Report per-query build/assert and solve times for STP "
                    "(default=off)"),
     llvm::cl::cat(klee::SolvingCat));
+
+// STP replaces a floating-point operation -- a product, quotient, root or
+// fused multiply-add -- by a fresh value of the same sort and reasons about
+// it through rules over the packed bits, building the exact circuit only
+// where a candidate model contradicts them. The bit-vector abstraction above
+// is the same idea one level down, and the two are independent.
+//
+// Why it is worth reaching from here rather than only in batch replay: what
+// the executor is short of is not per-query time but paths. A driver here
+// ends by exhausting its wall-clock budget far more often than by exhausting
+// its solver's patience, so a solver that answers the same queries faster
+// spends the budget going deeper instead. That is a property only an
+// end-to-end run can measure, and it needs this flag.
+llvm::cl::opt<bool> STPFPAbstraction(
+    "stp-fp-abstraction", llvm::cl::init(false),
+    llvm::cl::desc("Have STP abstract floating-point multiplication, "
+                   "division, square root and fused multiply-add, refining "
+                   "them by CEGAR (default=off)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// The operation set, as the mask --fp-abstraction-ops builds: 1 mul, 2 div,
+// 4 sqrt, 8 add, 16 sub, 32 fma, 64 rem, 128 rti, 256 to_sbv, 512 to_ubv.
+// Zero leaves STP's default (mul|div|sqrt|fma = 39), which is what compiled
+// numerical code is made of once the compiler has contracted a*b+c into a
+// fused multiply-add.
+llvm::cl::opt<unsigned> STPFPAbstractionOps(
+    "stp-fp-abstraction-ops", llvm::cl::init(0),
+    llvm::cl::desc("Bitmask of floating-point operations STP abstracts "
+                   "(default=0, use STP's own default of mul,div,sqrt,fma)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// The floor on the packed width. STP's own default is 16, so binary16 is the
+// narrowest format touched; raising it here is how a run asks for the wide
+// formats only, which is where the technique's cost model says it pays.
+llvm::cl::opt<unsigned> STPFPAbstractionWidth(
+    "stp-fp-abstraction-width", llvm::cl::init(0),
+    llvm::cl::desc("Packed width at or above which STP abstracts a "
+                   "floating-point operation (default=0, leave STP's own)"),
+    llvm::cl::cat(klee::SolvingCat));
+
+// Hosting the abstraction inside STP's incremental driver is a separate
+// decision from turning it on, and it is not free here: STP answers this
+// flag by expanding arrays eagerly for the whole session, because its lazy
+// read refinement and the abstraction's candidate checks cannot both be
+// right about a quotiented cell. KLEE's queries are array-heavy by
+// construction -- every memory object is an array -- so the eager expansion
+// is a poor trade for them, and this stays off unless a sweep asks for it.
+llvm::cl::opt<bool> STPFPAbstractionIncremental(
+    "stp-fp-abstraction-incremental", llvm::cl::init(false),
+    llvm::cl::desc("Host STP's floating-point abstraction inside its "
+                   "incremental driver as well (default=off; implies eager "
+                   "array expansion in STP)"),
+    llvm::cl::cat(klee::SolvingCat));
 } // namespace
 
 #define vc_bvBoolExtract IAMTHESPAWNOFSATAN
@@ -276,6 +329,24 @@ STPSolverImpl::STPSolverImpl(bool useForkedSTP, bool optimizeDivides)
     if (STPBVAbstractionValueDivisor > 0)
       vc_setInterfaceFlags(vc, BV_TERM_ABSTRACTION_VALUE_DIVISOR,
                            (int)STPBVAbstractionValueDivisor.getValue());
+  }
+
+  // The floating-point abstraction. FP_ABSTRACTION alone reaches the batch
+  // pipeline; the driver hosts it only with FP_ABSTRACTION_INCREMENTAL as
+  // well, exactly as STP's own command line requires both. KLEE drives STP
+  // through the incremental driver whenever the engage-at policy turns it
+  // on, so both are set together and the flag means the same thing however
+  // the session is solved.
+  if (STPFPAbstraction) {
+    vc_setInterfaceFlags(vc, FP_ABSTRACTION, 1);
+    if (STPFPAbstractionIncremental)
+      vc_setInterfaceFlags(vc, FP_ABSTRACTION_INCREMENTAL, 1);
+    if (STPFPAbstractionOps > 0)
+      vc_setInterfaceFlags(vc, FP_ABSTRACTION_OPS,
+                           (int)STPFPAbstractionOps.getValue());
+    if (STPFPAbstractionWidth > 0)
+      vc_setInterfaceFlags(vc, FP_ABSTRACTION_WIDTH,
+                           (int)STPFPAbstractionWidth.getValue());
   }
 
   if (STPPieceRewriting)
