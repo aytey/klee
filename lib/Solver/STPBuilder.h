@@ -15,6 +15,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "klee/Expr/ArrayExprHash.h"
 #include "klee/Expr/ExprHashMap.h"
+#include <map>
 
 #include <vector>
 
@@ -67,6 +68,13 @@ namespace klee {
 class STPBuilder {
   ::VC vc;
   ExprHashMap< std::pair<ExprHandle, unsigned> > constructed;
+
+  /// The bit-vector variable standing for a float's IEEE bits under
+  /// --stp-portable-float-bits, keyed by the float term it came from. Casting
+  /// one float twice must give one variable: two would let a model assign
+  /// them different bit patterns for the same value. The Bitwuzla builder
+  /// caches this for the same reason.
+  std::map< ::VCExpr, ExprHandle > floatToBitVectorVars;
 
   /// optimizeDivides - Rewrite division and reminders by constants
   /// into multiplies and shifts. STP should probably handle this for
@@ -145,7 +153,17 @@ public:
   /// castToFloat()). Clients must assert these alongside the query, once the
   /// whole query has been constructed, and clear them afterwards.
   std::vector<ExprHandle> sideConstraints;
-  void clearSideConstraints() { sideConstraints.clear(); }
+  // The bits variables are minted per query and defined by a side
+  // constraint asserted only in that query, so the map must go with the
+  // constraints: kept across queries, a hash-consed float would get its old
+  // variable back with no definition (a weaker query than KLEE asked), and a
+  // freed node's address a different float's variable (a spurious equality,
+  // which is what tripped CexCachingSolver's must-have-assignment check on
+  // 24 drivers of the 2026-09-03 capture). The Bitwuzla builder clears both.
+  void clearSideConstraints() {
+    sideConstraints.clear();
+    floatToBitVectorVars.clear();
+  }
 
   STPBuilder(::VC _vc, bool _optimizeDivides=true);
   ~STPBuilder();

@@ -49,6 +49,33 @@ namespace {
                    llvm::cl::desc("Use hash-consing during STP query construction (default=true)"),
                    llvm::cl::init(true),
                    llvm::cl::cat(klee::ExprCat));
+
+// Taking a float apart into its bits is what stops a query being dumpable.
+// STP has the operation, but SMT-LIB never standardised a spelling for it --
+// and neither Bitwuzla nor Z3's parser accepts the `fp.to_ieee_bv` that
+// early drafts proposed -- so a dumped query containing it can be replayed
+// by nothing, including STP itself.
+//
+// The reverse direction *is* standard: `((_ to_fp e s) b)` reinterprets a
+// bit-vector as a float, and every solver takes it. So with this flag the
+// builder introduces a fresh bit-vector `b` for each float-to-bits and
+// constrains `x = ((_ to_fp e s) b)` instead, which says the same thing in
+// a spelling that survives a round trip.
+//
+// It is not free, and the cost is NaN. `fp.to_ieee_bv` names one bit
+// pattern; the equation admits every NaN pattern for a NaN `x`, so `b` is
+// underdetermined exactly there and a model may report a payload the
+// program would not have produced. KLEE's own comment on castToBitVector
+// already accepts a related imprecision ("this picks a single
+// representation for NaN"), but this is a further loosening and it is why
+// the flag is off unless a capture run asks for it.
+  llvm::cl::opt<bool>
+  PortableFloatBits("stp-portable-float-bits",
+                    llvm::cl::desc("Spell float-to-bits as a fresh bitvector "
+                                   "constrained through to_fp, so queries can "
+                                   "be dumped and replayed (default=false)"),
+                    llvm::cl::init(false),
+                    llvm::cl::cat(klee::ExprCat));
 }
 
 ///
@@ -682,6 +709,30 @@ ExprHandle STPBuilder::castToBitVector(ExprHandle e) {
   case Expr::Int32:
   case Expr::Int64:
   case Expr::Int128:
+    if (PortableFloatBits) {
+      // One variable per float term, not per cast: see
+      // floatToBitVectorVars. This mirrors what the Bitwuzla builder does,
+      // which reaches for the same encoding for the same reason.
+      std::map< ::VCExpr, ExprHandle >::iterator it =
+          floatToBitVectorVars.find((::VCExpr)e);
+      if (it != floatToBitVectorVars.end())
+        return it->second;
+
+      int expBits = 0, sigBits = 0;
+      getFloatFormatFromBitWidth(floatWidth, expBits, sigBits);
+      static uint64_t portableBitsCounter = 0;
+      const std::string name =
+          "__klee_fp_bits_" + llvm::utostr(portableBitsCounter++);
+      ExprHandle bits =
+          vc_varExpr(vc, name.c_str(), vc_bvType(vc, floatWidth));
+      // vc_eqExpr on floats is SMT-LIB '=', which is what this needs: it
+      // keeps +0 and -0 apart, so the reinterpretation is pinned exactly
+      // for every value except NaN (see the flag's comment).
+      sideConstraints.push_back(vc_eqExpr(
+          vc, e, vc_fpToFPFromIEEEBV(vc, expBits, sigBits, bits)));
+      floatToBitVectorVars.insert(std::make_pair((::VCExpr)e, bits));
+      return bits;
+    }
     return vc_fpToIEEEBV(vc, e);
   case 79: {
     // This is Expr::Fl80 (15 bit exponent, 64 bit significand) but, because
