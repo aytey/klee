@@ -81,9 +81,12 @@ public:
   /// Different SMTLIBv2 logics supported by this class
   /// \sa setLogic()
   enum SMTLIBv2Logic {
-    QF_ABV,  ///< Logic using Theory of Arrays and Theory of Bitvectors
-    QF_AUFBV ///< Logic using Theory of Arrays and Theory of Bitvectors and has
-             ///< uninterpreted functions
+    QF_ABV,   ///< Logic using Theory of Arrays and Theory of Bitvectors
+    QF_AUFBV, ///< Logic using Theory of Arrays and Theory of Bitvectors and has
+              ///< uninterpreted functions
+    QF_AUFBVFP ///< The above with the Theory of FloatingPoint. Selected
+               ///< automatically when the query mentions a float; a logic
+               ///< without FP makes a solver reject the query outright.
   };
 
   /// Different SMTLIBv2 options that have a boolean value that can be set
@@ -117,8 +120,8 @@ public:
     ABBR_NAMED ///< Abbreviate with :named annotations.
   };
 
-  /// Different supported SMTLIBv2 sorts (a.k.a type) in QF_AUFBV
-  enum SMTLIB_SORT { SORT_BITVECTOR, SORT_BOOL };
+  /// Different supported SMTLIBv2 sorts (a.k.a type) in QF_AUFBVFP
+  enum SMTLIB_SORT { SORT_BITVECTOR, SORT_BOOL, SORT_FLOAT };
 
   /// Allows the way Constant bitvectors are printed to be changed.
   /// This setting is persistent across queries.
@@ -356,6 +359,44 @@ protected:
 
   /// Indicates if there were any constant arrays founds during a scan()
   bool haveConstantArray;
+
+  /// The bit-vector variable standing for the IEEE encoding of a float-sorted
+  /// expression, for every such expression the query uses where bits are
+  /// wanted. Allocated while the body is printed into its buffer, so that the
+  /// declarations can still precede the assertions that mention them.
+  typedef std::map<const ref<Expr>, unsigned> FloatBitsMap;
+  FloatBitsMap floatBitsVars;
+
+  /// Set while printing when the query mentions a float at all, which
+  /// decides the logic. The body is printed into a buffer before the logic
+  /// line is written, so this is known by the time it is needed.
+  bool usesFloats;
+
+  /// The IEEE-754 interchange format KLEE models a value of this width with.
+  /// \return false for a width that is not one of them, x87 fp80 included.
+  static bool getFloatFormat(Expr::Width w, unsigned &expBits,
+                             unsigned &sigBits);
+
+  /// The SMT-LIB name of an LLVM rounding mode.
+  static const char *getRoundingModeName(llvm::APFloat::roundingMode rm);
+
+  /// Print `((_ to_fp eb sb) |__klee_fp_bits_id|)`, the float that the
+  /// variable standing for its bits reinterprets to.
+  void printFloatFromBitsVar(Expr::Width w, unsigned id);
+
+  /// Print the bit-vector literal for the NaN encoding KLEE's own constant
+  /// folding produces at this width.
+  void printCanonicalNaNBits(Expr::Width w);
+
+  /// Declare the float-to-bits variables and constrain each to reinterpret as
+  /// its float.
+  void printFloatBitsDeclarations();
+
+  /// Print an operation that takes a rounding mode as its first argument.
+  void printFloatArithExpr(const ref<Expr> &e);
+
+  /// Print a conversion into or out of a float sort.
+  void printFloatConvExpr(const ref<Expr> &e);
 
 private:
   SMTLIBv2Logic logicToUse;

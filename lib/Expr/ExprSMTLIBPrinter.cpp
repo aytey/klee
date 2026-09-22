@@ -17,7 +17,9 @@
 
 #include "llvm/ADT/SmallString.h"
 
+#include <algorithm>
 #include <stack>
+#include <vector>
 
 namespace ExprSMTLIBOptions {
 // Command line options
@@ -59,7 +61,7 @@ namespace klee {
 
 ExprSMTLIBPrinter::ExprSMTLIBPrinter()
     : usedArrays(), o(NULL), query(NULL), p(NULL), haveConstantArray(false),
-      logicToUse(QF_AUFBV),
+      floatBitsVars(), usesFloats(false), logicToUse(QF_AUFBV),
       humanReadable(ExprSMTLIBOptions::humanReadableSMTLIB),
       smtlibBoolOptions(), arraysToCallGetValueOn(NULL) {
   setConstantDisplayMode(ExprSMTLIBOptions::argConstantDisplayMode);
@@ -89,6 +91,8 @@ void ExprSMTLIBPrinter::reset() {
   seenExprs.clear();
   usedArrays.clear();
   haveConstantArray = false;
+  floatBitsVars.clear();
+  usesFloats = false;
 
   /* Clear the PRODUCE_MODELS option if it was automatically set.
    * We need to do this because the next query might not need the
@@ -140,8 +144,8 @@ void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
 
   // The bits, never ConstantExpr::toString(), which renders a constant
   // carrying klee-float's float flag as a decimal or C99 hex *float*
-  // (0.0E+0, -0x1.000p+4). Every constant printed here is a bit-vector, and
-  // a bit-vector literal is what the reader expects.
+  // (0.0E+0, -0x1.000p+4). Every constant is a bit-vector here: a float
+  // constant reaches SMT-LIB as its bit pattern read back through to_fp.
   const llvm::APInt &bits = e->getAPValue();
 
   /* SMTLIBv2 deduces the bit-width (should be 8-bits in our case)
@@ -280,6 +284,39 @@ void ExprSMTLIBPrinter::printFullExpression(
 
   case Expr::AShr:
     printAShrExpr(cast<AShrExpr>(e));
+    return;
+
+  case Expr::FAdd:
+  case Expr::FSub:
+  case Expr::FMul:
+  case Expr::FDiv:
+  case Expr::FSqrt:
+  case Expr::FMA:
+    // These take a rounding mode as their first argument.
+    printFloatArithExpr(e);
+    return;
+
+  case Expr::FPExt:
+  case Expr::FPTrunc:
+  case Expr::FPToUI:
+  case Expr::FPToSI:
+  case Expr::UIToFP:
+  case Expr::SIToFP:
+    printFloatConvExpr(e);
+    return;
+
+  case Expr::FAbs:
+  case Expr::FOEq:
+  case Expr::FOLt:
+  case Expr::FOLe:
+  case Expr::FOGt:
+  case Expr::FOGe:
+  case Expr::IsNaN:
+  case Expr::IsInfinite:
+  case Expr::IsNormal:
+  case Expr::IsSubnormal:
+    // No rounding mode, float arguments.
+    printSortArgsExpr(e, SORT_FLOAT);
     return;
 
   default:
@@ -489,38 +526,291 @@ const char *ExprSMTLIBPrinter::getSMTLIBKeyword(const ref<Expr> &e) {
   case Expr::Sge:
     return "bvsge";
 
-  case Expr::FPExt:
-  case Expr::FPTrunc:
-  case Expr::FPToUI:
-  case Expr::FPToSI:
-  case Expr::UIToFP:
-  case Expr::SIToFP:
+  // The operations that carry a rounding mode, and the conversions, are
+  // printed by printFloatArithExpr() and printFloatConvExpr(), which need the
+  // operator's indices as well as its name.
   case Expr::FAdd:
+    return "fp.add";
   case Expr::FSub:
+    return "fp.sub";
   case Expr::FMul:
+    return "fp.mul";
   case Expr::FDiv:
+    return "fp.div";
   case Expr::FSqrt:
-  case Expr::FAbs:
+    return "fp.sqrt";
   case Expr::FMA:
+    return "fp.fma";
+
+  case Expr::FAbs:
+    return "fp.abs";
   case Expr::FOEq:
+    return "fp.eq";
   case Expr::FOLt:
+    return "fp.lt";
   case Expr::FOLe:
+    return "fp.leq";
   case Expr::FOGt:
+    return "fp.gt";
   case Expr::FOGe:
+    return "fp.geq";
   case Expr::IsNaN:
+    return "fp.isNaN";
   case Expr::IsInfinite:
+    return "fp.isInfinite";
   case Expr::IsNormal:
+    return "fp.isNormal";
   case Expr::IsSubnormal:
-    // Rendering these faithfully means emitting the FloatingPoint theory and,
-    // for Expr::Fl80, the x87 re-layout the solver builders do in
-    // castToFloat(). Rather than emit SMT-LIB that does not mean what the
-    // query means, say so. Use --debug-z3-dump-queries to get SMT-LIB for a
-    // floating-point query; Z3 prints its own, including fp80.
-    klee_error("Printing floating-point expressions as SMT-LIBv2 is not "
-               "supported; use --debug-z3-dump-queries instead");
+    return "fp.isSubnormal";
 
   default:
     llvm_unreachable("Conversion from Expr to SMTLIB keyword failed");
+  }
+}
+
+namespace {
+
+/// The rounding mode an expression carries. Every floating-point Expr class
+/// declares its own member rather than inheriting one, so this switches on the
+/// kind rather than calling through a base class.
+llvm::APFloat::roundingMode exprRoundingMode(const ref<Expr> &e) {
+  switch (e->getKind()) {
+  case Expr::FAdd:
+    return cast<FAddExpr>(e)->roundingMode;
+  case Expr::FSub:
+    return cast<FSubExpr>(e)->roundingMode;
+  case Expr::FMul:
+    return cast<FMulExpr>(e)->roundingMode;
+  case Expr::FDiv:
+    return cast<FDivExpr>(e)->roundingMode;
+  case Expr::FSqrt:
+    return cast<FSqrtExpr>(e)->roundingMode;
+  case Expr::FMA:
+    return cast<FMAExpr>(e)->roundingMode;
+  case Expr::FPTrunc:
+    return cast<FPTruncExpr>(e)->roundingMode;
+  case Expr::FPToUI:
+    return cast<FPToUIExpr>(e)->roundingMode;
+  case Expr::FPToSI:
+    return cast<FPToSIExpr>(e)->roundingMode;
+  case Expr::UIToFP:
+    return cast<UIToFPExpr>(e)->roundingMode;
+  case Expr::SIToFP:
+    return cast<SIToFPExpr>(e)->roundingMode;
+  case Expr::FPExt:
+    // Widening is exact, so no mode can change the result. SMT-LIB requires
+    // one syntactically all the same.
+    return llvm::APFloat::rmNearestTiesToEven;
+  default:
+    llvm_unreachable("expression carries no rounding mode");
+  }
+}
+
+} // namespace
+
+bool ExprSMTLIBPrinter::getFloatFormat(Expr::Width w, unsigned &expBits,
+                                       unsigned &sigBits) {
+  switch (w) {
+  case Expr::Int16:
+    expBits = 5;
+    sigBits = 11;
+    return true;
+  case Expr::Int32:
+    expBits = 8;
+    sigBits = 24;
+    return true;
+  case Expr::Int64:
+    expBits = 11;
+    sigBits = 53;
+    return true;
+  case Expr::Int128:
+    expBits = 15;
+    sigBits = 113;
+    return true;
+  default:
+    // Expr::Fl80 lands here deliberately. x87's significand integer bit is
+    // explicit, so its eighty bits are not an IEEE interchange encoding, and
+    // (_ FloatingPoint 15 64) is a different format rather than the same one
+    // spelled differently. Reproducing the re-layout the solver builders do
+    // in castToFloat(), and the side constraint that pins the explicit bit,
+    // is the one part of this that cannot be got right by inspection.
+    return false;
+  }
+}
+
+const char *
+ExprSMTLIBPrinter::getRoundingModeName(llvm::APFloat::roundingMode rm) {
+  switch (rm) {
+  case llvm::APFloat::rmNearestTiesToEven:
+    return "RNE";
+  case llvm::APFloat::rmTowardPositive:
+    return "RTP";
+  case llvm::APFloat::rmTowardNegative:
+    return "RTN";
+  case llvm::APFloat::rmTowardZero:
+    return "RTZ";
+  case llvm::APFloat::rmNearestTiesToAway:
+    return "RNA";
+  default:
+    llvm_unreachable("Unhandled rounding mode");
+  }
+}
+
+void ExprSMTLIBPrinter::printFloatFromBitsVar(Expr::Width w, unsigned id) {
+  unsigned expBits = 0, sigBits = 0;
+  if (!getFloatFormat(w, expBits, sigBits))
+    klee_error("Printing an x87 fp80 expression as SMT-LIBv2 is not "
+               "supported; use --debug-z3-dump-queries instead");
+  *p << "((_ to_fp " << expBits << " " << sigBits << ") |__klee_fp_bits_" << id
+     << "|)";
+}
+
+void ExprSMTLIBPrinter::printCanonicalNaNBits(Expr::Width w) {
+  // The encoding KLEE's own constant folding produces (ConstantExpr::GetNaN).
+  // Every NaN encoding reinterprets to the one NaN of the theory, so the
+  // reinterpretation constraint alone leaves a NaN's bits free and a model
+  // could return a payload KLEE would never compute. Pinning it keeps the
+  // solver's model and KLEE's evaluation of the same expression in step.
+  switch (w) {
+  case Expr::Int16:
+    *p << "#x7c01";
+    return;
+  case Expr::Int32:
+    *p << "#x7f800001";
+    return;
+  case Expr::Int64:
+    *p << "#x7ff0000000000001";
+    return;
+  case Expr::Int128:
+    *p << "(concat #x7fff (_ bv1 112))";
+    return;
+  default:
+    klee_error("no canonical NaN encoding for this width");
+  }
+}
+
+void ExprSMTLIBPrinter::printFloatBitsDeclarations() {
+  if (floatBitsVars.empty())
+    return;
+
+  // In the order they were allocated, so that a query is stable across runs.
+  std::vector<std::pair<unsigned, ref<Expr> > > ordered;
+  for (FloatBitsMap::const_iterator i = floatBitsVars.begin(),
+                                    e = floatBitsVars.end();
+       i != e; ++i)
+    ordered.push_back(std::make_pair(i->second, i->first));
+  std::sort(ordered.begin(), ordered.end(),
+            [](const std::pair<unsigned, ref<Expr> > &a,
+               const std::pair<unsigned, ref<Expr> > &b) {
+              return a.first < b.first;
+            });
+
+  if (humanReadable)
+    *o << "; Float-to-bits variables. The floating-point theory has no\n"
+          "; float-to-bits operation, so the bits of a float are a variable\n"
+          "; constrained to reinterpret as it.\n";
+
+  for (unsigned i = 0; i < ordered.size(); ++i)
+    *o << "(declare-fun |__klee_fp_bits_" << ordered[i].first << "| () (_ BitVec "
+       << ordered[i].second->getWidth() << ") )\n";
+
+  // The let bindings of the query live inside its own assert and are not in
+  // scope here, so these are printed without abbreviation.
+  AbbreviationMode savedAbbrMode = abbrMode;
+  abbrMode = ABBR_NONE;
+
+  for (unsigned i = 0; i < ordered.size(); ++i) {
+    unsigned id = ordered[i].first;
+    const ref<Expr> &f = ordered[i].second;
+
+    *p << "(assert (= ";
+    p->pushIndent();
+    printFloatFromBitsVar(f->getWidth(), id);
+    printSeperator();
+    printExpression(f, SORT_FLOAT);
+    p->popIndent();
+    *p << ") )";
+    p->breakLineI();
+
+    *p << "(assert (=> (fp.isNaN ";
+    p->pushIndent();
+    printFloatFromBitsVar(f->getWidth(), id);
+    *p << ") (= |__klee_fp_bits_" << id << "| ";
+    printCanonicalNaNBits(f->getWidth());
+    p->popIndent();
+    *p << ") ) )";
+    p->breakLineI();
+  }
+
+  abbrMode = savedAbbrMode;
+}
+
+void ExprSMTLIBPrinter::printFloatArithExpr(const ref<Expr> &e) {
+  *p << "(" << getSMTLIBKeyword(e) << " ";
+  p->pushIndent();
+
+  printSeperator();
+  *p << getRoundingModeName(exprRoundingMode(e));
+
+  for (unsigned i = 0; i < e->getNumKids(); ++i) {
+    printSeperator();
+    printExpression(e->getKid(i), SORT_FLOAT);
+  }
+
+  p->popIndent();
+  printSeperator();
+  *p << ")";
+}
+
+void ExprSMTLIBPrinter::printFloatConvExpr(const ref<Expr> &e) {
+  const char *rm = getRoundingModeName(exprRoundingMode(e));
+
+  switch (e->getKind()) {
+  case Expr::FPToUI:
+  case Expr::FPToSI:
+    // Partial in SMT-LIB: the value is unspecified when the float does not
+    // fit, which is what the solver builders build too.
+    *p << "((_ " << (e->getKind() == Expr::FPToUI ? "fp.to_ubv" : "fp.to_sbv")
+       << " " << e->getWidth() << ") ";
+    p->pushIndent();
+    printSeperator();
+    *p << rm;
+    printSeperator();
+    printExpression(e->getKid(0), SORT_FLOAT);
+    p->popIndent();
+    printSeperator();
+    *p << ")";
+    return;
+
+  case Expr::FPExt:
+  case Expr::FPTrunc:
+  case Expr::UIToFP:
+  case Expr::SIToFP: {
+    unsigned expBits = 0, sigBits = 0;
+    if (!getFloatFormat(e->getWidth(), expBits, sigBits))
+      klee_error("Printing an x87 fp80 expression as SMT-LIBv2 is not "
+                 "supported; use --debug-z3-dump-queries instead");
+    // (_ to_fp eb sb) means a bit-pattern reinterpretation when it is given a
+    // bit-vector and no rounding mode, and a signed integer conversion when it
+    // is given both. Both of those appear here, told apart by the argument.
+    *p << "((_ " << (e->getKind() == Expr::UIToFP ? "to_fp_unsigned" : "to_fp")
+       << " " << expBits << " " << sigBits << ") ";
+    p->pushIndent();
+    printSeperator();
+    *p << rm;
+    printSeperator();
+    printExpression(e->getKid(0),
+                    (e->getKind() == Expr::UIToFP || e->getKind() == Expr::SIToFP)
+                        ? SORT_BITVECTOR
+                        : SORT_FLOAT);
+    p->popIndent();
+    printSeperator();
+    *p << ")";
+    return;
+  }
+
+  default:
+    llvm_unreachable("not a floating-point conversion");
   }
 }
 
@@ -572,22 +862,50 @@ void ExprSMTLIBPrinter::generateOutput() {
     return;
   }
 
+  // The body is printed into a buffer before anything is written out.
+  // Printing is what discovers which floats are needed as bit-vectors, and
+  // the variables standing for those bits have to be declared ahead of the
+  // assertions that use them. Deciding that by walking the query separately
+  // would mean a second piece of code that has to agree with this one about
+  // the expected sort of every operand, and the two would drift.
+  std::string body;
+  {
+    llvm::raw_string_ostream bodyStream(body);
+    PrintContext bodyContext(bodyStream);
+    llvm::raw_ostream *savedO = o;
+    PrintContext *savedP = p;
+    o = &bodyStream;
+    p = &bodyContext;
+
+    if (humanReadable)
+      printHumanReadableQuery();
+    else
+      printMachineReadableQuery();
+
+    bodyStream.flush();
+    o = savedO;
+    p = savedP;
+  }
+
   if (humanReadable)
     printNotice();
   printOptions();
   printSetLogic();
   printArrayDeclarations();
+  printFloatBitsDeclarations();
 
-  if (humanReadable)
-    printHumanReadableQuery();
-  else
-    printMachineReadableQuery();
+  *o << body;
 
   printAction();
   printExit();
 }
 
 void ExprSMTLIBPrinter::printSetLogic() {
+  // Decided by what the body turned out to contain: a query mentioning a
+  // float needs the theory, and one that does not should not ask for it.
+  if (usesFloats)
+    logicToUse = QF_AUFBVFP;
+
   *o << "(set-logic ";
   switch (logicToUse) {
   case QF_ABV:
@@ -595,6 +913,9 @@ void ExprSMTLIBPrinter::printSetLogic() {
     break;
   case QF_AUFBV:
     *o << "QF_AUFBV";
+    break;
+  case QF_AUFBVFP:
+    *o << "QF_AUFBVFP";
     break;
   }
   *o << " )\n";
@@ -1005,7 +1326,38 @@ ExprSMTLIBPrinter::SMTLIB_SORT ExprSMTLIBPrinter::getSort(const ref<Expr> &e) {
   case Expr::Xor:
     return e->getWidth() == Expr::Bool ? SORT_BOOL : SORT_BITVECTOR;
 
-  // Everything else is a bitvector.
+  // The float-sorted operations. Note the deliberate absence of Select and
+  // Concat: the solver builders normalise an if-then-else or a concatenation
+  // over floats to one over their bit patterns, so this printer does too, and
+  // the operands take a float-to-bits variable like any other bit use.
+  case Expr::FAdd:
+  case Expr::FSub:
+  case Expr::FMul:
+  case Expr::FDiv:
+  case Expr::FSqrt:
+  case Expr::FAbs:
+  case Expr::FMA:
+  case Expr::FPExt:
+  case Expr::FPTrunc:
+  case Expr::UIToFP:
+  case Expr::SIToFP:
+    usesFloats = true;
+    return SORT_FLOAT;
+
+  // The float predicates and the ordered comparisons are bools.
+  case Expr::FOEq:
+  case Expr::FOLt:
+  case Expr::FOLe:
+  case Expr::FOGt:
+  case Expr::FOGe:
+  case Expr::IsNaN:
+  case Expr::IsInfinite:
+  case Expr::IsNormal:
+  case Expr::IsSubnormal:
+    return SORT_BOOL;
+
+  // Everything else is a bitvector. FPToUI and FPToSI land here, which is
+  // correct: they produce bits.
   default:
     return SORT_BITVECTOR;
   }
@@ -1013,6 +1365,49 @@ ExprSMTLIBPrinter::SMTLIB_SORT ExprSMTLIBPrinter::getSort(const ref<Expr> &e) {
 
 void ExprSMTLIBPrinter::printCastToSort(const ref<Expr> &e,
                                         ExprSMTLIBPrinter::SMTLIB_SORT sort) {
+  // A float where bits are wanted. There is no such operation in the SMT-LIB
+  // floating-point theory -- Z3's fp.to_ieee_bv is an extension -- so the
+  // bits are a variable of their own, declared and constrained by
+  // printFloatBitsDeclarations() once the body has been printed.
+  if (sort == SORT_BITVECTOR && getSort(e) == SORT_FLOAT) {
+    usesFloats = true;
+    FloatBitsMap::iterator i = floatBitsVars.find(e);
+    if (i == floatBitsVars.end()) {
+      // One variable per float, so that casting the same float twice cannot
+      // yield two variables a model could give different bits.
+      unsigned expBits = 0, sigBits = 0;
+      if (!getFloatFormat(e->getWidth(), expBits, sigBits))
+        klee_error("Printing an x87 fp80 expression as SMT-LIBv2 is not "
+                   "supported; use --debug-z3-dump-queries instead");
+      i = floatBitsVars
+              .insert(std::make_pair(e, (unsigned)floatBitsVars.size()))
+              .first;
+    }
+    *p << "|__klee_fp_bits_" << i->second << "|";
+    return;
+  }
+
+  // Bits where a float is wanted: the IEEE interchange reinterpretation, which
+  // unlike the direction above is standard SMT-LIB.
+  if (sort == SORT_FLOAT) {
+    usesFloats = true;
+    if (getSort(e) != SORT_BITVECTOR)
+      klee_error("ExprSMTLIBPrinter: cannot cast this sort to a float");
+    unsigned expBits = 0, sigBits = 0;
+    if (!getFloatFormat(e->getWidth(), expBits, sigBits))
+      klee_error("Printing an x87 fp80 expression as SMT-LIBv2 is not "
+                 "supported: its explicit significand integer bit has no "
+                 "SMT-LIB sort, and the re-layout the solver builders do in "
+                 "castToFloat() would have to be reproduced here exactly. "
+                 "Use --debug-z3-dump-queries, which prints Z3's own fp80");
+    *p << "((_ to_fp " << expBits << " " << sigBits << ") ";
+    p->pushIndent();
+    printExpression(e, SORT_BITVECTOR);
+    p->popIndent();
+    *p << ")";
+    return;
+  }
+
   switch (sort) {
   case SORT_BITVECTOR:
     if (humanReadable) {
