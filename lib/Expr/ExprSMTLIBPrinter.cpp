@@ -15,6 +15,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include "llvm/ADT/SmallString.h"
+
 #include <stack>
 
 namespace ExprSMTLIBOptions {
@@ -108,6 +110,17 @@ bool ExprSMTLIBPrinter::setConstantDisplayMode(ConstantDisplayMode cdm) {
   return true;
 }
 
+namespace {
+
+/// An APInt as digits in the given radix, unsigned, with no type suffix.
+std::string toStringUnsigned(const llvm::APInt &bits, unsigned radix) {
+  llvm::SmallString<64> storage;
+  bits.toString(storage, radix, /*Signed=*/false);
+  return std::string(storage.begin(), storage.end());
+}
+
+} // namespace
+
 void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
   /* Handle simple boolean constants */
 
@@ -125,6 +138,12 @@ void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
 
   std::string value;
 
+  // The bits, never ConstantExpr::toString(), which renders a constant
+  // carrying klee-float's float flag as a decimal or C99 hex *float*
+  // (0.0E+0, -0x1.000p+4). Every constant printed here is a bit-vector, and
+  // a bit-vector literal is what the reader expects.
+  const llvm::APInt &bits = e->getAPValue();
+
   /* SMTLIBv2 deduces the bit-width (should be 8-bits in our case)
    * from the length of the string (e.g. zero is #b00000000). LLVM
    * doesn't know about this so we need to pad the printed output
@@ -134,7 +153,7 @@ void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
 
   switch (cdm) {
   case BINARY:
-    e->toString(value, 2);
+    value = toStringUnsigned(bits, 2);
     *p << "#b";
 
     zeroPad = e->getWidth() - value.length();
@@ -146,7 +165,7 @@ void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
     break;
 
   case HEX:
-    e->toString(value, 16);
+    value = toStringUnsigned(bits, 16);
     *p << "#x";
 
     zeroPad = (e->getWidth() / 4) - value.length();
@@ -157,7 +176,7 @@ void ExprSMTLIBPrinter::printConstant(const ref<ConstantExpr> &e) {
     break;
 
   case DECIMAL:
-    e->toString(value, 10);
+    value = toStringUnsigned(bits, 10);
     *p << "(_ bv" << value << " " << e->getWidth() << ")";
     break;
 
